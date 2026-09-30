@@ -1,0 +1,9 @@
+{
+  "art-institute-chicago-mcp-server": {
+    "command": "npx",
+    "args": ["-y", "@cyanheads/art-institute-chicago-mcp-server"],
+    "env": {
+      "MCP_TRANSPORT_TYPE": "stdio"
+    }
+  }
+}

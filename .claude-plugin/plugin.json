@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "art-institute-chicago-mcp-server",
+  "version": "0.1.0",
+  "description": "Search the Art Institute of Chicago collection: artworks, artists, exhibitions, provenance, and audio tours via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
+  },
+  "homepage": "https://github.com/cyanheads/art-institute-chicago-mcp-server#readme",
+  "repository": "https://github.com/cyanheads/art-institute-chicago-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": ["art-institute-of-chicago", "artic", "art", "museum", "artwork", "iiif", "mcp", "mcp-server", "model-context-protocol"],
+  "mcpServers": {
+    "art-institute-chicago-mcp-server": {
+      "command": "npx",
+      "args": ["-y", "@cyanheads/art-institute-chicago-mcp-server"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio"
+      }
+    }
+  }
+}
