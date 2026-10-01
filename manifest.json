@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "art-institute-chicago-mcp-server",
   "display_name": "art-institute-chicago-mcp-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Search the Art Institute of Chicago collection: artworks, artists, exhibitions, and audio guides.",
   "author": { "name": "cyanheads" },
   "repository": {
