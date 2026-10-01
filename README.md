@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>art-institute-chicago-mcp-server</h1>
+  <h1>@cyanheads/art-institute-chicago-mcp-server</h1>
   <p><b>Search the Art Institute of Chicago collection: artworks, artists, exhibitions, and audio guides via MCP. STDIO or Streamable HTTP.</b>
   <div>6 Tools • 1 Resource</div>
   </p>
