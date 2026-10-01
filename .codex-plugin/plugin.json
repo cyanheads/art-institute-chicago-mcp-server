@@ -1,7 +1,7 @@
 {
   "name": "art-institute-chicago-mcp-server",
   "version": "0.1.0",
-  "description": "Search the Art Institute of Chicago collection: artworks, artists, exhibitions, provenance, and audio tours via MCP. STDIO or Streamable HTTP.",
+  "description": "Search the Art Institute of Chicago collection: artworks, artists, exhibitions, and audio guides.",
   "author": {
     "name": "cyanheads",
     "email": "casey@caseyjhand.com",
@@ -10,12 +10,12 @@
   "homepage": "https://github.com/cyanheads/art-institute-chicago-mcp-server#readme",
   "repository": "https://github.com/cyanheads/art-institute-chicago-mcp-server",
   "license": "Apache-2.0",
-  "keywords": ["art-institute-of-chicago", "artic", "art", "museum", "artwork", "iiif", "mcp", "mcp-server", "model-context-protocol"],
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "art-institute-of-chicago", "artic", "art", "museum", "artwork", "art-history", "iiif"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "art-institute-chicago-mcp-server",
-    "shortDescription": "Search the Art Institute of Chicago collection: artworks, artists, exhibitions, provenance, and audio tours.",
-    "longDescription": "Read-only access to the Art Institute of Chicago public API. Search the collection by keyword, artist, department, style, or date range; filter to public-domain works with IIIF image URLs; and fetch full artwork records with provenance, exhibition history, and credit lines. Also covers artist biographies, past and current exhibitions, and audio tour stops with transcripts. STDIO or Streamable HTTP, no API key required.",
+    "shortDescription": "Search the Art Institute of Chicago collection: artworks, artists, exhibitions, and audio guides.",
+    "longDescription": "Read-only, keyless access to the Art Institute of Chicago's public API: about 133,000 artworks, plus artists, exhibitions, and the museum's audio guide. Search artworks by text and by artist, department, type, style, subject, place, gallery, or year range, with facet counts and filters for public-domain and on-view works. Read full records with curatorial descriptions, provenance, exhibition and publication history, and IIIF image URLs marked public_domain or in_copyright. Resolve artists and cultures to ids with artwork counts and sample works, find current, upcoming, or past exhibitions and the works shown, search audio-guide transcripts, and list the exact values each search filter accepts. Artwork, artist, exhibition, and audio-guide results carry the API's license text: metadata is CC0, artwork descriptions are CC BY 4.0, and audio-guide content is for noncommercial educational use.",
     "developerName": "cyanheads",
     "category": "data",
     "capabilities": ["Read"],

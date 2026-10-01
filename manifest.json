@@ -1,14 +1,32 @@
 {
   "manifest_version": "0.3",
   "name": "art-institute-chicago-mcp-server",
+  "display_name": "art-institute-chicago-mcp-server",
   "version": "0.1.0",
-  "license": "Apache-2.0",
-  "description": "Search the Art Institute of Chicago collection: artworks, artists, exhibitions, provenance, and audio tours via MCP. STDIO or Streamable HTTP.",
+  "description": "Search the Art Institute of Chicago collection: artworks, artists, exhibitions, and audio guides.",
   "author": { "name": "cyanheads" },
   "repository": {
     "type": "git",
     "url": "https://github.com/cyanheads/art-institute-chicago-mcp-server"
   },
+  "homepage": "https://github.com/cyanheads/art-institute-chicago-mcp-server#readme",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "typescript",
+    "art-institute-of-chicago",
+    "artic",
+    "art",
+    "museum",
+    "artwork",
+    "art-history",
+    "provenance",
+    "exhibitions",
+    "public-domain",
+    "iiif"
+  ],
   "server": {
     "type": "node",
     "entry_point": "dist/index.js",
@@ -33,7 +51,7 @@
     "AIC_CONTACT": {
       "type": "string",
       "title": "Contact for the Art Institute API",
-      "description": "Optional. An email or URL the museum can reach, sent in the AIC-User-Agent header. Defaults to the repository URL.",
+      "description": "Optional. An email or URL the museum can reach, in printable ASCII, sent in the AIC-User-Agent header. Defaults to the repository URL.",
       "required": false,
       "default": ""
     },

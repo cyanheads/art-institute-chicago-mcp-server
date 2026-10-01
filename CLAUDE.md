@@ -11,16 +11,16 @@
 
 ---
 
-## First Session
+## Domain
 
-This project was just scaffolded with `bunx @cyanheads/mcp-ts-core init`. You're holding a production-grade MCP framework with the hard parts already solved — error handling, telemetry, auth, transport, validation, lifecycle. What's missing is the **domain**. Your job: design the tool, resource, and service surface with the user, then implement it as small pure handlers that throw — the framework catches, classifies, and instruments the rest. Design before code; the user's first messages set direction, so wait for them before scaffolding definitions.
+The server wraps the Art Institute of Chicago public API (`https://api.artic.edu/api/v1`): keyless, read-only, Elasticsearch-backed. `docs/design.md` is the spec — tool contracts, the request boundary, resilience settings, numbered design decisions, and the verified API reference. Read the relevant section before changing a definition or the service.
 
-> **Remove this section** from CLAUDE.md / AGENTS.md after completing these steps. The skills and conventions below remain — this block is one-time onboarding only.
-
-1. **Get your bearings.** Take stock of the project tree, the skills in `framework-skills/`, and the tools/MCP servers available. Light tool use is fine for context-building — you're mapping the territory, not committing yet.
-2. **Read the framework docs** — `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` (builders, Context, errors, exports, conventions)
-3. **Run the `setup` skill** — read `framework-skills/setup/SKILL.md` and follow its checklist (project orientation, agent protocol file selection, echo definition cleanup, skill sync)
-4. **Design the server** — read `framework-skills/design-mcp-server/SKILL.md` and work through it with the user to map the domain into tools, resources, and services before scaffolding
+- **One service, one host.** `AicService` (`src/services/aic/aic-service.ts`) makes every upstream call: a process-wide pacer (`AIC_REQUESTS_PER_MINUTE`, default 50, under the published 60/min anonymous limit), `withRetry` inside a 20 s deadline per request, an in-process LRU cache keyed by request URL, a 5 MiB body ceiling, and the `AIC-User-Agent` header built from `AIC_CONTACT`. Image URLs are constructed in `aic-text.ts`, never fetched.
+- **Request boundary.** Plain `fetch`, not `fetchWithTimeout`: the API reports paging errors as 403 JSON, search-backend rejections as 400 text, and firewall blocks as a non-JSON 403, and each maps to its own reason (`page_beyond_window`, `upstream_rejected_query`, `request_blocked`). Only a 429 is `rate_limited`.
+- **Search window.** Anonymous callers reach only `offset + limit ≤ 1000`. Every search tool keeps `page × limit` inside it and names the window in its notice.
+- **Licensing is per surface.** Artwork metadata, agents, exhibitions, vocabulary terms, and `/sounds` assets are CC0; artwork `description` is CC BY 4.0 (`description_attribution`); images are reusable only when `is_public_domain`; audio-guide content is for noncommercial educational and personal use (`license_text` plus `source_citation`). An output that returns licensed text carries its terms.
+- **Upstream text is data.** HTML becomes plain text once, at the service boundary, where upstream URLs also pass `httpUrl()`, the IIIF base `iiifBaseUrl()`, and image ids `iiifImageId()`, so a value that fails is absent. In `format()`, free text goes through `quoteBlock()`, inline slots through `inlineSafe()`, and URLs through `printableUrl()`; `structuredContent` keeps every string as received.
+- **Secondary calls degrade.** When the second request fails in `artic_get_artworks` (related media) or `artic_search_artists` (artwork counts), the primary records return with a notice. Cancellation still rethrows.
 
 ---
 
@@ -59,155 +59,221 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ### Tool
 
+Abridged from `src/mcp-server/tools/definitions/lookup-vocabulary.tool.ts`:
+
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { getAicService } from '@/services/aic/aic-service.js';
+import {
+  blankAsUnset,
+  containsPattern,
+  inlineSafe,
+  VOCABULARY_FIELDS,
+  VOCABULARY_FILTERS,
+} from '@/services/aic/aic-text.js';
 
-export const searchItems = tool('search_items', {
-  description: 'Search inventory items by query.',
-  annotations: { readOnlyHint: true },
+export const lookupVocabulary = tool('artic_lookup_vocabulary', {
+  title: 'Look up collection vocabulary',
+  description: 'List the values of an Art Institute of Chicago collection vocabulary with how many artworks carry each, …',
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
-    query: z.string().describe('Search terms'),
-    limit: z.number().int().min(1).max(100).default(10).describe('Max results (1–100)'),
+    vocabulary: z.enum(VOCABULARIES).describe('Vocabulary to list. …'),
+    // Every optional input is wrapped: a form client's "" becomes unset, or the default.
+    contains: blankAsUnset(z.string().trim().max(60).optional()).describe('Case-insensitive substring …'),
+    public_domain_only: blankAsUnset(z.boolean().default(false)).describe('Count only public-domain artworks.'),
+    limit: blankAsUnset(z.number().int().min(1).max(100).default(25)).describe('Values to return, most common first (1-100).'),
   }),
   output: z.object({
-    items: z.array(z.object({
-      id: z.string().describe('Item ID'),
-      name: z.string().describe('Item name'),
-    })).describe('Matching items'),
+    vocabulary: z.enum(VOCABULARIES).describe('The vocabulary listed.'),
+    filter_param: z.enum(VOCABULARY_FILTERS).optional().describe('The artic_search_artworks parameter …'),
+    values: z.array(/* { value, artwork_count } */).describe('Values, most common first.'),
   }),
-  auth: ['inventory:read'],
+  enrichment: {
+    truncated: z.boolean().describe('True when more values exist beyond the limit.'),
+    shown: z.number().describe('Values returned.'),
+    cap: z.number().describe('The limit applied.'),
+    notice: z.string().optional().describe('Guidance when no value matched or the list was capped.'),
+  },
+  errors: [
+    // rate_limited and upstream_rejected_query are declared inline the same way
+    {
+      reason: 'request_blocked',
+      code: JsonRpcErrorCode.Forbidden,
+      when: "The Art Institute API's firewall blocked the request, as it does for markup or script-like text and for bursts of traffic.",
+      retryable: false,
+      recovery: 'Remove markup or script-like text, such as HTML tags, from contains, then call artic_lookup_vocabulary again; …',
+      thrownBy: 'service',
+    },
+  ],
 
   async handler(input, ctx) {
-    const items = await findItems(input.query, input.limit);
-    ctx.log.info('Search completed', { query: input.query, count: items.length });
-    return { items };
+    // Required enrichment fields are written first, before any branch or upstream call.
+    ctx.enrich({ truncated: false, shown: 0, cap: input.limit });
+    const result = await getAicService().aggregate(
+      VOCABULARY_FIELDS[input.vocabulary],
+      {
+        size: input.limit,
+        include: input.contains ? containsPattern(input.contains) : undefined,
+        public_domain_only: input.public_domain_only,
+      },
+      ctx,
+    );
+    const values = result.buckets.map((b) => ({ value: b.key, artwork_count: b.doc_count }));
+    ctx.enrich({ shown: values.length });
+    if (result.sum_other_doc_count > 0) {
+      ctx.enrich.truncated({ shown: values.length, cap: input.limit, guidance: 'More values exist: raise limit or narrow with contains.' });
+    }
+    // … zero-value notice
+    return {
+      vocabulary: input.vocabulary,
+      ...(isFilterParam(input.vocabulary) ? { filter_param: input.vocabulary } : {}),
+      values,
+    };
   },
 
-  // format() populates content[] — the markdown twin of structuredContent.
-  // Different clients read different surfaces (Claude Code → structuredContent,
-  // Claude Desktop → content[]); both must carry the same data.
-  // Enforced at lint time: every field in `output` must appear in the rendered text.
+  // format() is the content[] twin of structuredContent: every output field appears,
+  // and upstream values pass through inlineSafe() here, never in structuredContent.
   format: (result) => [{
     type: 'text',
-    text: result.items.map(i => `**${i.id}**: ${i.name}`).join('\n'),
+    text: [
+      `# ${result.vocabulary} values (${result.values.length})`,
+      // … filter_param line
+      ...result.values.map((v) => `- ${inlineSafe(v.value)} (${v.artwork_count} artworks)`),
+    ].join('\n'),
   }],
 });
 ```
 
+The four search tools add the paging enrichment (`totalCount`, `truncated`, `shown`, `cap`, `notice`). Each handler writes it first (`ctx.enrich.total(0)`, then `ctx.enrich({ truncated: false, shown: 0, cap })`), pages with `pageInfo()` against the 1,000-match `SEARCH_WINDOW`, and composes one notice string that it writes once. `docs/design.md` § Shared conventions gives the order and the notice wording.
+
 ### Resource
+
+Abridged from `src/mcp-server/resources/definitions/artwork.resource.ts`. The resource builds its record through the same `loadArtworkRecords()` path as `artic_get_artworks`, and embeds the license text, attribution, and notice in the payload, since resources carry no enrichment block:
 
 ```ts
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { DEFAULT_SECTIONS, jsonBytes, loadArtworkRecords } from '@/services/aic/artwork-records.js';
 
-export const itemData = resource('inventory://{itemId}', {
-  description: 'Fetch an inventory item by ID.',
-  params: z.object({ itemId: z.string().describe('Item identifier') }),
-  auth: ['inventory:read'],
+export const artworkResource = resource('artic://artworks/{id}', {
+  name: 'artic-artwork',
+  title: 'Artwork record',
+  description: 'Read one Art Institute of Chicago artwork record by id as JSON: …',
+  mimeType: 'application/json',
+  params: z.object({
+    id: z.string().regex(/^\d+$/).describe('Artwork id (digits), from artic_search_artworks.'),
+  }),
+  cacheHint: { ttlMs: 21_600_000, cacheScope: 'public' },
+  errors: [
+    {
+      reason: 'artwork_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'No artwork has this id.',
+      recovery: 'Find artwork ids with artic_search_artworks, then read artic://artworks/<id> again.',
+    },
+    // … rate_limited, request_blocked, upstream_rejected_query (thrownBy: 'service')
+  ],
+
   async handler(params, ctx) {
-    const item = await ctx.state.get(`item/${params.itemId}`);
-    if (!item) throw notFound(`Item ${params.itemId} not found`, { itemId: params.itemId });
-    return item;
+    const id = Number(params.id);
+    if (!Number.isSafeInteger(id)) {
+      throw ctx.fail('artwork_not_found', `No artwork exists for id ${params.id}.`);
+    }
+    const { artworks, license_text, description_attribution, notices } = await loadArtworkRecords(
+      { ids: [id], sections: DEFAULT_SECTIONS, include_related_media: true, wireBytes: jsonBytes },
+      ctx,
+    );
+    const [artwork] = artworks;
+    if (!artwork) throw ctx.fail('artwork_not_found', `No artwork exists for id ${params.id}.`);
+    return {
+      artwork,
+      license_text,
+      ...(description_attribution ? { description_attribution } : {}),
+      ...(notices.length > 0 ? { notice: notices.join(' ') } : {}),
+    };
   },
 });
 ```
 
 ### Prompt
 
-```ts
-import { prompt, z } from '@cyanheads/mcp-ts-core';
-
-export const reviewCode = prompt('review_code', {
-  description: 'Review code for issues and best practices.',
-  args: z.object({
-    code: z.string().describe('Code to review'),
-    language: z.string().optional().describe('Programming language'),
-  }),
-  generate: (args) => [
-    { role: 'user', content: { type: 'text', text: `Review this ${args.language ?? ''} code:\n${args.code}` } },
-  ],
-});
-```
+None. The cross-tool workflow lives in the `createApp()` `instructions`.
 
 ### Server config
 
+`src/config/server-config.ts` (descriptions abridged):
+
 ```ts
-// src/config/server-config.ts — lazy-parsed, separate from framework config
 import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 const ServerConfigSchema = z.object({
-  apiKey: z.string().describe('External API key'),
-  maxResults: z.coerce.number().default(100),
-  verboseLogging: z.stringbool().default(false).describe('Enable verbose logging'),
+  contact: z
+    .string()
+    .trim()
+    .max(200)
+    .regex(/^[\x20-\x7E]*$/, 'Use printable ASCII only …') // a header value: anything else fails at startup
+    .default('https://github.com/cyanheads/art-institute-chicago-mcp-server')
+    .describe('Contact the museum can reach (an email or URL, printable ASCII), sent in the AIC-User-Agent header …'),
+  requestsPerMinute: z.coerce.number().int().min(1).max(600).default(50).describe('Outbound request budget per minute …'),
 });
 
-let _config: z.infer<typeof ServerConfigSchema> | undefined;
-export function getServerConfig() {
+export type ServerConfig = z.infer<typeof ServerConfigSchema>;
+
+let _config: ServerConfig | undefined;
+export function getServerConfig(): ServerConfig {
   _config ??= parseEnvConfig(ServerConfigSchema, {
-    apiKey: 'MY_API_KEY',
-    maxResults: 'MY_MAX_RESULTS',
-    verboseLogging: 'MY_VERBOSE_LOGGING',
+    contact: 'AIC_CONTACT',
+    requestsPerMinute: 'AIC_REQUESTS_PER_MINUTE',
   });
   return _config;
 }
 ```
 
-`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`MY_API_KEY`) not the path (`apiKey`). Throws `ConfigurationError`, which the framework prints as a clean startup banner.
+`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`AIC_REQUESTS_PER_MINUTE`) not the path (`requestsPerMinute`), and reads an empty value as unset, so a blank from a bundle install falls through to the default. Throws `ConfigurationError`, which the framework prints as a clean startup banner.
 
 For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
 
-### Server identity and instructions
+A new variable lands in `.env.example`, both `server.json` packages, `manifest.json` (`user_config` plus `mcp_config.env`), both plugin manifests, and the README Configuration table together.
 
-`createApp()` accepts optional identity fields forwarded to the SDK's `initialize` response and the server manifest (`/.well-known/mcp.json`):
+### Server identity, instructions, and lifecycle
 
-```ts
-await createApp({
-  name: 'my-mcp-server',
-  title: 'My Server',                         // human-readable display name
-  websiteUrl: 'https://github.com/owner/repo', // canonical homepage URL
-  description: 'One-line description.',        // wins over MCP_SERVER_DESCRIPTION
-  icons: [{ src: 'https://example.com/icon.png', sizes: ['48x48'], mimeType: 'image/png' }],
-  instructions: 'Use shortcut alpha for the most common case.', // session-level context
-});
-```
-
-`instructions` is optional server-level orientation, sent on every `initialize` as session-level context. Use it for deployment guidance (connection aliases, regional notes, scope hints) instead of repeating the same context across tool descriptions. Client adoption is uneven, but there's no downside when set.
-
-### Session posture and shutdown
-
-Two more `createApp()` options shape how the server runs rather than how it presents itself:
+`src/index.ts` (instructions abridged):
 
 ```ts
 await createApp({
-  sessionMode: 'stateless',          // or { default: 'stateful', require: 'stateful' }
-  setup(core) { startMyWatcher(core.config); },
-  async teardown() { await stopMyWatcher(); },
+  name: 'art-institute-chicago-mcp-server',
+  title: 'art-institute-chicago-mcp-server',
+  tools: allToolDefinitions,
+  resources: allResourceDefinitions,
+  instructions: 'Art Institute of Chicago collection data: about 133,000 artworks, artists, exhibitions, and audio-guide stops. …',
+  setup(core) {
+    const { contact, requestsPerMinute } = getServerConfig();
+    initAicService({ contact, requestsPerMinute, version: core.config.mcpServerVersion });
+  },
+  teardown() {
+    disposeAicService();
+  },
 });
 ```
 
-`sessionMode` declares the HTTP session posture in `src/` instead of leaving it to a deployment's `MCP_SESSION_MODE`, which still wins whenever it carries a meaningful value (an empty string and an unsubstituted `${…}` placeholder read as unset and fall through to the option). Add `require: 'stateful'` when a tool asks the caller for input mid-handler via `ctx.requestInput`: startup then fails with a `ConfigurationError` rather than serving a mode in which a 2025-era client can never answer the prompt. Stdio is never refused.
-
-`teardown(core)` is the `setup()` counterpart — release a watcher, socket, or non-`unref()`'d timer there. It runs after the transport stops and before the logger closes, on every shutdown path, and a signal-triggered shutdown then exits the process explicitly (0, or 1 if a step never settles within the framework's 10 s ceiling).
+Identity is `name` + `title`, both the unscoped package name (`lint:packaging` enforces the match); `description` comes from `package.json`. `instructions` (under the 2,048-character limit) carries the cross-tool workflow and the licensing terms, so update it with the tool names whenever the surface changes. `teardown()` disposes the service's pacer. No `sessionMode` is set: no tool calls `ctx.requestInput`, so the default posture applies, and `.env.example` and the Dockerfile set `MCP_SESSION_MODE=stateless`.
 
 ---
 
 ## Context
 
-Handlers receive a unified `ctx` object. Key properties:
+Handlers receive a unified `ctx` object. The properties this server uses:
 
 | Property | Description |
 |:---------|:------------|
-| `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat it as client-visible. |
-| `ctx.state` | Tenant-scoped KV — `.get(key)`, `.set(key, value, { ttl? })`, `.delete(key)`, `.getMany(keys)`, `.list(prefix, { cursor, limit })`. Accepts any JSON-serializable value; reads return its JSON form (a `Date` comes back as an ISO string). |
-| `ctx.requestInput` | Suspend and ask the caller for more input — `return ctx.requestInput({ inputRequests: { key: inputRequired.elicit({ message, requestedSchema }) } })`. Never returns; the handler is re-entered with the answers. Always present. |
-| `ctx.inputs` | The request's responses — `.accepted(key, schema)`, `.view(key)`, `.state()`, `.dropped` — limited to what the client declared (`elicitation` and its form/url modes, `sampling`, `roots`). Client-supplied: a consent gate trusts only a `ctx.state` record it stored when it asked, bound to the operation, caller, and target (see the `api-context` skill). |
-| `ctx.clientCapabilities` | What the client declared for this request, `undefined` when no view exists. Decides whether to ask for optional context (e.g. roots); never a reason to skip a consent prompt. |
-| `ctx.enrich` | Success-path agent context (empty-result notices, query echo, pagination totals) — `ctx.enrich(...)` or `.notice()` / `.total()` / `.echo()` / `.truncated()`. Reaches `structuredContent` and `content[]`; lands only when the definition declares an `enrichment` block (no-op otherwise). |
-| `ctx.content` | Non-text content blocks — `.image(data, mimeType)`, `.audio(data, mimeType)`, or `ctx.content(block)` for a raw block. Prepended to `content[]` after `format()`; never enters `structuredContent`. |
-| `ctx.signal` | `AbortSignal` for cancellation. |
-| `ctx.requestId` | Request ID — the one every log record of the call carries and its error envelope returns as `data.requestId`. |
-| `ctx.tenantId` | Tenant ID from JWT; `'default'` for stdio or HTTP with auth off. |
+| `ctx.log` | Request-scoped logger — `.debug()`, `.info()`, `.notice()`, `.warning()`, `.error()`. Auto-correlates requestId, traceId, tenantId. Dual-sink: Pino **and** `notifications/message` to the client, so treat it as client-visible. A degraded secondary call logs at `warning`. |
+| `ctx.enrich` | Success-path agent context — `ctx.enrich(...)` or `.notice()` / `.total()` / `.truncated()`. Every tool declares an `enrichment` block: the search tools carry `totalCount`, `truncated`, `shown`, `cap`, and `notice`; `artic_lookup_vocabulary` drops `totalCount`; `artic_get_artworks` carries `notice` only. Reaches `structuredContent` and `content[]`. |
+| `ctx.fail` | Throws a declared error-contract reason, typed against the definition's `errors[]` (see Errors). |
+| `ctx.signal` | `AbortSignal` for cancellation. The service hands it to `withRetry`, and a degraded secondary call rethrows when it is aborted. |
+
+Unused here: `ctx.state` (the response cache is in-process and shared across tenants, since the data is public), `ctx.requestInput` / `ctx.inputs`, and `ctx.content`. See the framework CLAUDE.md for the full `ctx` surface.
 
 ---
 
@@ -253,26 +319,42 @@ throw new McpError(JsonRpcErrorCode.InitializationFailed, 'Connection failed', {
 
 See framework CLAUDE.md and the `api-errors` skill for the full auto-classification table, all available factories, and the contract reference.
 
+**This server's contracts.** Every tool and the resource declare `rate_limited` (`RateLimited`, retryable), `request_blocked` (`Forbidden`), and `upstream_rejected_query` (`InternalError`) inline with `thrownBy: 'service'`; `code` and `when` match across definitions, and each `recovery` names that tool's own levers. Caller-input reasons (`page_beyond_window`, `invalid_year_range`, `invalid_date_range`, `query_or_ids_required`, `query_and_ids_conflict`) are `ValidationError` with `severity: 'notice'`. Upstream 5xx, timeouts, and unreadable bodies bubble as baseline `ServiceUnavailable` / `Timeout`. `docs/design.md` § Request boundary maps each upstream response to its reason.
+
 ---
 
 ## Structure
 
 ```text
 src/
-  index.ts                              # createApp() entry point
+  index.ts                              # createApp(): identity, instructions, service setup/teardown
   config/
-    server-config.ts                    # Server-specific env vars (Zod schema)
+    server-config.ts                    # AIC_CONTACT, AIC_REQUESTS_PER_MINUTE (Zod schema)
   services/
-    [domain]/
-      [domain]-service.ts               # Domain service (init/accessor pattern)
+    aic/
+      aic-service.ts                    # AicService: request boundary, pacer, retry, cache (init/accessor pattern)
+      aic-text.ts                       # Pure helpers: HTML to text, inlineSafe, URL builders, input preprocessors, paging
+      artwork-records.ts                # artic_get_artworks records: response budget, related media
+      artist-records.ts                 # Artwork counts and sample works for artic_search_artists
+      response-cache.ts                 # LRU bounded by entries and bytes
       types.ts                          # Domain types
   mcp-server/
-    tools/definitions/
-      [tool-name].tool.ts               # Tool definitions
+    tools/
+      artwork-output.ts                 # Artwork output schema and markdown shared by the artwork tools
+      definitions/
+        index.ts                        # allToolDefinitions barrel
+        search-artworks.tool.ts         # artic_search_artworks
+        get-artworks.tool.ts            # artic_get_artworks
+        search-artists.tool.ts          # artic_search_artists
+        search-exhibitions.tool.ts      # artic_search_exhibitions
+        search-audio-guide.tool.ts      # artic_search_audio_guide
+        lookup-vocabulary.tool.ts       # artic_lookup_vocabulary
     resources/definitions/
-      [resource-name].resource.ts       # Resource definitions
-    prompts/definitions/
-      [prompt-name].prompt.ts           # Prompt definitions
+      index.ts                          # allResourceDefinitions barrel
+      artwork.resource.ts               # artic://artworks/{id}
+tests/
+  fixtures/                             # Upstream payloads, service and tool kits
+  config/ services/ tools/ resources/   # Tests mirroring src/
 ```
 
 ---
@@ -281,9 +363,10 @@ src/
 
 | What | Convention | Example |
 |:-----|:-----------|:--------|
-| Files | kebab-case with suffix | `search-docs.tool.ts` |
-| Tool/resource/prompt names | snake_case | `search_docs` |
-| Directories | kebab-case | `src/services/doc-search/` |
+| Files | kebab-case with suffix | `search-artworks.tool.ts` |
+| Tool names | snake_case, `artic_` prefix | `artic_search_artworks` |
+| Resource URIs | `artic://` scheme | `artic://artworks/{id}` |
+| Directories | kebab-case | `src/services/aic/` |
 | Descriptions | Single string or template literal, no `+` concatenation | `'Search items by query and filter.'` |
 
 ---
@@ -357,11 +440,15 @@ When you complete a skill's checklist, check the boxes and add a completion time
 | `bun run format` | Auto-fix formatting (safe fixes only) |
 | `bun run format:unsafe` | Also apply Biome's unsafe autofixes — review the diff; they can change behavior |
 | `bun run test` | Run tests (Vitest — use `bun run test`, not `bun test`) |
+| `bun run test:coverage` | Run tests with coverage |
+| `bun run start` | Run the built server (`node dist/index.js`, transport from env) |
 | `bun run start:stdio` | Production mode (stdio) |
 | `bun run start:http` | Production mode (HTTP) |
 | `bun run changelog:build` | Regenerate `CHANGELOG.md` from `changelog/*.md` |
 | `bun run changelog:check` | Verify `CHANGELOG.md` is in sync (used by devcheck) |
 | `bun run bundle` | Build, pack, and clean a `.mcpb` for one-click Claude Desktop install |
+| `bun run release:github` | Create the GitHub Release from the pushed tag (release step) |
+| `bun run publish-mcp` | Publish `server.json` to the MCP Registry (release step) |
 
 **CI is one file.** `.github/workflows/codeql.yml` (scaffolded) is the only GitHub Actions workflow: CodeQL is GitHub-owned end to end, and the file runs only while the repo's CodeQL *default setup* is turned off. Verification — `devcheck`, tests, the release gates — runs locally; don't add a workflow that re-runs it.
 
@@ -418,7 +505,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { McpError, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 
 // Server's own code — via path alias
-import { getMyService } from '@/services/my-domain/my-service.js';
+import { getAicService } from '@/services/aic/aic-service.js';
 ```
 
 ---
@@ -435,6 +522,11 @@ import { getMyService } from '@/services/my-domain/my-service.js';
 - [ ] If wrapping external API: normalization and `format()` preserve uncertainty; do not fabricate facts from missing upstream data
 - [ ] If wrapping external API: tests include at least one sparse payload case with omitted upstream fields
 - [ ] Registered in `createApp()` arrays (directly or via barrel exports)
+- [ ] Optional inputs wrapped in `blankAsUnset()`; array inputs go through `listInput()` with a `.max()` cap
+- [ ] Upstream strings in `format()` pass through `inlineSafe()` (inline slots), `quoteBlock()` (free text), or `printableUrl()` (URLs); `structuredContent` keeps them as received
+- [ ] Every definition that calls the service declares `rate_limited`, `request_blocked`, and `upstream_rejected_query` (`thrownBy: 'service'`), each `recovery` naming that tool's own levers
+- [ ] Licensed text carries its terms: `license_text` on every artwork, artist, exhibition, and audio-guide result, `description_attribution` with description text, `source_citation` with audio-guide content
+- [ ] A new or renamed tool is reflected in the `createApp()` `instructions` (under 2,048 characters), the README, and `docs/design.md`
 - [ ] Tests use `createMockContext()` from `@cyanheads/mcp-ts-core/testing`
 - [ ] `.codex-plugin/plugin.json` populated — `name`, `version`, `description`, `repository`, `license` from `package.json`; `interface.displayName` = the unscoped repo name (never the npm scope — `lint:packaging` enforces this); `interface.shortDescription` from `package.json` description
 - [ ] `.codex-plugin/mcp.json` updated — server name key is the unscoped repo name; every user-supplied variable (API key, contact email, instance URL) is listed in `env_vars` so Codex forwards it from the user's environment. Never write `"KEY": ""` into `env` — an empty value replaces the user's exported key and is read as unset

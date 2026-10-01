@@ -2,7 +2,7 @@
   "name": "@cyanheads/art-institute-chicago-mcp-server",
   "version": "0.1.0",
   "mcpName": "io.github.cyanheads/art-institute-chicago-mcp-server",
-  "description": "Search the Art Institute of Chicago collection: artworks, artists, exhibitions, provenance, and audio tours via MCP. STDIO or Streamable HTTP.",
+  "description": "Search the Art Institute of Chicago collection: artworks, artists, exhibitions, and audio guides via MCP. STDIO or Streamable HTTP.",
   "author": "Casey Hand <casey@caseyjhand.com> (https://caseyjhand.com)",
   "funding": [
     {
@@ -48,6 +48,7 @@
     "changelog:build": "bun run scripts/build-changelog.ts",
     "changelog:check": "bun run scripts/build-changelog.ts --check",
     "release:github": "bun run scripts/release-github.ts",
+    "publish-mcp": "mcp-publisher login github -token \"$(security find-generic-password -a \"$USER\" -s mcp-publisher-github-pat -w)\" && mcp-publisher publish",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "start": "node dist/index.js",
@@ -60,6 +61,10 @@
     "art",
     "museum",
     "artwork",
+    "art-history",
+    "provenance",
+    "exhibitions",
+    "public-domain",
     "iiif",
     "mcp",
     "mcp-server",
