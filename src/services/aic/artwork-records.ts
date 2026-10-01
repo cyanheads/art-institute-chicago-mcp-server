@@ -16,8 +16,19 @@ export const DEFAULT_SECTIONS: readonly ArtworkSection[] = ['description', 'prov
 /** Most `/sounds` ids loaded per call, across all records. */
 const MAX_RELATED_MEDIA = 20;
 
-/** Records past this much cumulative serialized text are deferred to a follow-up call. */
-const RESPONSE_BUDGET_CHARS = 200_000;
+/**
+ * Records, related media included, stop before their summed wire bytes would pass this: a
+ * 100,000-byte response ceiling (about 25k tokens, the default tool-output limit of common
+ * clients) less 15,000 held back for the license text, attribution, and notices.
+ */
+const RECORD_BUDGET_BYTES = 85_000;
+
+const utf8 = new TextEncoder();
+
+/** UTF-8 bytes of `value` serialized as JSON, the form both MCP result surfaces travel in. */
+export function jsonBytes(value: unknown): number {
+  return utf8.encode(JSON.stringify(value)).byteLength;
+}
 
 export const DESCRIPTION_ATTRIBUTION =
   "Description text © Art Institute of Chicago, CC BY 4.0 — cite the record's web_url.";
@@ -29,6 +40,8 @@ export interface ArtworkRecordsRequest {
   ids: readonly number[];
   include_related_media: boolean;
   sections: readonly ArtworkSection[];
+  /** Bytes one record puts on the caller's wire; the response budget sums it per record. */
+  wireBytes: (record: ArtworkDetail) => number;
 }
 
 export interface ArtworkRecordsResult {
@@ -45,24 +58,21 @@ export interface ArtworkRecordsResult {
   notices: string[];
 }
 
-/** Fetch, budget, and enrich artwork records for `ids`. */
+/** Fetch, budget by the caller's wire size, and enrich artwork records for `ids`. */
 export async function loadArtworkRecords(
   request: ArtworkRecordsRequest,
   ctx: Context,
 ): Promise<ArtworkRecordsResult> {
   const batch = await getAicService().getArtworks(request.ids, request.sections, ctx);
 
-  const kept: ArtworkBatchEntry[] = [];
-  const deferredIds: number[] = [];
-  let chars = 0;
-  for (const entry of batch.entries) {
-    if (chars > RESPONSE_BUDGET_CHARS) {
-      deferredIds.push(entry.detail.id);
-      continue;
-    }
-    kept.push(entry);
-    chars += JSON.stringify(entry.detail).length;
-  }
+  // Media only adds bytes, so the records that fit without it bound those that fit with it:
+  // load media for those alone, then cut again with it counted.
+  const fitting = withinBudget(batch.entries, (entry) => request.wireBytes(entry.detail));
+  const media = request.include_related_media ? await attachRelatedMedia(fitting, ctx) : undefined;
+  const artworks = media
+    ? withinBudget(media.artworks, request.wireBytes)
+    : fitting.map((entry) => entry.detail);
+  const deferredIds = batch.entries.slice(artworks.length).map((entry) => entry.detail.id);
 
   const notices: string[] = [];
   if (batch.entries.length === 0) {
@@ -77,10 +87,13 @@ export async function loadArtworkRecords(
       `The response budget was reached; call artic_get_artworks again with ids ${deferredIds.join(', ')} (or fewer sections) for the rest.`,
     );
   }
-
-  const artworks = request.include_related_media
-    ? await attachRelatedMedia(kept, notices, ctx)
-    : kept.map((entry) => entry.detail);
+  if (media?.degraded) notices.push(RELATED_MEDIA_DEGRADED);
+  const cappedIds = artworks.filter((artwork) => media?.capped.has(artwork.id)).map((a) => a.id);
+  if (cappedIds.length > 0) {
+    notices.push(
+      `Related media is capped at ${MAX_RELATED_MEDIA} items per call; artwork ${cappedIds.join(', ')} is missing some or all of its related media. Call artic_get_artworks with fewer ids to load it.`,
+    );
+  }
 
   const hasDescription = artworks.some(
     (artwork) => artwork.description !== undefined || artwork.short_description !== undefined,
@@ -95,21 +108,38 @@ export async function loadArtworkRecords(
   };
 }
 
+/** The leading items whose summed size stays within the record budget; the first always stays. */
+function withinBudget<T>(items: readonly T[], size: (item: T) => number): T[] {
+  let bytes = 0;
+  const cut = items.findIndex((item, index) => {
+    bytes += size(item);
+    return index > 0 && bytes > RECORD_BUDGET_BYTES;
+  });
+  return items.slice(0, cut === -1 ? items.length : cut);
+}
+
+interface RelatedMediaResult {
+  artworks: ArtworkDetail[];
+  /** Records missing some or all of their media past the cap. */
+  capped: Set<number>;
+  /** The `/sounds` call failed, so no record carries media. */
+  degraded: boolean;
+}
+
 /**
  * Loads the union of the records' sound ids (record order, capped at 20) in one
  * call and attaches each record's media. `related_media` is attached only when
  * at least one item loaded, never as an empty list: a record whose sound ids all
- * fell past the cap (named in a notice) or came back without a usable asset URL
- * carries none. A failed load degrades: no record carries related media, and a
- * notice says how to retry. Cancellation rethrows.
+ * fell past the cap or came back without a usable asset URL carries none. A
+ * failed load degrades to the records without media. Cancellation rethrows.
  */
 async function attachRelatedMedia(
   entries: readonly ArtworkBatchEntry[],
-  notices: string[],
   ctx: Context,
-): Promise<ArtworkDetail[]> {
+): Promise<RelatedMediaResult> {
+  const details = entries.map((entry) => entry.detail);
   const union = [...new Set(entries.flatMap((entry) => entry.sound_ids))];
-  if (union.length === 0) return entries.map((entry) => entry.detail);
+  if (union.length === 0) return { artworks: details, capped: new Set(), degraded: false };
 
   const loadIds = union.slice(0, MAX_RELATED_MEDIA);
   let sounds: Map<string, RelatedMedia>;
@@ -121,23 +151,16 @@ async function attachRelatedMedia(
     ctx.log.warning('Related media could not be loaded; returning records without it', {
       error: error instanceof Error ? error.message : String(error),
     });
-    notices.push(RELATED_MEDIA_DEGRADED);
-    return entries.map((entry) => entry.detail);
+    return { artworks: details, capped: new Set(), degraded: true };
   }
 
   const loaded = new Set(loadIds);
-  const capped: number[] = [];
+  const capped = new Set<number>();
   const artworks = entries.map(({ detail, sound_ids }) => {
-    if (sound_ids.length === 0) return detail;
     const inLoad = sound_ids.filter((id) => loaded.has(id));
-    if (inLoad.length < sound_ids.length) capped.push(detail.id);
+    if (inLoad.length < sound_ids.length) capped.add(detail.id);
     const media = inLoad.flatMap((id) => sounds.get(id) ?? []);
     return media.length > 0 ? { ...detail, related_media: media } : detail;
   });
-  if (capped.length > 0) {
-    notices.push(
-      `Related media is capped at ${MAX_RELATED_MEDIA} items per call; artwork ${capped.join(', ')} is missing some or all of its related media. Call artic_get_artworks with fewer ids to load it.`,
-    );
-  }
-  return artworks;
+  return { artworks, capped, degraded: false };
 }

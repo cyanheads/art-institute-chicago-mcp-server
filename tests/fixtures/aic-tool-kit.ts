@@ -114,8 +114,8 @@ export const UPSTREAM_FAILURES: readonly UpstreamFailureCase[] = [
   {
     name: '403 edge block without the API error body',
     responder: textResponder(EDGE_BLOCK_HTML, 403, { 'content-type': 'text/html' }),
-    code: JsonRpcErrorCode.RateLimited,
-    reason: 'rate_limited',
+    code: JsonRpcErrorCode.Forbidden,
+    reason: 'request_blocked',
   },
   {
     name: '403 API refusal unrelated to paging',

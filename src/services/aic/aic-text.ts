@@ -2,8 +2,8 @@
  * @fileoverview Pure helpers shared by the Art Institute service and the tool
  * definitions: input preprocessors for form-client blanks and comma lists,
  * HTML-to-text conversion, markdown-safe rendering of upstream text,
- * constructed IIIF and web URLs, keyword truncation, vocabulary filter routing,
- * placeholder-year screening, and search-window paging.
+ * constructed IIIF and web URLs, vocabulary filter routing, placeholder-year
+ * screening, and search-window paging.
  * @module services/aic/aic-text
  */
 
@@ -322,7 +322,7 @@ export function printableUrl(url: string): string {
 // --- Constructed URLs --------------------------------------------------------
 
 export const FALLBACK_IIIF_URL = 'https://www.artic.edu/iiif/2';
-const API_BASE_URL = 'https://api.artic.edu/api/v1';
+export const API_BASE_URL = 'https://api.artic.edu/api/v1';
 
 /** The artwork's public page (301s to the slugged URL). */
 export function artworkWebUrl(id: number): string {
@@ -373,13 +373,6 @@ export function buildImage(
 
 // --- Vocabulary routing ------------------------------------------------------
 
-/** Keyword values are truncated at 40 characters in the index. */
-export const KEYWORD_MAX_LENGTH = 40;
-
-export function truncateKeyword(value: string): string {
-  return value.slice(0, KEYWORD_MAX_LENGTH);
-}
-
 /** Vocabularies `artic_lookup_vocabulary` lists, and the keyword field each aggregates. */
 export const VOCABULARY_FIELDS = {
   department: 'department_title.keyword',
@@ -397,7 +390,17 @@ export const VOCABULARY_FIELDS = {
 export type Vocabulary = keyof typeof VOCABULARY_FIELDS;
 
 /** Vocabularies that are also `artic_search_artworks` filters (the parameter shares the name). */
-export type VocabularyFilter = Exclude<Vocabulary, 'material' | 'technique' | 'theme'>;
+export const VOCABULARY_FILTERS = [
+  'department',
+  'artwork_type',
+  'style',
+  'subject',
+  'classification',
+  'place_of_origin',
+  'gallery',
+] as const satisfies readonly Vocabulary[];
+
+export type VocabularyFilter = (typeof VOCABULARY_FILTERS)[number];
 
 const ID_ROUTES: Partial<
   Record<VocabularyFilter, { field: string; numeric?: true; pattern: RegExp }>
@@ -412,7 +415,8 @@ const ID_ROUTES: Partial<
 /**
  * Query clause for one vocabulary filter value. An id (`PC-n`, `TM-n`, an
  * artwork type number) routes to the exact id field; a title matches the
- * keyword field case-insensitively, truncated to the index's 40 characters.
+ * keyword field whole, case-insensitively, since the index stores every value
+ * as written.
  */
 export function vocabularyFilterClause(
   filter: VocabularyFilter,
@@ -422,11 +426,7 @@ export function vocabularyFilterClause(
   if (idRoute?.pattern.test(value)) {
     return { term: { [idRoute.field]: idRoute.numeric ? Number(value) : value } };
   }
-  return {
-    term: {
-      [VOCABULARY_FIELDS[filter]]: { value: truncateKeyword(value), case_insensitive: true },
-    },
-  };
+  return { term: { [VOCABULARY_FIELDS[filter]]: { value, case_insensitive: true } } };
 }
 
 /**

@@ -121,6 +121,15 @@ export const searchAudioGuide = tool('artic_search_audio_guide', {
       thrownBy: 'service',
     },
     {
+      reason: 'request_blocked',
+      code: JsonRpcErrorCode.Forbidden,
+      when: "The Art Institute API's firewall blocked the request, as it does for markup or script-like text and for bursts of traffic.",
+      retryable: false,
+      recovery:
+        'Remove markup or script-like text, such as HTML tags, from query, then call artic_search_audio_guide again; if it holds none, wait about a minute first.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'upstream_rejected_query',
       code: JsonRpcErrorCode.InternalError,
       when: 'The Art Institute API rejected a request this server built from valid inputs.',

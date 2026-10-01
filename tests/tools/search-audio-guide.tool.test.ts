@@ -438,10 +438,11 @@ describe('artic_search_audio_guide upstream failures', () => {
     expect(errorOf(await pending).code).toBe(JsonRpcErrorCode.RequestCancelled);
   });
 
-  it('declares the three contract reasons with their codes', () => {
+  it('declares the four contract reasons with their codes', () => {
     expect(searchAudioGuide.errors?.map((entry) => [entry.reason, entry.code])).toEqual([
       ['page_beyond_window', JsonRpcErrorCode.ValidationError],
       ['rate_limited', JsonRpcErrorCode.RateLimited],
+      ['request_blocked', JsonRpcErrorCode.Forbidden],
       ['upstream_rejected_query', JsonRpcErrorCode.InternalError],
     ]);
   });

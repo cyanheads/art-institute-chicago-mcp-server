@@ -15,7 +15,7 @@ import {
   printableUrl,
   quoteBlock,
 } from '@/services/aic/aic-text.js';
-import { DEFAULT_SECTIONS, loadArtworkRecords } from '@/services/aic/artwork-records.js';
+import { DEFAULT_SECTIONS, jsonBytes, loadArtworkRecords } from '@/services/aic/artwork-records.js';
 import { artworkSummaryShape, summaryLines, titleText } from '../artwork-output.js';
 
 const SECTIONS = [
@@ -247,6 +247,15 @@ export const getArtworks = tool('artic_get_artworks', {
       thrownBy: 'service',
     },
     {
+      reason: 'request_blocked',
+      code: JsonRpcErrorCode.Forbidden,
+      when: "The Art Institute API's firewall blocked the request, as it does for markup or script-like text and for bursts of traffic.",
+      retryable: false,
+      recovery:
+        'Wait about a minute, then call artic_get_artworks again with the same ids; ids carry no text the firewall could object to.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'upstream_rejected_query',
       code: JsonRpcErrorCode.InternalError,
       when: 'The Art Institute API rejected a request this server built from valid inputs.',
@@ -263,6 +272,8 @@ export const getArtworks = tool('artic_get_artworks', {
         ids: input.ids,
         sections: input.sections,
         include_related_media: input.include_related_media,
+        // format() puts each record on the wire a second time, as markdown.
+        wireBytes: (record) => jsonBytes(record) + jsonBytes(recordLines(record).join('\n')),
       },
       ctx,
     );

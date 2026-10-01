@@ -205,8 +205,15 @@ describe('artic_search_artworks request', () => {
     ],
     [
       'department',
-      'x'.repeat(50),
-      { term: { 'department_title.keyword': { value: 'x'.repeat(40), case_insensitive: true } } },
+      'Ryerson and Burnham Libraries Special Collections',
+      {
+        term: {
+          'department_title.keyword': {
+            value: 'Ryerson and Burnham Libraries Special Collections',
+            case_insensitive: true,
+          },
+        },
+      },
     ],
   ])('routes %s %j through the schema to %j', async (name, value, clause) => {
     const fetchFake = emptyResults();
@@ -969,11 +976,12 @@ describe('artic_search_artworks upstream failures', () => {
     expect(errorOf(await pending).code).toBe(JsonRpcErrorCode.RequestCancelled);
   });
 
-  it('declares the four contract reasons with their codes', () => {
+  it('declares the five contract reasons with their codes', () => {
     expect(searchArtworks.errors?.map((entry) => [entry.reason, entry.code])).toEqual([
       ['page_beyond_window', JsonRpcErrorCode.ValidationError],
       ['invalid_year_range', JsonRpcErrorCode.ValidationError],
       ['rate_limited', JsonRpcErrorCode.RateLimited],
+      ['request_blocked', JsonRpcErrorCode.Forbidden],
       ['upstream_rejected_query', JsonRpcErrorCode.InternalError],
     ]);
   });

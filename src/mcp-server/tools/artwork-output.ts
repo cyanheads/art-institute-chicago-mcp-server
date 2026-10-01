@@ -8,7 +8,7 @@
 import { z } from '@cyanheads/mcp-ts-core';
 import { inlineSafe, printableUrl } from '@/services/aic/aic-text.js';
 
-export const ArtworkImageSchema = z
+const ArtworkImageSchema = z
   .object({
     url: z
       .string()
@@ -92,7 +92,7 @@ export function yesNo(value: boolean): string {
 }
 
 /** Markdown lines for the primary image: URLs, size, rights, and alt text. */
-export function imageLines(image: ArtworkImage): string[] {
+function imageLines(image: ArtworkImage): string[] {
   const urls = [`display ${printableUrl(image.url)}`];
   if (image.url_large) urls.push(`large ${printableUrl(image.url_large)}`);
   urls.push(`IIIF info ${printableUrl(image.iiif_info_url)}`);

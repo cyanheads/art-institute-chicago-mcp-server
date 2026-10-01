@@ -1,6 +1,6 @@
 /**
  * @fileoverview Tests for `loadArtworkRecords`: request-order records, missing
- * ids, the 200,000-character response budget and deferred ids, the 20-id
+ * ids, the wire-byte response budget and deferred ids, the 20-id
  * related-media cap, degradation when `/sounds` fails, cancellation, and the
  * description attribution.
  * @module tests/services/artwork-records.test.ts
@@ -14,6 +14,7 @@ import { disposeAicService, initAicService } from '@/services/aic/aic-service.js
 import {
   DEFAULT_SECTIONS,
   DESCRIPTION_ATTRIBUTION,
+  jsonBytes,
   loadArtworkRecords,
 } from '@/services/aic/artwork-records.js';
 import {
@@ -63,6 +64,7 @@ const request = (
   ids,
   include_related_media: true,
   sections: DEFAULT_SECTIONS,
+  wireBytes: jsonBytes,
   ...overrides,
 });
 
@@ -217,7 +219,7 @@ describe('loadArtworkRecords', () => {
 
     it('keeps everything under the budget', async () => {
       setup({
-        [ARTWORKS]: jsonResponder(envelope([bulky(1, 50_000), bulky(2, 50_000), bulky(3, 50_000)])),
+        [ARTWORKS]: jsonResponder(envelope([bulky(1, 25_000), bulky(2, 25_000), bulky(3, 25_000)])),
       });
       const result = await loadArtworkRecords(
         request([1, 2, 3], { include_related_media: false }),
@@ -227,10 +229,10 @@ describe('loadArtworkRecords', () => {
       expect(result.deferred_ids).toEqual([]);
     });
 
-    it('defers the records after the one that crosses 200,000 characters, in request order', async () => {
+    it('defers the record that would pass 85,000 bytes and those after it, in request order', async () => {
       setup({
         [ARTWORKS]: jsonResponder(
-          envelope([bulky(4, 120_000), bulky(2, 120_000), bulky(1, 120_000), bulky(3, 120_000)]),
+          envelope([bulky(4, 30_000), bulky(2, 30_000), bulky(1, 30_000), bulky(3, 30_000)]),
         ),
       });
       const result = await loadArtworkRecords(
@@ -267,18 +269,30 @@ describe('loadArtworkRecords', () => {
       expect(result.notices[1]).toContain('response budget');
     });
 
-    it('stops deferring only at the point the running total first exceeds the budget', async () => {
+    it('defers every record after the first that does not fit, even a smaller one', async () => {
       setup({
-        [ARTWORKS]: jsonResponder(
-          envelope([bulky(1, 90_000), bulky(2, 90_000), bulky(3, 90_000), bulky(4, 90_000)]),
-        ),
+        [ARTWORKS]: jsonResponder(envelope([bulky(1, 40_000), bulky(2, 50_000), bulky(3, 10)])),
       });
       const result = await loadArtworkRecords(
-        request([1, 2, 3, 4], { include_related_media: false }),
+        request([1, 2, 3], { include_related_media: false }),
         createMockContext(),
       );
-      expect(result.artworks.map((a) => a.id)).toEqual([1, 2, 3]);
-      expect(result.deferred_ids).toEqual([4]);
+      expect(result.artworks.map((a) => a.id)).toEqual([1]);
+      expect(result.deferred_ids).toEqual([2, 3]);
+    });
+
+    it("sums the caller's wire measure, not the record's JSON alone", async () => {
+      setup({ [ARTWORKS]: jsonResponder(envelope([bulky(1, 30_000), bulky(2, 30_000)])) });
+      const asJson = await loadArtworkRecords(
+        request([1, 2], { include_related_media: false }),
+        createMockContext(),
+      );
+      expect(asJson.deferred_ids).toEqual([]);
+      const twice = await loadArtworkRecords(
+        request([1, 2], { include_related_media: false, wireBytes: (r) => 2 * jsonBytes(r) }),
+        createMockContext(),
+      );
+      expect(twice.deferred_ids).toEqual([2]);
     });
 
     it('does not load related media for deferred records', async () => {
@@ -294,6 +308,30 @@ describe('loadArtworkRecords', () => {
       const result = await loadArtworkRecords(request([1, 2]), createMockContext());
       expect(result.deferred_ids).toEqual([2]);
       expect(idsRequested(fetch, SOUNDS)).toEqual([[soundUuid(1)]]);
+    });
+
+    it('counts related media against the budget and leaves deferred records out of the cap notice', async () => {
+      const lectures = Array.from({ length: 20 }, (_, i) => soundUuid(i + 1));
+      setup({
+        [ARTWORKS]: jsonResponder(
+          envelope([
+            { ...bulky(1, 40_000), sound_ids: lectures },
+            { ...bulky(2, 40_000), sound_ids: [soundUuid(21)] },
+          ]),
+        ),
+        [SOUNDS]: jsonResponder(
+          envelope(
+            [...lectures, soundUuid(21)].map((id) => soundRecord(id, { title: 'l'.repeat(1_000) })),
+          ),
+        ),
+      });
+      const result = await loadArtworkRecords(request([1, 2]), createMockContext());
+      expect(result.artworks.map((a) => a.id)).toEqual([1]);
+      expect(result.artworks[0]?.related_media).toHaveLength(20);
+      expect(result.deferred_ids).toEqual([2]);
+      expect(result.notices).toEqual([
+        'The response budget was reached; call artic_get_artworks again with ids 2 (or fewer sections) for the rest.',
+      ]);
     });
   });
 
@@ -505,7 +543,7 @@ describe('loadArtworkRecords', () => {
     it.each([
       ['a 5xx', jsonResponder({}, 500)],
       ['a rate limit', jsonResponder({}, 429)],
-      ['a throttling 403', textResponder('<html>blocked</html>', 403)],
+      ['a firewall 403', textResponder('<html>blocked</html>', 403)],
       ['a 400 rejection', textResponder(ES_BAD_REQUEST_TEXT, 400)],
       ['a rejected 403 JSON', jsonResponder({ status: 403, error: 'Forbidden' }, 403)],
       ['a network failure', networkErrorResponder()],

@@ -16,6 +16,7 @@ import {
   pageInfo,
   quoteBlock,
   SEARCH_WINDOW,
+  VOCABULARY_FILTERS,
   vocabularyInput,
   WINDOW_NOTICE,
   YEAR_MAX,
@@ -31,17 +32,6 @@ const FACETS = [
   'classification',
   'place_of_origin',
   'artist',
-] as const;
-
-/** Inputs whose values come from `artic_lookup_vocabulary`, named as its vocabularies. */
-const VOCABULARY_INPUTS = [
-  'department',
-  'artwork_type',
-  'style',
-  'subject',
-  'classification',
-  'place_of_origin',
-  'gallery',
 ] as const;
 
 const SCOPE_FLAGS = ['public_domain_only', 'on_view_only', 'has_image'] as const;
@@ -72,19 +62,19 @@ const SearchInput = z.object({
     'Agent id from artic_search_artists or an artist facet row; matches preferred and other credits.',
   ),
   department: vocabularyInput(120).describe(
-    'Department title or PC- id, exactly as artic_lookup_vocabulary lists it (case ignored), such as Prints and Drawings.',
+    'Department title exactly as artic_lookup_vocabulary lists it (case ignored), such as Prints and Drawings.',
   ),
   artwork_type: vocabularyInput(120).describe(
-    'Artwork type title (such as Painting or Print) or numeric type id, as artic_lookup_vocabulary lists it (case ignored).',
+    'Artwork type title as artic_lookup_vocabulary lists it (case ignored), such as Painting or Print.',
   ),
   style: vocabularyInput(120).describe(
-    'Style title or TM- id, as artic_lookup_vocabulary lists it (case ignored), such as Impressionism; matches preferred or alternate styles.',
+    'Style title as artic_lookup_vocabulary lists it (case ignored), such as Impressionism; matches preferred or alternate styles.',
   ),
   subject: vocabularyInput(120).describe(
-    'Subject title or TM- id, as artic_lookup_vocabulary lists it (case ignored).',
+    'Subject title as artic_lookup_vocabulary lists it (case ignored).',
   ),
   classification: vocabularyInput(120).describe(
-    'Classification title (such as oil on canvas or etching) or TM- id, as artic_lookup_vocabulary lists it (case ignored).',
+    'Classification title as artic_lookup_vocabulary lists it (case ignored), such as oil on canvas or etching.',
   ),
   place_of_origin: vocabularyInput(120).describe(
     'Place of origin as artic_lookup_vocabulary lists it (case ignored), such as france.',
@@ -124,7 +114,7 @@ type SearchInputValues = z.infer<typeof SearchInput>;
 /** Zero-hit guidance: one fragment per filter in play, each routing to a call. */
 function zeroHitFragments(input: SearchInputValues): string[] {
   const fragments = ['No artworks matched.'];
-  const vocabularies = VOCABULARY_INPUTS.filter((name) => input[name] !== undefined);
+  const vocabularies = VOCABULARY_FILTERS.filter((name) => input[name] !== undefined);
   if (vocabularies.length > 0) {
     fragments.push(
       `Check filter values with artic_lookup_vocabulary (vocabulary ${vocabularies.map((name) => `"${name}"`).join(', ')}) — values match exactly, ignoring case.`,
@@ -246,6 +236,15 @@ export const searchArtworks = tool('artic_search_artworks', {
       retryable: true,
       recovery:
         'Wait about a minute and retry; the Art Institute API allows about 60 requests per minute from this server, so batch ids into one artic_get_artworks call.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'request_blocked',
+      code: JsonRpcErrorCode.Forbidden,
+      when: "The Art Institute API's firewall blocked the request, as it does for markup or script-like text and for bursts of traffic.",
+      retryable: false,
+      recovery:
+        'Remove markup or script-like text, such as HTML tags, from query and the other text filters, then call artic_search_artworks again; if they hold none, wait about a minute first.',
       thrownBy: 'service',
     },
     {

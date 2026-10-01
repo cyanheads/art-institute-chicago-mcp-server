@@ -359,9 +359,10 @@ describe('artic_lookup_vocabulary upstream failures', () => {
     },
   );
 
-  it('declares both shared reasons in the contract', () => {
+  it('declares the three shared reasons in the contract', () => {
     expect(lookupVocabulary.errors?.map((e) => e.reason)).toEqual([
       'rate_limited',
+      'request_blocked',
       'upstream_rejected_query',
     ]);
   });

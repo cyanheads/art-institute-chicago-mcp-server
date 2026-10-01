@@ -154,15 +154,19 @@ describe('AicService status classification', () => {
     );
   });
 
-  describe('throttling', () => {
-    it('maps a 403 without the API JSON body (an edge block) to rate_limited and retries it', async () => {
+  describe('edge firewall blocks', () => {
+    it('maps a 403 without the API JSON body to request_blocked, without retrying', async () => {
       const { service, fetch } = createTestService(
-        scriptedFetch(textResponder(EDGE_BLOCK_HTML, 403, {})),
+        scriptedFetch(textResponder(EDGE_BLOCK_HTML, 403, { 'content-type': 'text/html' })),
       );
       const error = await rejection(search(service));
-      expect(error.code).toBe(JsonRpcErrorCode.RateLimited);
-      expect(error.data).toMatchObject({ reason: 'rate_limited', status: 403 });
-      expect(fetch).toHaveBeenCalledTimes(3);
+      expect(error.code).toBe(JsonRpcErrorCode.Forbidden);
+      expect(error.data).toMatchObject({
+        reason: 'request_blocked',
+        retryable: false,
+        status: 403,
+      });
+      expect(fetch).toHaveBeenCalledTimes(1);
     });
 
     it.each([
@@ -174,9 +178,49 @@ describe('AicService status classification', () => {
     ])('treats a 403 with %s as an edge block', async (_name, text) => {
       const { service } = createTestService(scriptedFetch(textResponder(text, 403)));
       const error = await rejection(search(service));
-      expect(error.data).toMatchObject({ reason: 'rate_limited' });
+      expect(error.data).toMatchObject({ reason: 'request_blocked', retryable: false });
     });
 
+    it('leaves the shared cooldown open, so other calls are not held back', async () => {
+      const pacer = createPacer({
+        name: 'aic-test-cooldown',
+        cooldown: { baseMs: MINUTE, maxMs: MINUTE },
+      });
+      const { service, fetch } = createTestService(
+        scriptedFetch(
+          textResponder(EDGE_BLOCK_HTML, 403, { 'content-type': 'text/html' }),
+          jsonResponder(searchEnvelope([artworkRecord(1)])),
+        ),
+        { pacer },
+      );
+      const ctx = makeCtx();
+      const blocked = await rejection(
+        service.searchArtworks(artworkParams({ query: '<script>alert(1)</script>' }), ctx),
+      );
+      expect(blocked.data).toMatchObject({ reason: 'request_blocked' });
+      expect(pacer.cooldown.remainingMs).toBe(0);
+      const next = await service.searchArtworks(artworkParams({ query: 'water' }), ctx);
+      expect(next.artworks).toHaveLength(1);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      pacer.dispose();
+    });
+
+    it('closes the shared cooldown on a 429, unlike an edge block', async () => {
+      const pacer = createPacer({
+        name: 'aic-test-cooldown-429',
+        cooldown: { baseMs: MINUTE, maxMs: MINUTE },
+      });
+      const { service } = createTestService(scriptedFetch(jsonResponder({}, 429)), {
+        pacer,
+        retry: { baseDelayMs: 0, maxRetries: 0 },
+      });
+      await rejection(search(service));
+      expect(pacer.cooldown.remainingMs).toBeGreaterThan(0);
+      pacer.dispose();
+    });
+  });
+
+  describe('throttling', () => {
     it('maps 429 to rate_limited and retries up to the attempt budget', async () => {
       const { service, fetch } = createTestService(scriptedFetch(jsonResponder({}, 429)));
       const error = await rejection(search(service));
@@ -211,14 +255,6 @@ describe('AicService status classification', () => {
       );
       const error = await rejection(search(service));
       expect(error.data?.retryAfter).toBe(date);
-    });
-
-    it('carries retryAfter on a throttling 403 as well', async () => {
-      const { service } = createTestService(
-        scriptedFetch(textResponder(EDGE_BLOCK_HTML, 403, { 'retry-after': '45' })),
-      );
-      const error = await rejection(search(service));
-      expect(error.data).toMatchObject({ reason: 'rate_limited', retryAfter: 45 });
     });
 
     it('omits retryAfter when there is no Retry-After header or it is blank', async () => {

@@ -476,7 +476,7 @@ describe('artic://artworks/{id} definition', () => {
     expect(artworkResource.list).toBeUndefined();
   });
 
-  it('declares the three contract reasons with their codes and recoveries', () => {
+  it('declares the four contract reasons with their codes and recoveries', () => {
     expect(
       artworkResource.errors?.map((entry) => [entry.reason, entry.code, entry.recovery]),
     ).toEqual([
@@ -489,6 +489,11 @@ describe('artic://artworks/{id} definition', () => {
         'rate_limited',
         JsonRpcErrorCode.RateLimited,
         'Wait about a minute and retry; the Art Institute API allows about 60 requests per minute from this server, so batch ids into one artic_get_artworks call.',
+      ],
+      [
+        'request_blocked',
+        JsonRpcErrorCode.Forbidden,
+        'Wait about a minute, then read artic://artworks/<id> again.',
       ],
       [
         'upstream_rejected_query',

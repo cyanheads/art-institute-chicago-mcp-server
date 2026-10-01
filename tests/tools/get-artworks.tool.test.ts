@@ -471,8 +471,77 @@ describe('artic_get_artworks response budget', () => {
   const big = (id: number, chars: number) =>
     artworkRecord(id, { provenance_text: 'p'.repeat(chars) });
 
-  it('defers records once cumulative text passes 200,000 characters', async () => {
-    serve([big(1, 120_000), big(2, 120_000), big(3, 120_000)]);
+  /** UTF-8 bytes the call puts on the wire: format() text and structuredContent, each as JSON. */
+  const wireBytes = (result: Awaited<ReturnType<typeof get>>) =>
+    Buffer.byteLength(JSON.stringify(textOf(result))) +
+    Buffer.byteLength(JSON.stringify(result.structuredContent));
+
+  it('counts the format() markdown as well as the structured record', async () => {
+    serve([big(1, 30_000), big(2, 30_000)]);
+    const out = structuredOf<GetRun>(
+      await get({ ids: [1, 2], sections: ['provenance'], include_related_media: false }),
+    );
+    expect(out.artworks.map((artwork) => artwork.id)).toEqual([1]);
+    expect(out.deferred_ids).toEqual([2]);
+  });
+
+  it('keeps a ten-id response with related media under 100,000 bytes on the wire', async () => {
+    serve(
+      Array.from({ length: 10 }, (_, i) => ({
+        ...big(i + 1, 19_000),
+        description: `<p>${'d'.repeat(1_000)}</p>`,
+        sound_ids: [soundUuid(2 * i + 1), soundUuid(2 * i + 2)],
+      })),
+      Array.from({ length: 20 }, (_, i) =>
+        soundRecord(soundUuid(i + 1), { title: `A long related media title ${'t'.repeat(40)}` }),
+      ),
+    );
+    const result = await get({ ids: Array.from({ length: 10 }, (_, i) => i + 1) });
+    const out = structuredOf<GetRun>(result);
+    expect(out.deferred_ids.length).toBeGreaterThan(0);
+    expect(wireBytes(result)).toBeLessThanOrEqual(100_000);
+  });
+
+  it.each(Array.from({ length: 13 }, (_, i) => 600 + 50 * i))(
+    'keeps the whole result under 100,000 bytes at the worst case: ten ids, every section, 20 long-titled media items (%i-character sections)',
+    async (chars) => {
+      const ids = Array.from({ length: 10 }, (_, i) => 100_001 + i);
+      const text = (char: string) => char.repeat(chars);
+      serve(
+        ids.slice(0, 9).map((id, i) =>
+          artworkRecord(id, {
+            description: `<p>${text('d')}</p>`,
+            short_description: text('s'),
+            provenance_text: text('p'),
+            exhibition_history: text('e'),
+            publication_history: text('u'),
+            catalogue_display: `<p>${text('c')}</p>`,
+            sound_ids: [soundUuid(3 * i + 1), soundUuid(3 * i + 2), soundUuid(3 * i + 3)],
+          }),
+        ),
+        Array.from({ length: 27 }, (_, i) =>
+          soundRecord(soundUuid(i + 1), { title: `Audio Lecture: ${'l'.repeat(385)}` }),
+        ),
+      );
+      const result = await get({
+        ids,
+        sections: [
+          'description',
+          'provenance',
+          'exhibition_history',
+          'publication_history',
+          'catalogue',
+        ],
+      });
+      const out = structuredOf<GetRun>(result);
+      expect(out.missing_ids).toEqual([100_010]);
+      expect(out.deferred_ids.length).toBeGreaterThan(0);
+      expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(100_000);
+    },
+  );
+
+  it('defers records once their wire bytes would pass the budget', async () => {
+    serve([big(1, 20_000), big(2, 20_000), big(3, 20_000)]);
     const result = await get({
       ids: [1, 2, 3],
       sections: ['provenance'],
@@ -498,7 +567,7 @@ describe('artic_get_artworks response budget', () => {
   });
 
   it('defers nothing when the records fit', async () => {
-    serve([big(1, 50_000), big(2, 50_000)]);
+    serve([big(1, 20_000), big(2, 20_000)]);
     const out = structuredOf<GetRun>(
       await get({ ids: [1, 2], sections: ['provenance'], include_related_media: false }),
     );
@@ -875,9 +944,10 @@ describe('artic_get_artworks upstream failures', () => {
     },
   );
 
-  it('declares exactly the two shared service reasons', () => {
+  it('declares exactly the three shared service reasons', () => {
     expect(getArtworks.errors?.map((entry) => [entry.reason, entry.code])).toEqual([
       ['rate_limited', JsonRpcErrorCode.RateLimited],
+      ['request_blocked', JsonRpcErrorCode.Forbidden],
       ['upstream_rejected_query', JsonRpcErrorCode.InternalError],
     ]);
   });

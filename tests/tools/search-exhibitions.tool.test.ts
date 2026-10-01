@@ -665,11 +665,12 @@ describe('artic_search_exhibitions upstream failures', () => {
     expect(errorOf(await pending).code).toBe(JsonRpcErrorCode.RequestCancelled);
   });
 
-  it('declares the four contract reasons with their codes', () => {
+  it('declares the five contract reasons with their codes', () => {
     expect(searchExhibitions.errors?.map((entry) => [entry.reason, entry.code])).toEqual([
       ['invalid_date_range', JsonRpcErrorCode.ValidationError],
       ['page_beyond_window', JsonRpcErrorCode.ValidationError],
       ['rate_limited', JsonRpcErrorCode.RateLimited],
+      ['request_blocked', JsonRpcErrorCode.Forbidden],
       ['upstream_rejected_query', JsonRpcErrorCode.InternalError],
     ]);
   });

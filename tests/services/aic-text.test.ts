@@ -23,7 +23,6 @@ import {
   iiifInfoUrl,
   inlineSafe,
   integerList,
-  KEYWORD_MAX_LENGTH,
   listInput,
   manifestUrl,
   nonEmpty,
@@ -34,7 +33,6 @@ import {
   quoteBlock,
   SEARCH_WINDOW,
   stringList,
-  truncateKeyword,
   VOCABULARY_FIELDS,
   vocabularyFilterClause,
   vocabularyInput,
@@ -573,17 +571,6 @@ describe('buildImage', () => {
   });
 });
 
-describe('truncateKeyword', () => {
-  it('cuts to the index keyword length', () => {
-    expect(KEYWORD_MAX_LENGTH).toBe(40);
-    const long = 'gelatin silver (developing-out-paper) print';
-    expect(truncateKeyword(long)).toBe('gelatin silver (developing-out-paper) pr');
-    expect(truncateKeyword(long)).toHaveLength(40);
-    expect(truncateKeyword('short')).toBe('short');
-    expect(truncateKeyword('x'.repeat(40))).toHaveLength(40);
-  });
-});
-
 describe('vocabularyFilterClause', () => {
   it('routes a department id to department_id', () => {
     expect(vocabularyFilterClause('department', 'PC-10')).toEqual({
@@ -614,12 +601,33 @@ describe('vocabularyFilterClause', () => {
     });
   });
 
-  it('truncates a long title to the 40-character index keyword', () => {
-    const clause = vocabularyFilterClause(
+  /** Values past 40 characters the index stores whole (probed against the live API). */
+  it.each([
+    ['department', 'department_title.keyword', 'Ryerson and Burnham Libraries Special Collections'],
+    [
       'classification',
-      'gelatin silver (developing-out-paper) print',
-    );
-    expect(clause).toEqual({
+      'classification_titles.keyword',
+      'personal grooming / hygiene / cosmetic container',
+    ],
+    ['subject', 'subject_titles.keyword', 'devil/satan/lucifer/beezelbub/mephistopheles'],
+    [
+      'place_of_origin',
+      'place_of_origin.keyword',
+      'confederated salish and kootenai tribes of the flathead reservation',
+    ],
+    ['style', 'style_titles.keyword', `${'x'.repeat(60)} style`],
+    ['artwork_type', 'artwork_type_title.keyword', `${'x'.repeat(60)} type`],
+    ['gallery', 'gallery_title.keyword', `${'x'.repeat(60)} gallery`],
+  ] as const)('sends a long %s title whole to %s', (filter, field, value) => {
+    expect(vocabularyFilterClause(filter, value)).toEqual({
+      term: { [field]: { value, case_insensitive: true } },
+    });
+  });
+
+  it('sends a title the museum stores at 40 characters exactly as listed', () => {
+    expect(
+      vocabularyFilterClause('classification', 'gelatin silver (developing-out-paper) pr'),
+    ).toEqual({
       term: {
         'classification_titles.keyword': {
           value: 'gelatin silver (developing-out-paper) pr',

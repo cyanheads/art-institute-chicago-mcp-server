@@ -7,7 +7,7 @@
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { DEFAULT_SECTIONS, loadArtworkRecords } from '@/services/aic/artwork-records.js';
+import { DEFAULT_SECTIONS, jsonBytes, loadArtworkRecords } from '@/services/aic/artwork-records.js';
 
 export const artworkResource = resource('artic://artworks/{id}', {
   name: 'artic-artwork',
@@ -37,6 +37,14 @@ export const artworkResource = resource('artic://artworks/{id}', {
       thrownBy: 'service',
     },
     {
+      reason: 'request_blocked',
+      code: JsonRpcErrorCode.Forbidden,
+      when: "The Art Institute API's firewall blocked the request, as it does for markup or script-like text and for bursts of traffic.",
+      retryable: false,
+      recovery: 'Wait about a minute, then read artic://artworks/<id> again.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'upstream_rejected_query',
       code: JsonRpcErrorCode.InternalError,
       when: 'The Art Institute API rejected a request this server built from valid inputs.',
@@ -54,7 +62,7 @@ export const artworkResource = resource('artic://artworks/{id}', {
       throw ctx.fail('artwork_not_found', `No artwork exists for id ${params.id}.`);
     }
     const { artworks, license_text, description_attribution, notices } = await loadArtworkRecords(
-      { ids: [id], sections: DEFAULT_SECTIONS, include_related_media: true },
+      { ids: [id], sections: DEFAULT_SECTIONS, include_related_media: true, wireBytes: jsonBytes },
       ctx,
     );
     const [artwork] = artworks;

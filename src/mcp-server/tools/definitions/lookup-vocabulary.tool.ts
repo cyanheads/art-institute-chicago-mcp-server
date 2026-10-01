@@ -13,6 +13,7 @@ import {
   containsPattern,
   inlineSafe,
   VOCABULARY_FIELDS,
+  VOCABULARY_FILTERS,
   type VocabularyFilter,
 } from '@/services/aic/aic-text.js';
 
@@ -29,18 +30,8 @@ const VOCABULARIES = [
   'gallery',
 ] as const;
 
-const FILTER_PARAMS = [
-  'department',
-  'artwork_type',
-  'style',
-  'subject',
-  'classification',
-  'place_of_origin',
-  'gallery',
-] as const satisfies readonly VocabularyFilter[];
-
 const isFilterParam = (vocabulary: string): vocabulary is VocabularyFilter =>
-  (FILTER_PARAMS as readonly string[]).includes(vocabulary);
+  (VOCABULARY_FILTERS as readonly string[]).includes(vocabulary);
 
 export const lookupVocabulary = tool('artic_lookup_vocabulary', {
   title: 'Look up collection vocabulary',
@@ -66,7 +57,7 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
   output: z.object({
     vocabulary: z.enum(VOCABULARIES).describe('The vocabulary listed.'),
     filter_param: z
-      .enum(FILTER_PARAMS)
+      .enum(VOCABULARY_FILTERS)
       .optional()
       .describe(
         'The artic_search_artworks parameter that accepts these values as listed; absent for material, technique, and theme, which are not search filters (use their values as query text).',
@@ -78,7 +69,7 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
             value: z
               .string()
               .describe(
-                'Value as the index stores it (cut at 40 characters; place values are lower-case); pass it back verbatim.',
+                'Value as the index stores it (place values are lower-case); pass it back verbatim.',
               ),
             artwork_count: z.number().describe('Artworks carrying this value.'),
           })
@@ -103,6 +94,15 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
       retryable: true,
       recovery:
         'Wait about a minute and retry; the Art Institute API allows about 60 requests per minute from this server, so batch ids into one artic_get_artworks call.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'request_blocked',
+      code: JsonRpcErrorCode.Forbidden,
+      when: "The Art Institute API's firewall blocked the request, as it does for markup or script-like text and for bursts of traffic.",
+      retryable: false,
+      recovery:
+        'Remove markup or script-like text, such as HTML tags, from contains, then call artic_lookup_vocabulary again; if it holds none, wait about a minute first.',
       thrownBy: 'service',
     },
     {

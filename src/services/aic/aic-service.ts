@@ -9,6 +9,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import {
+  forbidden,
   internalError,
   McpError,
   rateLimited,
@@ -18,6 +19,7 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import { createPacer, isRecord, type Pacer, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import {
+  API_BASE_URL,
   artworkWebUrl,
   buildImage,
   definedOnly,
@@ -31,7 +33,7 @@ import {
   plausibleYear,
   stringList,
   VOCABULARY_FIELDS,
-  type VocabularyFilter,
+  VOCABULARY_FILTERS,
   vocabularyFilterClause,
   YEAR_MAX,
   YEAR_MIN,
@@ -58,8 +60,6 @@ import type {
   RelatedMedia,
   SampleWork,
 } from './types.js';
-
-const API_BASE_URL = 'https://api.artic.edu/api/v1';
 
 /** Bodies past this are abandoned mid-stream; the largest observed is about 1.33 MB. */
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
@@ -149,16 +149,6 @@ const EXHIBITION_FIELDS =
 const MOBILE_SOUND_FIELDS = 'id,title,web_url,transcript';
 
 const SOUND_FIELDS = 'id,title,type,content';
-
-const VOCABULARY_FILTERS: readonly VocabularyFilter[] = [
-  'department',
-  'artwork_type',
-  'style',
-  'subject',
-  'classification',
-  'place_of_origin',
-  'gallery',
-];
 
 const FACET_SIZE = 15;
 
@@ -390,7 +380,7 @@ export class AicService {
         .filter((section) => sections.includes(section))
         .flatMap((section) => SECTION_FIELDS[section]),
     ].join(',');
-    const envelope = await this.#list<RawArtwork>(
+    const envelope = await this.#request<RawArtwork>(
       '/artworks',
       { ids: ids.join(','), fields },
       TTL_MS.record,
@@ -414,7 +404,7 @@ export class AicService {
 
   /** `/sounds` multimedia assets by uuid, reordered to request order; unknown uuids are dropped. */
   async getSounds(ids: readonly string[], ctx: Context): Promise<SoundBatchResult> {
-    const envelope = await this.#list<RawSound>(
+    const envelope = await this.#request<RawSound>(
       '/sounds',
       { ids: ids.join(','), fields: SOUND_FIELDS },
       TTL_MS.record,
@@ -459,7 +449,7 @@ export class AicService {
 
   /** Agents by id, reordered to request order; unknown ids are listed as missing. */
   async getAgents(ids: readonly number[], ctx: Context): Promise<AgentBatchResult> {
-    const envelope = await this.#list<RawAgent>(
+    const envelope = await this.#request<RawAgent>(
       '/agents',
       { ids: ids.join(','), fields: AGENT_FIELDS },
       TTL_MS.record,
@@ -634,16 +624,7 @@ export class AicService {
     return this.#request<T>(path, { params: JSON.stringify(body) }, ttlMs, ctx);
   }
 
-  /** `GET <path>?ids=…&fields=…` listing-by-ids. */
-  #list<T>(
-    path: string,
-    params: Record<string, string>,
-    ttlMs: number,
-    ctx: Context,
-  ): Promise<RawEnvelope<T>> {
-    return this.#request<T>(path, params, ttlMs, ctx);
-  }
-
+  /** `GET <path>?<params>`: the listing-by-ids routes call it directly with `ids` and `fields`. */
   async #request<T>(
     path: string,
     params: Record<string, string>,
@@ -676,7 +657,7 @@ export class AicService {
         (attempt) =>
           this.#pacer.run((signal) => this.#attempt(href, signal, attempt.remainingMs, ctx), {
             signal: attempt.signal,
-            ...(Number.isFinite(attempt.remainingMs) ? { maxWaitMs: attempt.remainingMs } : {}),
+            maxWaitMs: attempt.remainingMs,
           }),
         {
           operation: `AicService ${path}`,
@@ -829,10 +810,11 @@ function classify(
   }
 
   if (status === 403) {
+    // The edge firewall's block page, never the API: not throttling, so no retry and no cooldown.
     if (!isApiErrorBody(body)) {
-      throw rateLimited(
-        'The Art Institute API edge refused the request (HTTP 403 without the API error body), which indicates throttling.',
-        { reason: 'rate_limited', status, ...retryAfterOf(response) },
+      throw forbidden(
+        "The Art Institute API's firewall blocked the request (HTTP 403 without the API error body).",
+        { reason: 'request_blocked', retryable: false, status },
       );
     }
     if (WINDOW_ERRORS.has(body.error)) {
