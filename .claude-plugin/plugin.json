@@ -12,12 +12,28 @@
   "repository": "https://github.com/cyanheads/art-institute-chicago-mcp-server",
   "license": "Apache-2.0",
   "keywords": ["art-institute-of-chicago", "artic", "art", "museum", "artwork", "iiif", "mcp", "mcp-server", "model-context-protocol"],
+  "userConfig": {
+    "AIC_CONTACT": {
+      "type": "string",
+      "title": "Contact for the Art Institute API",
+      "description": "Optional. An email or URL the museum can reach, sent in the AIC-User-Agent header. Defaults to the repository URL.",
+      "default": ""
+    },
+    "AIC_REQUESTS_PER_MINUTE": {
+      "type": "string",
+      "title": "Requests per minute",
+      "description": "Optional. Outbound request budget for api.artic.edu (1-600). Defaults to 50, under the published 60 per minute anonymous limit.",
+      "default": ""
+    }
+  },
   "mcpServers": {
     "art-institute-chicago-mcp-server": {
       "command": "npx",
       "args": ["-y", "@cyanheads/art-institute-chicago-mcp-server"],
       "env": {
-        "MCP_TRANSPORT_TYPE": "stdio"
+        "MCP_TRANSPORT_TYPE": "stdio",
+        "AIC_CONTACT": "${user_config.AIC_CONTACT}",
+        "AIC_REQUESTS_PER_MINUTE": "${user_config.AIC_REQUESTS_PER_MINUTE}"
       }
     }
   }

@@ -4,6 +4,7 @@
     "args": ["-y", "@cyanheads/art-institute-chicago-mcp-server"],
     "env": {
       "MCP_TRANSPORT_TYPE": "stdio"
-    }
+    },
+    "env_vars": ["AIC_CONTACT", "AIC_REQUESTS_PER_MINUTE"]
   }
 }

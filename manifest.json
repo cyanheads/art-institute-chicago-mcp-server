@@ -18,7 +18,9 @@
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
-        "NODE_ENV": "production"
+        "NODE_ENV": "production",
+        "AIC_CONTACT": "${user_config.AIC_CONTACT}",
+        "AIC_REQUESTS_PER_MINUTE": "${user_config.AIC_REQUESTS_PER_MINUTE}"
       }
     }
   },
@@ -27,5 +29,20 @@
   },
   "tools_generated": true,
   "prompts_generated": true,
-  "user_config": {}
+  "user_config": {
+    "AIC_CONTACT": {
+      "type": "string",
+      "title": "Contact for the Art Institute API",
+      "description": "Optional. An email or URL the museum can reach, sent in the AIC-User-Agent header. Defaults to the repository URL.",
+      "required": false,
+      "default": ""
+    },
+    "AIC_REQUESTS_PER_MINUTE": {
+      "type": "string",
+      "title": "Requests per minute",
+      "description": "Optional. Outbound request budget for api.artic.edu (1-600). Defaults to 50, under the published 60 per minute anonymous limit.",
+      "required": false,
+      "default": ""
+    }
+  }
 }

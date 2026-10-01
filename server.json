@@ -26,6 +26,20 @@
       ],
       "environmentVariables": [
         {
+          "name": "AIC_CONTACT",
+          "description": "Contact the museum can reach (an email or URL), sent in the AIC-User-Agent header on every request. Defaults to the repository URL.",
+          "format": "string",
+          "isRequired": false,
+          "default": ""
+        },
+        {
+          "name": "AIC_REQUESTS_PER_MINUTE",
+          "description": "Outbound request budget per minute for api.artic.edu (1-600). Defaults to 50, under the published 60 per minute anonymous limit.",
+          "format": "string",
+          "isRequired": false,
+          "default": ""
+        },
+        {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
           "format": "string",
@@ -81,6 +95,20 @@
           "format": "string",
           "isRequired": false,
           "default": "none"
+        },
+        {
+          "name": "AIC_CONTACT",
+          "description": "Contact the museum can reach (an email or URL), sent in the AIC-User-Agent header on every request. Defaults to the repository URL.",
+          "format": "string",
+          "isRequired": false,
+          "default": ""
+        },
+        {
+          "name": "AIC_REQUESTS_PER_MINUTE",
+          "description": "Outbound request budget per minute for api.artic.edu (1-600). Defaults to 50, under the published 60 per minute anonymous limit.",
+          "format": "string",
+          "isRequired": false,
+          "default": ""
         },
         {
           "name": "MCP_LOG_LEVEL",
