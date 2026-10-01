@@ -116,8 +116,16 @@ const soundsFor = (count: number, from = 1) =>
 // --- Params ------------------------------------------------------------------------------------
 
 describe('artic://artworks/{id} params', () => {
-  it.each(['1', '27992', '007', '0'])('accepts the digit string %j', (id) => {
+  it.each(['1', '27992', '007', '0', '9'.repeat(16)])('accepts the digit string %j', (id) => {
     expect(artworkResource.params!.parse({ id })).toEqual({ id });
+  });
+
+  it('rejects an id past 16 digits without echoing it back', () => {
+    const id = '7'.repeat(200_000);
+    const result = artworkResource.params!.safeParse({ id });
+    expect(result.success).toBe(false);
+    expect(result.error?.message).not.toContain('7'.repeat(17));
+    expect(JSON.stringify(result.error?.issues)).not.toContain('7'.repeat(17));
   });
 
   it.each([
@@ -133,6 +141,7 @@ describe('artic://artworks/{id} params', () => {
     ['a comma list', '1,2'],
     ['fullwidth digits', '１２'],
     ['a URL', 'https://www.artic.edu/artworks/12'],
+    ['17 digits', '1'.repeat(17)],
   ])('rejects %s', (_name, id) => {
     expect(artworkResource.params!.safeParse({ id }).success).toBe(false);
   });
@@ -302,12 +311,9 @@ describe('artic://artworks/{id} unknown id', () => {
     expect(queryParam(callTo(fetchFake, '/artworks'), 'ids')).toBe('0');
   });
 
-  it.each([
-    ['past 2^53', '99999999999999999999'],
-    ['long enough to read as Infinity', '9'.repeat(400)],
-  ])('fails artwork_not_found for an id %s without calling upstream', async (_name, id) => {
+  it('fails artwork_not_found for a 16-digit id past 2^53 without calling upstream', async () => {
     const fetchFake = serve([]);
-    const error = await readError(id);
+    const error = await readError('9999999999999999');
     expect(error.code).toBe(JsonRpcErrorCode.NotFound);
     expect(error.data?.reason).toBe('artwork_not_found');
     expect(fetchFake).not.toHaveBeenCalled();

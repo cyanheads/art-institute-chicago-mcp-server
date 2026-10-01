@@ -137,6 +137,13 @@ export const UPSTREAM_FAILURES: readonly UpstreamFailureCase[] = [
     reason: 'upstream_rejected_query',
   },
   {
+    name: '302 redirect, which is never followed',
+    responder: () =>
+      new Response(null, { status: 302, headers: { location: 'https://elsewhere.test/x' } }),
+    code: JsonRpcErrorCode.ServiceUnavailable,
+    forbidden: ['elsewhere.test'],
+  },
+  {
     name: '500 server error',
     responder: textResponder('upstream exploded', 500, { 'content-type': 'text/plain' }),
     code: JsonRpcErrorCode.ServiceUnavailable,

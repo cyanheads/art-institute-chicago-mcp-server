@@ -8,7 +8,7 @@
 
 import { JsonRpcErrorCode, McpError, rateLimited } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, type MockContextLogger } from '@cyanheads/mcp-ts-core/testing';
-import { createPacer, type Pacer } from '@cyanheads/mcp-ts-core/utils';
+import { createPacer, logger, type Pacer } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   API_ORIGIN,
@@ -66,6 +66,7 @@ const makeCtx = () => createMockContext();
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 // --- Status classification -------------------------------------------------------
@@ -101,6 +102,18 @@ describe('AicService status classification', () => {
       expect(fetch).toHaveBeenCalledTimes(1);
     });
 
+    it('quotes the API 403 error string on one line, escaped, and cut to 100 characters', async () => {
+      const apiError = `Refused [x](https://x.test)\r\n# Injected <b>​${'y'.repeat(500)}`;
+      const { service } = createTestService(
+        scriptedFetch(jsonResponder({ ...API_OTHER_403_BODY, error: apiError }, 403)),
+      );
+      const error = await rejection(search(service));
+      expect(error.data).toMatchObject({ reason: 'upstream_rejected_query' });
+      expect(error.message).toBe(
+        `The Art Institute API rejected the request this server built (HTTP 403, "Refused \\[x\\](https://x.test) # Injected \\<b\\>${'y'.repeat(56)}…").`,
+      );
+    });
+
     it('maps a 400 with a plain-text body served as JSON to upstream_rejected_query', async () => {
       const { service, fetch } = createTestService(
         scriptedFetch(textResponder(ES_BAD_REQUEST_TEXT, 400)),
@@ -115,7 +128,8 @@ describe('AicService status classification', () => {
       expect(fetch).toHaveBeenCalledTimes(1);
     });
 
-    it('keeps the 400 body, which names index internals, off the wire and in the log', async () => {
+    it('keeps the 400 body, which names index internals, off the wire and in the process log only', async () => {
+      const processLog = vi.spyOn(logger, 'debug');
       const { service } = createTestService(scriptedFetch(textResponder(ES_BAD_REQUEST_TEXT, 400)));
       const ctx = makeCtx();
       const error = await rejection(service.searchArtworks(artworkParams({ query: 'x' }), ctx));
@@ -123,8 +137,19 @@ describe('AicService status classification', () => {
       expect(wire).not.toContain('root_cause');
       expect(wire).not.toContain('artic-test-index');
       expect(wire).not.toContain('search_phase_execution_exception');
-      const logged = (ctx.log as MockContextLogger).calls.map((call) => JSON.stringify(call));
-      expect(logged.some((entry) => entry.includes('artic-test-index'))).toBe(true);
+      // ctx.log reaches the client as notifications/message, so the body never goes there.
+      const clientLog = (ctx.log as MockContextLogger).calls.map((call) => JSON.stringify(call));
+      expect(clientLog.some((entry) => entry.includes('artic-test-index'))).toBe(false);
+      expect(processLog).toHaveBeenCalledWith(
+        'Art Institute API rejected a request',
+        expect.objectContaining({
+          requestId: ctx.requestId,
+          extra: expect.objectContaining({
+            status: 400,
+            body: expect.stringContaining('artic-test-index'),
+          }),
+        }),
+      );
     });
 
     it('maps a 400 with the API JSON error body to upstream_rejected_query', async () => {
@@ -152,6 +177,40 @@ describe('AicService status classification', () => {
         expect(fetch).toHaveBeenCalledTimes(1);
       },
     );
+  });
+
+  describe('redirects', () => {
+    const redirectTo = (status: number) => () =>
+      new Response(null, {
+        status,
+        headers: { location: 'https://elsewhere.test/private?token=abc' },
+      });
+
+    it.each([301, 302, 303, 307, 308])(
+      'fails an HTTP %s at once as ServiceUnavailable, naming the status but not the target',
+      async (status) => {
+        const { service, fetch } = createTestService(scriptedFetch(redirectTo(status)));
+        const error = await rejection(search(service));
+        expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+        expect(error.data).toMatchObject({ retryable: false, status });
+        expect(error.message).toContain(`HTTP ${status}`);
+        expect(JSON.stringify({ message: error.message, data: error.data })).not.toContain(
+          'elsewhere.test',
+        );
+        expect(fetch).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('leaves the shared cooldown open, so other calls are not held back', async () => {
+      const pacer = createPacer({
+        name: 'aic-test-cooldown-redirect',
+        cooldown: { baseMs: MINUTE, maxMs: MINUTE },
+      });
+      const { service } = createTestService(scriptedFetch(redirectTo(302)), { pacer });
+      await rejection(search(service));
+      expect(pacer.cooldown.remainingMs).toBe(0);
+      pacer.dispose();
+    });
   });
 
   describe('edge firewall blocks', () => {
@@ -377,6 +436,12 @@ describe('AicService request boundary', () => {
     expect(headers.Accept).toBe('application/json');
     expect(init?.signal).toBeInstanceOf(AbortSignal);
     expect(init?.method).toBeUndefined();
+  });
+
+  it('asks fetch to hand back a redirect rather than follow it', async () => {
+    const { service, fetch } = createTestService(scriptedFetch(jsonResponder(searchEnvelope([]))));
+    await service.searchArtworks(artworkParams(), makeCtx());
+    expect(fetch.mock.calls[0]?.[1]?.redirect).toBe('manual');
   });
 
   it('builds search params only from the fixed top-level key allowlist', async () => {
@@ -720,13 +785,21 @@ describe('AicService cache', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it('logs the cache hit at debug', async () => {
+  it('logs a cache hit to the process log only, so no caller learns what another one asked', async () => {
+    const processLog = vi.spyOn(logger, 'debug');
     const { service } = createTestService(scriptedFetch(emptySearch()));
     const logCtx = makeCtx();
     await service.searchArtworks(artworkParams(), logCtx);
     await service.searchArtworks(artworkParams(), logCtx);
     const calls = (logCtx.log as MockContextLogger).calls;
-    expect(calls.some((c) => c.level === 'debug' && c.msg.includes('cache hit'))).toBe(true);
+    expect(calls.some((c) => c.msg.includes('cache hit'))).toBe(false);
+    expect(processLog).toHaveBeenCalledWith(
+      'Art Institute API cache hit',
+      expect.objectContaining({
+        requestId: logCtx.requestId,
+        extra: expect.objectContaining({ path: '/artworks/search' }),
+      }),
+    );
   });
 
   it('keys by the full request, so any changed parameter is a miss', async () => {
@@ -1198,13 +1271,31 @@ describe('AicService.searchArtworks', () => {
     });
 
     it('reads the IIIF base from the envelope config, with a fallback when it is missing', async () => {
-      const custom = await one(artworkRecord(1), { iiifUrl: 'https://iiif.example.test/2' });
+      const custom = await one(artworkRecord(1), { iiifUrl: 'https://www.artic.edu/iiif/3' });
       expect(custom?.image?.url).toBe(
-        `https://iiif.example.test/2/${IMAGE_ID}/full/843,/0/default.jpg`,
+        `https://www.artic.edu/iiif/3/${IMAGE_ID}/full/843,/0/default.jpg`,
       );
       for (const iiifUrl of [null, '']) {
         const fallback = await one(artworkRecord(1), { iiifUrl });
         expect(fallback?.image?.url).toBe(`${IIIF_URL}/${IMAGE_ID}/full/843,/0/default.jpg`);
+      }
+    });
+
+    it.each(['javascript:alert(1)', 'http://www.artic.edu/iiif/2', 'https://iiif.example.test/2'])(
+      'builds image URLs on the built-in base when the envelope reports %s',
+      async (iiifUrl) => {
+        const artwork = await one(artworkRecord(1), { iiifUrl });
+        expect(artwork?.image).toMatchObject({
+          url: `${IIIF_URL}/${IMAGE_ID}/full/843,/0/default.jpg`,
+          iiif_info_url: `${IIIF_URL}/${IMAGE_ID}/info.json`,
+        });
+      },
+    );
+
+    it('omits the image when the image id is not uuid-shaped', async () => {
+      for (const image_id of ['../x?y', 'abc', `${IMAGE_ID}/../../x`]) {
+        const artwork = await one(artworkRecord(1, { image_id }));
+        expect(artwork).not.toHaveProperty('image');
       }
     });
 
@@ -1445,6 +1536,20 @@ describe('AicService.getArtworks', () => {
       expect(result).not.toHaveProperty('alt_images');
       expect(result).not.toHaveProperty('alt_titles');
     });
+
+    it('keeps only the uuid-shaped alternate image ids', async () => {
+      const result = await detail(
+        artworkRecord(1, { alt_image_ids: ['../x?y', ALT_IMAGE_ID, 'abc'] }),
+      );
+      expect(result?.alt_images).toEqual([
+        {
+          url: `${IIIF_URL}/${ALT_IMAGE_ID}/full/843,/0/default.jpg`,
+          iiif_info_url: `${IIIF_URL}/${ALT_IMAGE_ID}/info.json`,
+        },
+      ]);
+      const none = await detail(artworkRecord(1, { alt_image_ids: ['../x?y'] }));
+      expect(none).not.toHaveProperty('alt_images');
+    });
   });
 });
 
@@ -1491,6 +1596,24 @@ describe('AicService.getSounds', () => {
     );
     const result = await service.getSounds([soundUuid(1), soundUuid(2), soundUuid(3)], ctx);
     expect(result.sounds.map((s) => s.id)).toEqual([soundUuid(3)]);
+  });
+
+  it('drops assets whose content URL is not http or https', async () => {
+    const { service } = createTestService(
+      scriptedFetch(
+        jsonResponder(
+          envelope([
+            soundRecord(soundUuid(1), { content: 'javascript:alert(1)' }),
+            soundRecord(soundUuid(2), { content: 'data:audio/mpeg;base64,AAAA' }),
+            soundRecord(soundUuid(3), { content: 'http://www.artic.edu/assets/3' }),
+          ]),
+        ),
+      ),
+    );
+    const result = await service.getSounds([soundUuid(1), soundUuid(2), soundUuid(3)], ctx);
+    expect(result.sounds.map((s) => [s.id, s.url])).toEqual([
+      [soundUuid(3), 'http://www.artic.edu/assets/3'],
+    ]);
   });
 
   it('converts markup in titles and omits an absent type', async () => {
@@ -1884,6 +2007,29 @@ describe('AicService.searchExhibitions', () => {
     expect(result.exhibitions[1]).not.toHaveProperty('image_url');
   });
 
+  it('omits URLs that are not http or https, and reads a malformed image id as absent', async () => {
+    const { result } = await run(
+      {},
+      jsonResponder(
+        searchEnvelope([
+          exhibitionRecord(1, {
+            web_url: 'javascript:alert(1)',
+            image_url: 'data:image/png;base64,AAAA',
+          }),
+          exhibitionRecord(2, {
+            image_id: '../x?y',
+            image_url: 'https://imgix.example.test/x.jpg',
+          }),
+          exhibitionRecord(3, { image_id: '../x?y' }),
+        ]),
+      ),
+    );
+    expect(result.exhibitions[0]).not.toHaveProperty('web_url');
+    expect(result.exhibitions[0]).not.toHaveProperty('image_url');
+    expect(result.exhibitions[1]?.image_url).toBe('https://imgix.example.test/x.jpg');
+    expect(result.exhibitions[2]).not.toHaveProperty('image_url');
+  });
+
   it('omits what an older sparse exhibition lacks', async () => {
     const { result } = await run({}, jsonResponder(searchEnvelope([{ id: 5, title: 'Old show' }])));
     expect(result.exhibitions[0]).toEqual({
@@ -1958,6 +2104,20 @@ describe('AicService.searchMobileSounds', () => {
       transcript: 'First paragraph.\n\nSecond paragraph.',
     });
     expect(result.stops[1]).toEqual({ id: 2, title: 'Synthetic audio stop 2' });
+  });
+
+  it('omits an audio URL that is not http or https', async () => {
+    const { service } = createTestService(
+      scriptedFetch(
+        jsonResponder(
+          searchEnvelope([mobileSoundRecord(1, { web_url: 'javascript:alert(1)' })], 1, {
+            license: MOBILE_SOUND_LICENSE,
+          }),
+        ),
+      ),
+    );
+    const result = await service.searchMobileSounds({ query: 'a', limit: 5, page: 1 }, ctx);
+    expect(result.stops[0]).not.toHaveProperty('audio_url');
   });
 });
 

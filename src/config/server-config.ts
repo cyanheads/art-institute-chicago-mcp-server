@@ -12,9 +12,13 @@ const ServerConfigSchema = z.object({
     .string()
     .trim()
     .max(200)
+    .regex(
+      /^[\x20-\x7E]*$/,
+      'Use printable ASCII only (no line breaks, tabs, control characters, or non-ASCII letters); the value is sent in an HTTP header.',
+    )
     .default('https://github.com/cyanheads/art-institute-chicago-mcp-server')
     .describe(
-      'Contact the museum can reach (an email or URL), sent in the AIC-User-Agent header on every request.',
+      'Contact the museum can reach (an email or URL, printable ASCII), sent in the AIC-User-Agent header on every request.',
     ),
   requestsPerMinute: z.coerce
     .number()

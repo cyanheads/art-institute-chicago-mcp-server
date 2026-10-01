@@ -2,8 +2,8 @@
  * @fileoverview Pure helpers shared by the Art Institute service and the tool
  * definitions: input preprocessors for form-client blanks and comma lists,
  * HTML-to-text conversion, markdown-safe rendering of upstream text,
- * constructed IIIF and web URLs, vocabulary filter routing, placeholder-year
- * screening, and search-window paging.
+ * upstream URL and image-id screening, constructed IIIF and web URLs,
+ * vocabulary filter routing, placeholder-year screening, and search-window paging.
  * @module services/aic/aic-text
  */
 
@@ -165,87 +165,101 @@ const BIDI_CONTROLS = `${esc(0x61c)}${esc(0x200e)}${esc(0x200f)}${esc(0x202a)}-$
 /** C1 controls (DEL through APC). */
 const C1_CONTROLS = `${esc(0x7f)}-${esc(0x9f)}`;
 
+/**
+ * Invisible characters with no rendering role: ZERO WIDTH SPACE, WORD JOINER,
+ * and BOM. ZWNJ, ZWJ, and the variation selectors carry meaning in scripts and
+ * emoji, so they stay.
+ */
+const INVISIBLE = `${esc(0x200b)}${esc(0x2060)}${esc(0xfeff)}`;
+
+/** Unicode tag characters (U+E0000–U+E007F), matched as their UTF-16 surrogate pairs. */
+const TAG_CHARACTERS = `${esc(0xdb40)}[${esc(0xdc00)}-${esc(0xdc7f)}]`;
+
 const LINE_BREAKS = new RegExp(`\\r\\n|[\\r\\n${EXTRA_LINE_BREAKS}]`, 'g');
 
-/** C0 controls except tab (CR/LF are replaced before this runs), C1, bidi. */
+/** C0 controls except tab (CR/LF are replaced before this runs), C1, bidi, invisible, tag characters. */
 const UNSAFE_INLINE = new RegExp(
-  `[${esc(0)}-${esc(8)}${esc(0xb)}-${esc(0x1f)}${C1_CONTROLS}${BIDI_CONTROLS}]`,
+  `[${esc(0)}-${esc(8)}${esc(0xb)}-${esc(0x1f)}${C1_CONTROLS}${BIDI_CONTROLS}${INVISIBLE}]|${TAG_CHARACTERS}`,
   'g',
 );
 
-/** C0 controls except tab and LF, C1, bidi. */
+/** C0 controls except tab and LF, C1, bidi, invisible, tag characters. */
 const UNSAFE_BLOCK = new RegExp(
-  `[${esc(0)}-${esc(8)}${esc(0xb)}${esc(0xc)}${esc(0xe)}-${esc(0x1f)}${C1_CONTROLS}${BIDI_CONTROLS}]`,
+  `[${esc(0)}-${esc(8)}${esc(0xb)}${esc(0xc)}${esc(0xe)}-${esc(0x1f)}${C1_CONTROLS}${BIDI_CONTROLS}${INVISIBLE}]|${TAG_CHARACTERS}`,
   'g',
 );
 
 /** Runs of spaces, tabs, and no-break spaces within one line. */
 const INLINE_WHITESPACE = new RegExp(`[ \\t${esc(0xa0)}]+`, 'g');
 
-/** Characters a printed URL never carries raw: brackets, whitespace and line breaks, C0, C1, bidi. */
+/**
+ * Characters a printed URL never carries raw: brackets, angle brackets, quotes,
+ * backtick, whitespace and line breaks, C0, C1, bidi, invisible, tag characters.
+ */
 const URL_UNSAFE = new RegExp(
-  `[\\[\\]\\s${esc(0)}-${esc(0x1f)}${C1_CONTROLS}${BIDI_CONTROLS}]`,
+  `[\\[\\]<>"'\`\\s${esc(0)}-${esc(0x1f)}${C1_CONTROLS}${BIDI_CONTROLS}${INVISIBLE}]|${TAG_CHARACTERS}`,
   'g',
 );
 
 // --- HTML to text ------------------------------------------------------------
 
-const NAMED_ENTITIES: Record<string, number> = {
-  aacute: 0xe1,
-  acirc: 0xe2,
-  agrave: 0xe0,
-  amp: 0x26,
-  apos: 0x27,
-  aring: 0xe5,
-  atilde: 0xe3,
-  auml: 0xe4,
-  bdquo: 0x201e,
-  bull: 0x2022,
-  ccedil: 0xe7,
-  copy: 0xa9,
-  deg: 0xb0,
-  eacute: 0xe9,
-  ecirc: 0xea,
-  egrave: 0xe8,
-  emsp: 0x2003,
-  ensp: 0x2002,
-  euml: 0xeb,
-  frac12: 0xbd,
-  gt: 0x3e,
-  hellip: 0x2026,
-  iacute: 0xed,
-  icirc: 0xee,
-  iexcl: 0xa1,
-  iquest: 0xbf,
-  iuml: 0xef,
-  laquo: 0xab,
-  ldquo: 0x201c,
-  lsquo: 0x2018,
-  lt: 0x3c,
-  mdash: 0x2014,
-  middot: 0xb7,
-  nbsp: 0x20,
-  ndash: 0x2013,
-  ntilde: 0xf1,
-  oacute: 0xf3,
-  ocirc: 0xf4,
-  oslash: 0xf8,
-  ouml: 0xf6,
-  quot: 0x22,
-  raquo: 0xbb,
-  rdquo: 0x201d,
-  reg: 0xae,
-  rsquo: 0x2019,
-  sbquo: 0x201a,
-  szlig: 0xdf,
-  thinsp: 0x2009,
-  times: 0xd7,
-  trade: 0x2122,
-  uacute: 0xfa,
-  ucirc: 0xfb,
-  ugrave: 0xf9,
-  uuml: 0xfc,
-};
+/** A `Map`, so an entity named for an `Object` member (`&constructor;`) finds nothing. */
+const NAMED_ENTITIES = new Map<string, number>([
+  ['aacute', 0xe1],
+  ['acirc', 0xe2],
+  ['agrave', 0xe0],
+  ['amp', 0x26],
+  ['apos', 0x27],
+  ['aring', 0xe5],
+  ['atilde', 0xe3],
+  ['auml', 0xe4],
+  ['bdquo', 0x201e],
+  ['bull', 0x2022],
+  ['ccedil', 0xe7],
+  ['copy', 0xa9],
+  ['deg', 0xb0],
+  ['eacute', 0xe9],
+  ['ecirc', 0xea],
+  ['egrave', 0xe8],
+  ['emsp', 0x2003],
+  ['ensp', 0x2002],
+  ['euml', 0xeb],
+  ['frac12', 0xbd],
+  ['gt', 0x3e],
+  ['hellip', 0x2026],
+  ['iacute', 0xed],
+  ['icirc', 0xee],
+  ['iexcl', 0xa1],
+  ['iquest', 0xbf],
+  ['iuml', 0xef],
+  ['laquo', 0xab],
+  ['ldquo', 0x201c],
+  ['lsquo', 0x2018],
+  ['lt', 0x3c],
+  ['mdash', 0x2014],
+  ['middot', 0xb7],
+  ['nbsp', 0x20],
+  ['ndash', 0x2013],
+  ['ntilde', 0xf1],
+  ['oacute', 0xf3],
+  ['ocirc', 0xf4],
+  ['oslash', 0xf8],
+  ['ouml', 0xf6],
+  ['quot', 0x22],
+  ['raquo', 0xbb],
+  ['rdquo', 0x201d],
+  ['reg', 0xae],
+  ['rsquo', 0x2019],
+  ['sbquo', 0x201a],
+  ['szlig', 0xdf],
+  ['thinsp', 0x2009],
+  ['times', 0xd7],
+  ['trade', 0x2122],
+  ['uacute', 0xfa],
+  ['ucirc', 0xfb],
+  ['ugrave', 0xf9],
+  ['uuml', 0xfc],
+]);
 
 function decodeEntities(text: string): string {
   return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]*);/gi, (match, body: string) => {
@@ -256,7 +270,7 @@ function decodeEntities(text: string): string {
           ? Number.parseInt(body.slice(2), 16)
           : Number.parseInt(body.slice(1), 10);
     } else {
-      codePoint = NAMED_ENTITIES[body] ?? NAMED_ENTITIES[body.toLowerCase()];
+      codePoint = NAMED_ENTITIES.get(body) ?? NAMED_ENTITIES.get(body.toLowerCase());
     }
     return codePoint !== undefined && codePoint > 0 && codePoint <= 0x10ffff
       ? String.fromCodePoint(codePoint)
@@ -268,16 +282,21 @@ function decodeEntities(text: string): string {
  * Converts upstream HTML (`<p>`, `<em>`, `<br>`, entities) to plain text:
  * source line breaks are whitespace, `<br>` and block closers become line
  * breaks, other tags are removed, entities decoded, runs of blank lines
- * collapsed, and the result trimmed.
+ * collapsed, and the result trimmed. Tags are stripped before entities are
+ * decoded, so `&lt;b&gt;` stays the text `<b>`; the markdown sinks escape it.
+ *
+ * Every pattern runs in linear time on unterminated markup: an unclosed
+ * comment runs to the end of the text, a tag ends at the first `<` or `>`, and
+ * a whitespace run is matched once, then collapsed only when it holds a line break.
  */
 export function htmlToText(html: string): string {
   const withBreaks = html
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/\s*[\r\n]+\s*/g, ' ')
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, '')
+    .replace(/\s+/g, (run) => (/[\r\n]/.test(run) ? ' ' : run))
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/(?:p|div|blockquote|h[1-6])\s*>/gi, '\n\n')
-    .replace(/<\/?(?:li|ul|ol)\b[^>]*>/gi, '\n')
-    .replace(/<\/?[a-z][^>]*>/gi, '');
+    .replace(/<\/?(?:li|ul|ol)\b[^<>]*>/gi, '\n')
+    .replace(/<\/?[a-z][^<>]*>/gi, '');
   return decodeEntities(withBreaks)
     .split('\n')
     .map((line) => line.replace(INLINE_WHITESPACE, ' ').trim())
@@ -288,41 +307,87 @@ export function htmlToText(html: string): string {
 
 // --- Rendering upstream text in format() -------------------------------------
 
+/** A backslash run, or one of the characters that open link, image, and HTML syntax. */
+const MARKUP = /\\+|[[\]<>]/g;
+
 /**
- * Upstream text for an inline markdown slot (heading, bold label, list item):
- * line breaks flattened to spaces, `[ ] < >` backslash-escaped, C0/C1 control
- * and bidi control characters stripped.
+ * Backslash-escapes `[`, `]`, `<`, and `>`, so link, image, and HTML syntax
+ * renders as text. A backslash run directly in front of one is doubled, so it
+ * cannot cancel the escape; other backslashes, and `(`, `)`, `!`, and
+ * backticks, stay as written.
  */
-export function inlineSafe(text: string): string {
-  return text
-    .replace(LINE_BREAKS, ' ')
-    .replace(UNSAFE_INLINE, '')
-    .replace(/[[\]<>]/g, '\\$&');
+function escapeMarkup(text: string): string {
+  return text.replace(MARKUP, (match: string, offset: number) => {
+    if (match[0] !== '\\') return `\\${match}`;
+    return /[[\]<>]/.test(text.charAt(offset + match.length)) ? match + match : match;
+  });
 }
 
-/** Upstream free text as a markdown blockquote, line structure kept, controls stripped. */
+/**
+ * Upstream text for an inline markdown slot (heading, bold label, list item):
+ * line breaks flattened to spaces, C0/C1 control, bidi control, and invisible
+ * characters stripped, and `[ ] < >` backslash-escaped.
+ */
+export function inlineSafe(text: string): string {
+  return escapeMarkup(text.replace(LINE_BREAKS, ' ').replace(UNSAFE_INLINE, ''));
+}
+
+/**
+ * Upstream free text as a markdown blockquote: line structure kept, control,
+ * bidi, and invisible characters stripped, and `[ ] < >` backslash-escaped.
+ */
 export function quoteBlock(text: string): string {
-  return text
-    .replace(LINE_BREAKS, '\n')
-    .replace(UNSAFE_BLOCK, '')
+  return escapeMarkup(text.replace(LINE_BREAKS, '\n').replace(UNSAFE_BLOCK, ''))
     .split('\n')
     .map((line) => (line === '' ? '>' : `> ${line}`))
     .join('\n');
 }
 
 /**
- * A URL for printing in an inline markdown slot: `[`, `]`, whitespace, line
- * breaks, and control and bidi characters percent-encoded, so an upstream URL
- * cannot break out of its list item. Existing percent-escapes are untouched.
+ * A URL for printing in an inline markdown slot: brackets, angle brackets,
+ * quotes, backticks, whitespace, line breaks, and control, bidi, and invisible
+ * characters percent-encoded, so an upstream URL cannot break out of its list
+ * item or carry markup. Existing percent-escapes are untouched. Parentheses
+ * stay: a printed URL never sits inside a markdown link target.
  */
 export function printableUrl(url: string): string {
-  return url.replace(URL_UNSAFE, (char) => encodeURIComponent(char));
+  return url.replace(URL_UNSAFE, (char) => (char === "'" ? '%27' : encodeURIComponent(char)));
 }
 
 // --- Constructed URLs --------------------------------------------------------
 
 export const FALLBACK_IIIF_URL = 'https://www.artic.edu/iiif/2';
 export const API_BASE_URL = 'https://api.artic.edu/api/v1';
+
+/** The host the API's envelope reports for IIIF today, which the built-in base shares. */
+const IIIF_HOST = new URL(FALLBACK_IIIF_URL).host;
+
+/** The uuid shape of the API's `image_id` and `alt_image_ids` values. */
+const IMAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** An upstream URL kept as received when its scheme is `http:` or `https:`; anything else is absent. */
+export function httpUrl(value: unknown): string | undefined {
+  const raw = nonEmpty(value);
+  if (raw === undefined) return;
+  const protocol = URL.parse(raw)?.protocol;
+  return protocol === 'http:' || protocol === 'https:' ? raw : undefined;
+}
+
+/**
+ * The envelope's IIIF base, kept as received when it is `https:` on the
+ * museum's IIIF host; anything else, or no base, is the built-in base.
+ */
+export function iiifBaseUrl(value: unknown): string {
+  const raw = nonEmpty(value);
+  if (raw === undefined) return FALLBACK_IIIF_URL;
+  const url = URL.parse(raw);
+  return url?.protocol === 'https:' && url.host === IIIF_HOST ? raw : FALLBACK_IIIF_URL;
+}
+
+/** An upstream image id in the API's uuid shape; anything else is absent and builds no URL. */
+export function iiifImageId(value: unknown): string | undefined {
+  return typeof value === 'string' && IMAGE_ID.test(value) ? value : undefined;
+}
 
 /** The artwork's public page (301s to the slugged URL). */
 export function artworkWebUrl(id: number): string {

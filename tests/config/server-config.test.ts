@@ -70,6 +70,37 @@ describe('getServerConfig', () => {
     expect(() => getServerConfig()).toThrow(/AIC_CONTACT/);
   });
 
+  it('accepts a contact in printable ASCII, spaces and punctuation included', async () => {
+    vi.stubEnv('AIC_CONTACT', 'Ops Team <ops@example.test> (https://example.test/~ops?x=1)');
+    const getServerConfig = await loadConfig();
+    expect(getServerConfig().contact).toBe(
+      'Ops Team <ops@example.test> (https://example.test/~ops?x=1)',
+    );
+  });
+
+  it.each([
+    ['an inner line feed', 'ops@example.test\nX-Injected: 1'],
+    ['an inner carriage return', 'ops@example.test\rX-Injected: 1'],
+    ['a tab', 'ops\t@example.test'],
+    ['a DEL character', 'ops\u007f@example.test'],
+    ['letters outside ASCII', 'ops 名前 <ops@example.jp>'],
+    ['an accented letter', 'josé@example.test'],
+  ])(
+    'fails at startup on a contact with %s, naming the variable without echoing the value',
+    async (_name, value) => {
+      vi.stubEnv('AIC_CONTACT', value);
+      const getServerConfig = await loadConfig();
+      let message = '';
+      try {
+        getServerConfig();
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toMatch(/AIC_CONTACT/);
+      expect(message).not.toContain(value.trim());
+    },
+  );
+
   it('parses once and returns the cached object afterwards', async () => {
     vi.stubEnv('AIC_REQUESTS_PER_MINUTE', '20');
     const getServerConfig = await loadConfig();

@@ -37,6 +37,7 @@ import {
   ARTWORK_LICENSE,
   exhibitionRecord,
   IIIF_URL,
+  IMAGE_ID,
   searchEnvelope,
 } from '../fixtures/aic-upstream.js';
 
@@ -516,12 +517,34 @@ describe('artic_search_exhibitions records', () => {
 
   it('builds the IIIF image URL on the base the envelope reports', async () => {
     serve(
-      searchEnvelope([exhibitionRecord(1, { image_id: 'abc' })], 1, {
-        iiifUrl: 'https://iiif.example.test/v2',
+      searchEnvelope([exhibitionRecord(1, { image_id: IMAGE_ID })], 1, {
+        iiifUrl: 'https://www.artic.edu/iiif/3',
       }),
     );
     const [exhibition] = structuredOf<ExhibitionsRun>(await search()).exhibitions;
-    expect(exhibition?.image_url).toBe('https://iiif.example.test/v2/abc/full/843,/0/default.jpg');
+    expect(exhibition?.image_url).toBe(
+      `https://www.artic.edu/iiif/3/${IMAGE_ID}/full/843,/0/default.jpg`,
+    );
+  });
+
+  it('prints no web or image line for a URL that is not http or https', async () => {
+    serve(
+      searchEnvelope(
+        [
+          exhibitionRecord(1, {
+            web_url: 'javascript:alert(1)',
+            image_url: 'data:image/png;base64,AAAA',
+          }),
+        ],
+        1,
+      ),
+    );
+    const result = await search();
+    const [exhibition] = structuredOf<ExhibitionsRun>(result).exhibitions;
+    expect(exhibition).not.toHaveProperty('web_url');
+    expect(exhibition).not.toHaveProperty('image_url');
+    expect(textOf(result)).not.toContain('javascript:');
+    expect(textOf(result)).not.toContain('data:image');
   });
 
   it('pairs artwork ids with titles by index when the lists are the same length', async () => {

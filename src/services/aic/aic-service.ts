@@ -17,16 +17,26 @@ import {
   timeout,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
-import { createPacer, isRecord, type Pacer, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import {
+  createPacer,
+  isRecord,
+  logger,
+  type Pacer,
+  withExtra,
+  withRetry,
+} from '@cyanheads/mcp-ts-core/utils';
 import {
   API_BASE_URL,
   artworkWebUrl,
   buildImage,
   definedOnly,
-  FALLBACK_IIIF_URL,
   htmlField,
+  httpUrl,
+  iiifBaseUrl,
+  iiifImageId,
   iiifImageUrl,
   iiifInfoUrl,
+  inlineSafe,
   integerList,
   manifestUrl,
   nonEmpty,
@@ -637,7 +647,8 @@ export class AicService {
 
     const cached = this.#cache.get(href);
     if (cached !== undefined) {
-      ctx.log.debug('Art Institute API cache hit', { path });
+      // Process log, not ctx.log: the client would learn another caller made this request.
+      logger.debug('Art Institute API cache hit', withExtra(ctx, { path }));
       return JSON.parse(cached) as RawEnvelope<T>;
     }
 
@@ -695,6 +706,7 @@ export class AicService {
     try {
       const response = await this.#fetch(href, {
         headers: { Accept: 'application/json', 'AIC-User-Agent': this.#userAgent },
+        redirect: 'manual',
         signal: AbortSignal.any([signal, timer.signal]),
       });
       const read = await readBounded(response, MAX_BODY_BYTES);
@@ -767,6 +779,11 @@ function isApiErrorBody(body: unknown): body is { error: string; status: number 
   return isRecord(body) && typeof body.status === 'number' && typeof body.error === 'string';
 }
 
+/** The API's `error` string as an error message quotes it: cut to 100 characters, one line, markup escaped. */
+function quotedApiError(error: string): string {
+  return inlineSafe(error.length > 100 ? `${error.slice(0, 100).toWellFormed()}…` : error);
+}
+
 function retryAfterOf(response: Response): { retryAfter?: number | string } {
   const header = response.headers.get('retry-after')?.trim();
   if (!header) return {};
@@ -783,6 +800,13 @@ function classify(
   ctx: Context,
 ): FetchedBody {
   const { status } = response;
+  // The API's routes never redirect, so one is not followed and not retried; Location stays off the wire.
+  if (status >= 300 && status < 400) {
+    throw serviceUnavailable(
+      `The Art Institute API answered with a redirect (HTTP ${status}), which this server does not follow.`,
+      { retryable: false, status },
+    );
+  }
   if (read === undefined) {
     throw serviceUnavailable(
       `The Art Institute API sent an unreadable response (HTTP ${status}, larger than ${MAX_BODY_BYTES} bytes).`,
@@ -824,7 +848,7 @@ function classify(
       );
     }
     throw internalError(
-      `The Art Institute API rejected the request this server built (HTTP 403, "${body.error}").`,
+      `The Art Institute API rejected the request this server built (HTTP 403, "${quotedApiError(body.error)}").`,
       { reason: 'upstream_rejected_query', retryable: false, status },
     );
   }
@@ -833,11 +857,11 @@ function classify(
     throw serviceUnavailable(`The Art Institute API returned HTTP ${status}.`, { status });
   }
 
-  // 400 from the search backend names internal index names: log it, never put it on the wire.
-  ctx.log.debug('Art Institute API rejected a request', {
-    status,
-    body: read.text.slice(0, 2_000),
-  });
+  // 400 from the search backend names internal index names: process log only, since ctx.log reaches the client.
+  logger.debug(
+    'Art Institute API rejected a request',
+    withExtra(ctx, { status, body: read.text.slice(0, 2_000) }),
+  );
   throw internalError(
     `The Art Institute API rejected the request this server built (HTTP ${status}).`,
     {
@@ -943,7 +967,7 @@ function licenseText(envelope: RawEnvelope<unknown>): string {
 }
 
 function iiifBase(envelope: RawEnvelope<unknown>): string {
-  return nonEmpty(envelope.config?.iiif_url) ?? FALLBACK_IIIF_URL;
+  return iiifBaseUrl(envelope.config?.iiif_url);
 }
 
 // --- Normalization -------------------------------------------------------------
@@ -968,7 +992,7 @@ function toArtworkSummary(raw: RawArtwork, iiifUrl: string): ArtworkSummary {
     is_on_view: raw.is_on_view === true,
     ...definedOnly({
       gallery: nonEmpty(raw.gallery_title),
-      image: buildImage(iiifUrl, nonEmpty(raw.image_id), isPublicDomain, raw.thumbnail),
+      image: buildImage(iiifUrl, iiifImageId(raw.image_id), isPublicDomain, raw.thumbnail),
     }),
     web_url: artworkWebUrl(raw.id),
   };
@@ -977,10 +1001,17 @@ function toArtworkSummary(raw: RawArtwork, iiifUrl: string): ArtworkSummary {
 function toArtworkDetail(raw: RawArtwork, iiifUrl: string): ArtworkDetail {
   const summary = toArtworkSummary(raw, iiifUrl);
   const altTitles = stringList(raw.alt_titles).map((title) => htmlField(title) ?? title);
-  const altImages = stringList(raw.alt_image_ids).map((imageId) => ({
-    url: iiifImageUrl(iiifUrl, imageId, 843),
-    iiif_info_url: iiifInfoUrl(iiifUrl, imageId),
-  }));
+  const altImages = stringList(raw.alt_image_ids).flatMap((value) => {
+    const imageId = iiifImageId(value);
+    return imageId === undefined
+      ? []
+      : [
+          {
+            url: iiifImageUrl(iiifUrl, imageId, 843),
+            iiif_info_url: iiifInfoUrl(iiifUrl, imageId),
+          },
+        ];
+  });
   return {
     ...summary,
     ...definedOnly({
@@ -1014,7 +1045,7 @@ function toArtworkDetail(raw: RawArtwork, iiifUrl: string): ArtworkDetail {
 }
 
 function toRelatedMedia(raw: RawSound): RelatedMedia | undefined {
-  const url = nonEmpty(raw?.content);
+  const url = httpUrl(raw?.content);
   if (typeof raw?.id !== 'string' || url === undefined) return;
   return {
     id: raw.id,
@@ -1055,7 +1086,7 @@ function toExhibition(raw: RawExhibition, iiifUrl: string): Exhibition {
   const artworkIds = integerList(raw.artwork_ids);
   const artworkTitles = Array.isArray(raw.artwork_titles) ? raw.artwork_titles : [];
   const paired = artworkTitles.length === artworkIds.length;
-  const imageId = nonEmpty(raw.image_id);
+  const imageId = iiifImageId(raw.image_id);
   return {
     id: raw.id,
     title: htmlField(raw.title) ?? '',
@@ -1065,8 +1096,8 @@ function toExhibition(raw: RawExhibition, iiifUrl: string): Exhibition {
       end: nonEmpty(raw.aic_end_at),
       gallery: nonEmpty(raw.gallery_title),
       summary: htmlField(raw.short_description),
-      web_url: nonEmpty(raw.web_url),
-      image_url: imageId ? iiifImageUrl(iiifUrl, imageId, 843) : nonEmpty(raw.image_url),
+      web_url: httpUrl(raw.web_url),
+      image_url: imageId ? iiifImageUrl(iiifUrl, imageId, 843) : httpUrl(raw.image_url),
       is_featured: typeof raw.is_featured === 'boolean' ? raw.is_featured : undefined,
     }),
     artwork_count: artworkIds.length,
@@ -1083,7 +1114,7 @@ function toAudioGuideStop(raw: RawMobileSound): AudioGuideStop {
     id: raw.id,
     title: htmlField(raw.title) ?? '',
     ...definedOnly({
-      audio_url: nonEmpty(raw.web_url),
+      audio_url: httpUrl(raw.web_url),
       transcript: htmlField(raw.transcript),
     }),
   };

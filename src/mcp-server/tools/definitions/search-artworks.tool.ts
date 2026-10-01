@@ -36,6 +36,9 @@ const FACETS = [
 
 const SCOPE_FLAGS = ['public_domain_only', 'on_view_only', 'has_image'] as const;
 
+/** Most rows a page returns: a page of the heaviest catalog rows with every facet fits 100,000 wire bytes. */
+const LIMIT_MAX = 12;
+
 const facetValues = (filter: string) =>
   z
     .array(
@@ -104,8 +107,8 @@ const SearchInput = z.object({
   page: blankAsUnset(z.number().int().min(1).max(SEARCH_WINDOW).default(1)).describe(
     'Page to return (1-based); page times limit may not exceed 1,000.',
   ),
-  limit: blankAsUnset(z.number().int().min(0).max(100).default(10)).describe(
-    'Rows per page (0-100); 0 returns only totalCount and facets.',
+  limit: blankAsUnset(z.number().int().min(0).max(LIMIT_MAX).default(10)).describe(
+    `Rows per page (0-${LIMIT_MAX}; capped so a page of long catalog records with every facet stays within common tool-output limits); 0 returns only totalCount and facets.`,
   ),
 });
 
@@ -290,7 +293,7 @@ export const searchArtworks = tool('artic_search_artworks', {
       fragments.push(...zeroHitFragments(input));
     } else if (input.limit === 0) {
       fragments.push(
-        'Counts only (limit 0); set limit between 1 and 100 to list the matching artworks.',
+        `Counts only (limit 0); set limit between 1 and ${LIMIT_MAX} to list the matching artworks.`,
       );
     } else if (shown === 0) {
       fragments.push(

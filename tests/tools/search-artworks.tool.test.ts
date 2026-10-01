@@ -7,6 +7,7 @@
  * @module tests/tools/search-artworks.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -29,6 +30,7 @@ import {
   installAicService,
   recoveryFor,
   structuredOf,
+  type ToolRun,
   textOf,
   UPSTREAM_FAILURES,
 } from '../fixtures/aic-tool-kit.js';
@@ -37,9 +39,11 @@ import {
   API_INVALID_RESULTS_BODY,
   ARTWORK_LICENSE,
   artworkRecord,
+  heaviestArtworkRows,
   IIIF_URL,
   IMAGE_ID,
   inCopyrightArtworkRecord,
+  longestFacetAggregations,
   placeholderYearArtworkRecord,
   searchEnvelope,
   sparseArtworkRecord,
@@ -315,7 +319,7 @@ describe('artic_search_artworks request', () => {
 
 describe('artic_search_artworks validation', () => {
   it.each([
-    ['limit 101', { limit: 101 }, 'limit'],
+    ['limit 13', { limit: 13 }, 'limit'],
     ['a negative limit', { limit: -1 }, 'limit'],
     ['page 0', { page: 0 }, 'page'],
     ['page 1001', { page: 1001 }, 'page'],
@@ -354,7 +358,7 @@ describe('artic_search_artworks validation', () => {
     expect((error.data.issues as unknown[]).length).toBeLessThanOrEqual(2);
   });
 
-  it('accepts the boundary values 0, 100, 1, and 1000', async () => {
+  it('accepts the boundary values 0, 12, 1, and 1000', async () => {
     installAicService(
       scriptedFetch(
         jsonResponder(searchEnvelope([], 0)),
@@ -363,14 +367,14 @@ describe('artic_search_artworks validation', () => {
       ),
     );
     expect((await search({ limit: 0 })).isError).toBeUndefined();
-    expect((await search({ limit: 100 })).isError).toBeUndefined();
+    expect((await search({ limit: 12 })).isError).toBeUndefined();
     expect((await search({ page: 1000, limit: 1 })).isError).toBeUndefined();
   });
 });
 
 describe('artic_search_artworks window and range guards', () => {
   it.each([
-    [11, 100],
+    [84, 12],
     [1000, 2],
     [501, 2],
     [101, 10],
@@ -390,7 +394,7 @@ describe('artic_search_artworks window and range guards', () => {
   );
 
   it.each([
-    [10, 100],
+    [125, 8],
     [1000, 1],
     [500, 2],
     [100, 10],
@@ -413,7 +417,7 @@ describe('artic_search_artworks window and range guards', () => {
 
   it('reports the window before the year range when both are violated', async () => {
     emptyResults();
-    const error = errorOf(await search({ page: 11, limit: 100, year_from: 2000, year_to: 1900 }));
+    const error = errorOf(await search({ page: 101, limit: 10, year_from: 2000, year_to: 1900 }));
     expect(error.data.reason).toBe('page_beyond_window');
   });
 
@@ -511,19 +515,19 @@ describe('artic_search_artworks paging', () => {
     expect(out.notice).toBe('Page 4 is past the last match (25 total); request a lower page.');
   });
 
-  it('offers page 10 at limit 100 because it still ends inside the window', async () => {
-    serve(searchEnvelope(rows(100, 801), 5000));
-    const out = structuredOf<SearchRun>(await search({ page: 9, limit: 100 }));
-    expect(out).toMatchObject({ has_more: true, next_page: 10 });
+  it('offers page 100 at limit 10 because it still ends inside the window', async () => {
+    serve(searchEnvelope(rows(10, 981), 5000));
+    const out = structuredOf<SearchRun>(await search({ page: 99, limit: 10 }));
+    expect(out).toMatchObject({ has_more: true, next_page: 100 });
   });
 
   it('withholds next_page and names the window when the next page would cross 1,000', async () => {
-    serve(searchEnvelope(rows(100, 901), 5000));
-    const out = structuredOf<SearchRun>(await search({ page: 10, limit: 100 }));
+    serve(searchEnvelope(rows(12, 985), 5000));
+    const out = structuredOf<SearchRun>(await search({ page: 83, limit: 12 }));
     expect(out).toMatchObject({
       has_more: true,
       truncated: true,
-      shown: 100,
+      shown: 12,
       notice: WINDOW_NOTICE,
     });
     expect(out).not.toHaveProperty('next_page');
@@ -539,7 +543,7 @@ describe('artic_search_artworks paging', () => {
       truncated: true,
       shown: 0,
       cap: 0,
-      notice: 'Counts only (limit 0); set limit between 1 and 100 to list the matching artworks.',
+      notice: 'Counts only (limit 0); set limit between 1 and 12 to list the matching artworks.',
     });
     expect(out).not.toHaveProperty('next_page');
   });
@@ -719,17 +723,19 @@ describe('artic_search_artworks rows', () => {
     expect(textOf(result)).not.toContain('5000001');
   });
 
-  it('reads the IIIF base from the envelope, and falls back when it is missing', async () => {
-    serve(searchEnvelope([artworkRecord(1)], 1, { iiifUrl: 'https://iiif.example.test/v2' }));
+  it('reads the IIIF base from the envelope, and falls back when it is missing or off-host', async () => {
+    serve(searchEnvelope([artworkRecord(1)], 1, { iiifUrl: 'https://www.artic.edu/iiif/3' }));
     const [custom] = structuredOf<SearchRun>(await search()).artworks;
     expect(fieldOf<{ url: string }>(custom, 'image').url).toBe(
-      `https://iiif.example.test/v2/${IMAGE_ID}/full/843,/0/default.jpg`,
+      `https://www.artic.edu/iiif/3/${IMAGE_ID}/full/843,/0/default.jpg`,
     );
-    serve(searchEnvelope([artworkRecord(1)], 1, { iiifUrl: null }));
-    const [fallback] = structuredOf<SearchRun>(await search()).artworks;
-    expect(fieldOf<{ url: string }>(fallback, 'image').url).toBe(
-      `${IIIF_URL}/${IMAGE_ID}/full/843,/0/default.jpg`,
-    );
+    for (const iiifUrl of [null, 'https://iiif.example.test/v2', 'javascript:alert(1)']) {
+      serve(searchEnvelope([artworkRecord(1)], 1, { iiifUrl }));
+      const [fallback] = structuredOf<SearchRun>(await search()).artworks;
+      expect(fieldOf<{ url: string }>(fallback, 'image').url).toBe(
+        `${IIIF_URL}/${IMAGE_ID}/full/843,/0/default.jpg`,
+      );
+    }
   });
 
   it('returns an empty license text when the envelope carries none', async () => {
@@ -877,11 +883,11 @@ describe('artic_search_artworks format', () => {
   });
 
   it('percent-encodes brackets in printed URLs and leaves structuredContent untouched', async () => {
-    serve(searchEnvelope([artworkRecord(1)], 1, { iiifUrl: 'https://iiif.example.test/a[1]' }));
+    serve(searchEnvelope([artworkRecord(1)], 1, { iiifUrl: 'https://www.artic.edu/iiif/a[1]' }));
     const result = await search();
     const text = textOf(result);
     expect(text).toContain(
-      `https://iiif.example.test/a%5B1%5D/${IMAGE_ID}/full/843,/0/default.jpg`,
+      `https://www.artic.edu/iiif/a%5B1%5D/${IMAGE_ID}/full/843,/0/default.jpg`,
     );
     expect(text).not.toContain('a[1]');
     const [row] = structuredOf<SearchRun>(result).artworks;
@@ -936,6 +942,49 @@ describe('artic_search_artworks format', () => {
     expect(structuredOf<SearchRun>(result).license_text).toBe(
       'License one\r\n# Fake heading\r\n\r\nLicense three',
     );
+  });
+});
+
+// --- Response size ----------------------------------------------------------------------------
+
+describe('artic_search_artworks response size', () => {
+  /** UTF-8 bytes the call puts on the wire: format() text and structuredContent, each as JSON. */
+  const wireBytes = (result: ToolRun) =>
+    Buffer.byteLength(JSON.stringify(textOf(result))) +
+    Buffer.byteLength(JSON.stringify(result.structuredContent));
+
+  /** The `limit` maximum the tool advertises in its input JSON Schema. */
+  const advertisedLimitMax = (): number => {
+    const limit = z.toJSONSchema(searchArtworks.input, { io: 'input' }).properties?.limit;
+    if (typeof limit !== 'object' || limit.maximum === undefined) {
+      throw new Error('limit advertises no maximum');
+    }
+    return limit.maximum;
+  };
+
+  it('keeps a full page of the heaviest catalog rows with every facet under 100,000 bytes', async () => {
+    const limit = advertisedLimitMax();
+    serve(
+      searchEnvelope(heaviestArtworkRows(limit), 5000, {
+        aggregations: longestFacetAggregations(),
+      }),
+    );
+    const result = await search({
+      limit,
+      facets: [
+        'department',
+        'artwork_type',
+        'style',
+        'subject',
+        'classification',
+        'place_of_origin',
+        'artist',
+      ],
+    });
+    const out = structuredOf<SearchRun>(result);
+    expect(out.shown).toBe(limit);
+    expect(Object.values(out.facets ?? {}).every((values) => values.length === 15)).toBe(true);
+    expect(wireBytes(result)).toBeLessThanOrEqual(100_000);
   });
 });
 

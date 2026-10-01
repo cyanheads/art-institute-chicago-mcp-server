@@ -19,6 +19,9 @@ import {
   galleryInput,
   htmlField,
   htmlToText,
+  httpUrl,
+  iiifBaseUrl,
+  iiifImageId,
   iiifImageUrl,
   iiifInfoUrl,
   inlineSafe,
@@ -43,6 +46,13 @@ const IIIF = 'https://www.artic.edu/iiif/2';
 
 /** A string built from code points, keeping control characters out of the source text. */
 const chars = (...codePoints: number[]) => String.fromCodePoint(...codePoints);
+
+/** `[hex label, code point]` rows for `it.each`. */
+const codePointRows = (...codePoints: number[]) =>
+  codePoints.map((codePoint) => [codePoint.toString(16).toUpperCase(), codePoint] as const);
+
+/** ZERO WIDTH SPACE, BOM, WORD JOINER, and tag characters (first, `A`, last). */
+const INVISIBLE = codePointRows(0x200b, 0xfeff, 0x2060, 0xe0000, 0xe0041, 0xe007f);
 
 describe('blankAsUnset', () => {
   const optionalText = blankAsUnset(z.string().max(5).optional());
@@ -390,6 +400,39 @@ describe('htmlToText', () => {
     expect(htmlToText('<p> </p><br>')).toBe('');
     expect(htmlToText('')).toBe('');
   });
+
+  it('drops an unclosed comment through the end of the text', () => {
+    expect(htmlToText('a<!-- never closed <b>x</b>')).toBe('a');
+  });
+
+  it('leaves entity names that are Object members as written', () => {
+    expect(htmlToText('&constructor; &toString; &valueOf; &hasOwnProperty;')).toBe(
+      '&constructor; &toString; &valueOf; &hasOwnProperty;',
+    );
+  });
+
+  it('keeps whitespace with no line break in it for the inline collapse', () => {
+    expect(htmlToText(`a${chars(0x3000)}b`)).toBe(`a${chars(0x3000)}b`);
+    expect(htmlToText(`a${chars(0x3000)}\n${chars(0x3000)}b`)).toBe('a b');
+  });
+
+  describe('time on unterminated markup at 1 MiB', () => {
+    const MIB = 1024 * 1024;
+    it.each([
+      ['a whitespace run with no line break', () => `a${' '.repeat(MIB)}b`],
+      ['mixed spaces, tabs, and no-break spaces', () => `a${' \t \u000b'.repeat(MIB / 4)}b`],
+      ['repeated list-tag openings', () => '<li'.repeat(MIB / 3)],
+      ['repeated comment openings', () => '<!--'.repeat(MIB / 4)],
+      ['repeated tag openings', () => '<a '.repeat(MIB / 3)],
+      ['a line-break tag followed by spaces', () => `<br${' '.repeat(MIB)}`],
+      ['an entity name with no semicolon', () => `&${'a'.repeat(MIB)}`],
+    ])('converts %s in under 250 ms', (_name, make) => {
+      const input = make();
+      const started = performance.now();
+      htmlToText(input);
+      expect(performance.now() - started).toBeLessThan(250);
+    });
+  });
 });
 
 describe('inlineSafe', () => {
@@ -448,6 +491,29 @@ describe('inlineSafe', () => {
     expect(inlineSafe('Plain title, 1890 (oil)')).toBe('Plain title, 1890 (oil)');
     expect(inlineSafe('')).toBe('');
   });
+
+  it('doubles a backslash run in front of an escaped character, so the escape holds', () => {
+    expect(inlineSafe('\\[x](https://x.test)')).toBe('\\\\\\[x\\](https://x.test)');
+    expect(inlineSafe('\\\\<b>')).toBe('\\\\\\\\\\<b\\>');
+    expect(inlineSafe('C:\\path and a\\b')).toBe('C:\\path and a\\b');
+  });
+
+  it('renders angle brackets that entity decoding produced as text', () => {
+    expect(inlineSafe(htmlToText('&lt;img src=x onerror=alert(1)&gt;'))).toBe(
+      '\\<img src=x onerror=alert(1)\\>',
+    );
+  });
+
+  it.each(INVISIBLE)('strips invisible character U+%s', (_hex, codePoint) => {
+    expect(inlineSafe(`a${chars(codePoint)}b`)).toBe('ab');
+  });
+
+  it.each(codePointRows(0x200c, 0x200d, 0xfe0f, 0xe0100))(
+    'keeps joiner or variation selector U+%s',
+    (_hex, codePoint) => {
+      expect(inlineSafe(`a${chars(codePoint)}b`)).toBe(`a${chars(codePoint)}b`);
+    },
+  );
 });
 
 describe('quoteBlock', () => {
@@ -481,6 +547,35 @@ describe('quoteBlock', () => {
   it('renders an empty string as one empty quote line', () => {
     expect(quoteBlock('')).toBe('>');
   });
+
+  it('escapes link, image, and HTML syntax, and leaves parentheses, bangs, and backticks', () => {
+    expect(
+      quoteBlock('![p](https://x.test/p.png) [click](https://x.test) <img src=x> `code` (note)!'),
+    ).toBe(
+      '> !\\[p\\](https://x.test/p.png) \\[click\\](https://x.test) \\<img src=x\\> `code` (note)!',
+    );
+  });
+
+  it('doubles a backslash run in front of an escaped character, so the escape holds', () => {
+    expect(quoteBlock('\\[x](https://x.test)\n\\\\<b>')).toBe(
+      '> \\\\\\[x\\](https://x.test)\n> \\\\\\\\\\<b\\>',
+    );
+  });
+
+  it('renders a tag that entity decoding produced as text', () => {
+    expect(quoteBlock(htmlToText('<p>&lt;img src=x onerror=alert(1)&gt;</p>'))).toBe(
+      '> \\<img src=x onerror=alert(1)\\>',
+    );
+  });
+
+  it.each(INVISIBLE)('strips invisible character U+%s', (_hex, codePoint) => {
+    expect(quoteBlock(`a${chars(codePoint)}b`)).toBe('> ab');
+  });
+
+  it('keeps joiners and variation selectors, so emoji sequences survive', () => {
+    const family = '\u{1f468}\u200d\u{1f469}\u200d\u{1f467}';
+    expect(quoteBlock(`${family} \u2764\ufe0f a\u200cb`)).toBe(`> ${family} \u2764\ufe0f a\u200cb`);
+  });
 });
 
 describe('printableUrl', () => {
@@ -499,6 +594,98 @@ describe('printableUrl', () => {
   it('leaves an already-encoded url as it was', () => {
     const url = 'https://www.artic.edu/iiif/audio/970%20fixed.mp3';
     expect(printableUrl(url)).toBe(url);
+  });
+
+  it('percent-encodes angle brackets, quotes, and backticks', () => {
+    expect(printableUrl('https://x.test/<script>"q"\'s\'`t`')).toBe(
+      'https://x.test/%3Cscript%3E%22q%22%27s%27%60t%60',
+    );
+  });
+
+  it('percent-encodes invisible characters', () => {
+    expect(printableUrl(`https://x.test/a${chars(0x200b)}b${chars(0xe0041)}c`)).toBe(
+      'https://x.test/a%E2%80%8Bb%F3%A0%81%81c',
+    );
+  });
+});
+
+describe('httpUrl', () => {
+  it.each([
+    'https://www.artic.edu/exhibitions/1',
+    'http://www.artic.edu/exhibitions/1',
+    'HTTPS://imgix.example.test/x.jpg',
+    'https://www.artic.edu/iiif/audio/970%20fixed.mp3',
+    'https://www.artic.edu/assets/a[1]',
+  ])('keeps %s as received', (url) => {
+    expect(httpUrl(url)).toBe(url);
+  });
+
+  it.each([
+    'javascript:alert(document.cookie)',
+    'JavaScript:alert(1)',
+    'data:image/png;base64,AAAA',
+    'ftp://x.test/a',
+    'file:///etc/passwd',
+    'mailto:a@x.test',
+    '//x.test/a',
+    '/relative/path',
+    'not a url',
+    '',
+    '   ',
+  ])('treats %j as absent', (value) => {
+    expect(httpUrl(value)).toBeUndefined();
+  });
+
+  it('treats a non-string as absent', () => {
+    expect(httpUrl(null)).toBeUndefined();
+    expect(httpUrl(undefined)).toBeUndefined();
+    expect(httpUrl(42)).toBeUndefined();
+  });
+});
+
+describe('iiifBaseUrl', () => {
+  it('keeps an https base on the museum IIIF host as received', () => {
+    expect(iiifBaseUrl(IIIF)).toBe(IIIF);
+    expect(iiifBaseUrl('https://www.artic.edu/iiif/3')).toBe('https://www.artic.edu/iiif/3');
+  });
+
+  it.each([
+    'javascript:alert(1)',
+    'http://www.artic.edu/iiif/2',
+    'https://iiif.example.test/2',
+    'https://www.artic.edu.example.test/iiif/2',
+    'https://www.artic.edu@example.test/iiif/2',
+    'https://www.artic.edu:8443/iiif/2',
+    'not a url',
+    '',
+    null,
+    undefined,
+  ])('falls back to the built-in base for %j', (value) => {
+    expect(iiifBaseUrl(value)).toBe(FALLBACK_IIIF_URL);
+  });
+});
+
+describe('iiifImageId', () => {
+  it('keeps a uuid-shaped image id', () => {
+    expect(iiifImageId('11111111-2222-3333-4444-555555555555')).toBe(
+      '11111111-2222-3333-4444-555555555555',
+    );
+    expect(iiifImageId('2d484387-2509-5e8e-2c43-22f9981972eb')).toBe(
+      '2d484387-2509-5e8e-2c43-22f9981972eb',
+    );
+  });
+
+  it.each([
+    '../x?y',
+    'abc',
+    '11111111-2222-3333-4444-555555555555/../../x',
+    '11111111-2222-3333-4444-555555555555\n',
+    '11111111-2222-3333-4444-55555555555',
+    '',
+    null,
+    42,
+  ])('treats %j as absent', (value) => {
+    expect(iiifImageId(value)).toBeUndefined();
   });
 });
 

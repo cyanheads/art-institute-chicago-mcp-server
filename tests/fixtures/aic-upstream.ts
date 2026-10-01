@@ -206,6 +206,97 @@ export function mobileSoundRecord(id: number, overrides: Record<string, unknown>
   };
 }
 
+// --- Response-size worst case -----------------------------------------------------
+
+/**
+ * The twelve artwork rows that put the most bytes on the `artic_search_artworks`
+ * wire, measured over the whole collection (Design Decision 45), heaviest first:
+ * the length of each upstream text field, the line count of `artist_display`,
+ * and whether the row has an image and is public domain. The text is synthetic.
+ */
+const HEAVIEST_ROWS = [
+  [22, 3567, 7, 4, 144, 4, 19, 6, 160, true, true],
+  [7, 5, 1, 35, 1420, 7, 8, 5, 1436, true, true],
+  [23, 2007, 11, 4, 332, 4, 19, 7, 348, true, false],
+  [73, 20, 1, 9, 1235, 22, 8, 7, 1251, true, true],
+  [23, 1966, 9, 4, 291, 4, 19, 6, 307, true, false],
+  [23, 17, 2, 35, 1158, 23, 8, 5, 1174, true, true],
+  [46, 13, 1, 35, 1135, 23, 8, 5, 1151, true, true],
+  [18, 5, 1, 31, 1073, 7, 8, 5, 1089, true, true],
+  [33, 1831, 6, 7, 138, 4, 19, 6, 154, true, true],
+  [33, 1811, 6, 4, 140, 4, 19, 6, 156, true, true],
+  [10, 33, 2, 26, 2399, 9, 0, 0, 0, false, false],
+  [10, 33, 2, 26, 2399, 0, 0, 0, 0, false, false],
+] as const;
+
+/** Synthetic text of exactly `length` characters. */
+function filler(length: number): string {
+  return 'Synthetic catalog text '.repeat(Math.ceil(length / 23)).slice(0, length);
+}
+
+/** `length` characters of synthetic text over `lines` lines. */
+function multiline(length: number, lines: number): string {
+  const text = filler(length).split('');
+  const step = Math.floor(length / lines);
+  for (let line = 1; line < lines; line++) text[line * step] = '\n';
+  return text.join('');
+}
+
+/** `count` search rows shaped like the heaviest in the collection, heaviest first; past twelve the list repeats. */
+export function heaviestArtworkRows(count: number): Record<string, unknown>[] {
+  return Array.from({ length: count }, (_, index) => {
+    const [title, artist, lines, date, medium, type, department, place, alt, image, publicDomain] =
+      HEAVIEST_ROWS[index % HEAVIEST_ROWS.length] ?? HEAVIEST_ROWS[0];
+    return artworkRecord(500_001 + index, {
+      title: filler(title),
+      artist_display: multiline(artist, lines),
+      date_display: filler(date),
+      medium_display: filler(medium),
+      artwork_type_title: filler(type),
+      department_title: filler(department),
+      place_of_origin: filler(place),
+      is_public_domain: publicDomain,
+      image_id: image ? IMAGE_ID : null,
+      thumbnail: image ? { width: 3000, height: 2400, alt_text: filler(alt) } : null,
+    });
+  });
+}
+
+/** The longest value each artwork facet holds in the collection; `artist` is the longest artist name. */
+const LONGEST_FACET_VALUES = {
+  department: 49,
+  artwork_type: 23,
+  style: 40,
+  subject: 44,
+  classification: 48,
+  place_of_origin: 74,
+} as const;
+const LONGEST_ARTIST_NAME = 97;
+
+/** Aggregations for all seven artwork facets, 15 values each, every value as long as the longest the collection holds. */
+export function longestFacetAggregations(): Record<string, unknown> {
+  const buckets = <T>(build: (index: number) => T) => ({
+    buckets: Array.from({ length: 15 }, (_, index) => build(index)),
+    sum_other_doc_count: 0,
+  });
+  return {
+    ...Object.fromEntries(
+      Object.entries(LONGEST_FACET_VALUES).map(([name, length]) => [
+        name,
+        buckets((index) => ({
+          key: `${filler(length - 2)}${String(index).padStart(2, '0')}`,
+          doc_count: 133_118,
+        })),
+      ]),
+    ),
+    artist: buckets((index) => ({
+      key: 100_001 + index,
+      doc_count: 133_118,
+      label: { hits: { hits: [{ _source: { artist_title: filler(LONGEST_ARTIST_NAME) } }] } },
+    })),
+  };
+}
+
 // --- Error bodies ---------------------------------------------------------------
 
 export const API_NOT_FOUND_BODY = {

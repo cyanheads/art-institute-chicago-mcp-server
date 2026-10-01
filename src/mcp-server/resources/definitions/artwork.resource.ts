@@ -16,7 +16,10 @@ export const artworkResource = resource('artic://artworks/{id}', {
     'Read one Art Institute of Chicago artwork record by id as JSON: the artic_get_artworks record with the description and provenance sections and related media, plus the API license text, the CC BY 4.0 attribution when description text is present, and a notice when related media was capped or could not load.',
   mimeType: 'application/json',
   params: z.object({
-    id: z.string().regex(/^\d+$/).describe('Artwork id (digits), from artic_search_artworks.'),
+    id: z
+      .string()
+      .regex(/^\d{1,16}$/)
+      .describe('Artwork id (1-16 digits), from artic_search_artworks.'),
   }),
   cacheHint: { ttlMs: 21_600_000, cacheScope: 'public' },
   errors: [
@@ -57,7 +60,7 @@ export const artworkResource = resource('artic://artworks/{id}', {
 
   async handler(params, ctx) {
     const id = Number(params.id);
-    // Past 2^53 the id no longer survives as a number (a long enough one prints as Infinity).
+    // A 16-digit id past 2^53 no longer survives as a number.
     if (!Number.isSafeInteger(id)) {
       throw ctx.fail('artwork_not_found', `No artwork exists for id ${params.id}.`);
     }

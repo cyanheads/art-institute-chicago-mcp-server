@@ -919,6 +919,26 @@ describe('artic_get_artworks format', () => {
     expect(record?.inscriptions).toBe(freeText);
     expect(record?.provenance).toBe(freeText);
   });
+
+  it('renders link, image, and decoded HTML in quoted free text as inert text', async () => {
+    const provenance = 'See [the file](https://x.test/f) and ![p](https://x.test/p.png)​.';
+    serve([
+      artworkRecord(1, {
+        description: '<p>&lt;img src=x onerror=alert(1)&gt; is shown.</p>',
+        provenance_text: provenance,
+      }),
+    ]);
+    const result = await get({ ids: [1], include_related_media: false });
+    const text = textOf(result);
+    const [record] = structuredOf<GetRun>(result).artworks;
+
+    expect(text).toContain('### Description\n> \\<img src=x onerror=alert(1)\\> is shown.');
+    expect(text).toContain(
+      '### Provenance\n> See \\[the file\\](https://x.test/f) and !\\[p\\](https://x.test/p.png).',
+    );
+    expect(record?.description).toBe('<img src=x onerror=alert(1)> is shown.');
+    expect(record?.provenance).toBe(provenance);
+  });
 });
 
 // --- failures on the primary call ------------------------------------------------------------------------------
