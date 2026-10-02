@@ -13,9 +13,13 @@ import { lookupVocabulary } from '@/mcp-server/tools/definitions/lookup-vocabula
 import { disposeAicService } from '@/services/aic/aic-service.js';
 import { containsPattern, VOCABULARY_FIELDS } from '@/services/aic/aic-text.js';
 import {
+  GET_QUERY_LIMIT,
   jsonResponder,
+  POST_BODY_LIMIT,
+  queryStringBytes,
   scriptedFetch,
   searchBodyOf,
+  searchCallOf,
   urlOfCall,
 } from '../fixtures/aic-service-kit.js';
 import {
@@ -67,17 +71,68 @@ describe('artic_lookup_vocabulary input', () => {
     expect(body).not.toHaveProperty('query');
   });
 
-  it('compiles contains into a case-insensitive include regex, trimmed', async () => {
+  it('compiles contains into a case- and accent-insensitive include regex, trimmed', async () => {
     const fetchFake = installAicService(scriptedFetch(jsonResponder(aggregationEnvelope('v', []))));
     await runToolContract(lookupVocabulary, { vocabulary: 'style', contains: '  Impress  ' });
     expect(bucketBody(fetchFake).aggs.v.terms.include).toBe(containsPattern('Impress'));
-    expect(bucketBody(fetchFake).aggs.v.terms.include).toBe('.*[iI][mM][pP][rR][eE][sS][sS].*');
   });
 
   it('escapes regex metacharacters in contains so they match literally', async () => {
     const fetchFake = installAicService(scriptedFetch(jsonResponder(aggregationEnvelope('v', []))));
     await runToolContract(lookupVocabulary, { vocabulary: 'style', contains: 'a.b(c)*' });
-    expect(bucketBody(fetchFake).aggs.v.terms.include).toBe('.*[aA]\\.[bB]\\([cC]\\)\\*.*');
+    const include = bucketBody(fetchFake).aggs.v.terms.include ?? '';
+    expect(include).toBe(containsPattern('a.b(c)*'));
+    expect(new RegExp(`^${include}$`).test('A.B(C)*')).toBe(true);
+    expect(new RegExp(`^${include}$`).test('axbcc')).toBe(false);
+  });
+
+  it('sends one request for an accented and an unaccented contains, the second from cache', async () => {
+    const fetchFake = installAicService(
+      scriptedFetch(
+        jsonResponder(aggregationEnvelope('v', [{ key: "cote d'ivoire", doc_count: 53 }])),
+      ),
+    );
+    const accented = await runToolContract(lookupVocabulary, {
+      vocabulary: 'place_of_origin',
+      contains: 'côte',
+    });
+    const plain = await runToolContract(lookupVocabulary, {
+      vocabulary: 'place_of_origin',
+      contains: 'cote',
+    });
+    expect(fetchFake).toHaveBeenCalledTimes(1);
+    expect(bucketBody(fetchFake).aggs.v.terms.include).toBe(containsPattern('cote'));
+    for (const result of [accented, plain]) {
+      expect(structuredOf<VocabularyRun>(result).values).toEqual([
+        { value: "cote d'ivoire", artwork_count: 53 },
+      ]);
+      expect(textOf(result)).toContain("- cote d'ivoire (53 artworks)");
+    }
+  });
+
+  /** `o` has the longest letter class; a short contains stays a GET, a long one posts. */
+  it.each([
+    ['a short word', 'applique', 'GET'],
+    ['the longest letter class', 'o'.repeat(60), 'POST'],
+    ['realistic text', 'black-and-white photography with gelatin silver and ink wash', 'POST'],
+    ['title-case letters', 'ǅ'.repeat(60), 'GET'],
+    ['fullwidth letters', 'Ａ'.repeat(60), 'GET'],
+  ])('sends a contains of %s inside the firewall limits', async (_name, contains, method) => {
+    const fetchFake = installAicService(scriptedFetch(jsonResponder(aggregationEnvelope('v', []))));
+    await runToolContract(lookupVocabulary, {
+      vocabulary: 'classification',
+      contains,
+      public_domain_only: true,
+      limit: 100,
+    });
+    const call = searchCallOf(fetchFake);
+    expect(call.method).toBe(method);
+    expect((call.body.aggs as typeof call.body).v).toMatchObject({
+      terms: { include: containsPattern(contains) },
+    });
+    if (call.method === 'GET')
+      expect(queryStringBytes(call.url)).toBeLessThanOrEqual(GET_QUERY_LIMIT);
+    else expect(Buffer.byteLength(String(call.init.body))).toBeLessThan(POST_BODY_LIMIT);
   });
 
   it.each(['', '   ', '\t\n'])('reads blank contains %j as unset', async (contains) => {
@@ -248,35 +303,35 @@ describe('artic_lookup_vocabulary output and enrichment', () => {
     expect(out.values).toEqual([{ value: '240', artwork_count: 4 }]);
   });
 
-  it.each([
-    'department',
-    'artwork_type',
-    'style',
-    'subject',
-    'classification',
-    'place_of_origin',
-    'gallery',
-  ] as const)('names %s as the search filter its values feed', async (vocabulary) => {
-    installAicService(scriptedFetch(jsonResponder(aggregationEnvelope('v', []))));
-    const out = structuredOf<VocabularyRun>(
-      await runToolContract(lookupVocabulary, { vocabulary }),
-    );
-    expect(out.filter_param).toBe(vocabulary);
-  });
-
-  it.each(['material', 'technique', 'theme'] as const)(
-    'omits filter_param for %s, which is query text only',
+  it.each(Object.keys(VOCABULARY_FIELDS))(
+    'names %s as the search filter its values feed, on both surfaces',
     async (vocabulary) => {
       installAicService(
         scriptedFetch(
-          jsonResponder(aggregationEnvelope('v', [{ key: 'oil paint', doc_count: 2 }])),
+          jsonResponder(aggregationEnvelope('v', [{ key: 'gold leaf', doc_count: 78 }])),
         ),
       );
-      const result = await runToolContract(lookupVocabulary, { vocabulary });
-      expect(structuredOf<VocabularyRun>(result)).not.toHaveProperty('filter_param');
-      expect(textOf(result)).toContain('Not an artic_search_artworks filter');
+      const result = await runToolContract(lookupVocabulary, { vocabulary } as never);
+      expect(structuredOf<VocabularyRun>(result).filter_param).toBe(vocabulary);
+      expect(textOf(result)).toContain(
+        `Pass a value as \`${vocabulary}\` to artic_search_artworks; case is ignored.`,
+      );
+      expect(textOf(result)).not.toContain('query text');
     },
   );
+
+  it('declares filter_param required in the output contract', () => {
+    expect(lookupVocabulary.output.safeParse({ vocabulary: 'material', values: [] }).success).toBe(
+      false,
+    );
+    expect(
+      lookupVocabulary.output.safeParse({
+        vocabulary: 'material',
+        filter_param: 'material',
+        values: [],
+      }).success,
+    ).toBe(true);
+  });
 
   it('leaves the cap on the accumulator when the call fails before any result', async () => {
     installAicService(scriptedFetch(jsonResponder({}, 429)));

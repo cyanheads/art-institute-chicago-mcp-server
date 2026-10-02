@@ -14,38 +14,21 @@ import {
   inlineSafe,
   VOCABULARY_FIELDS,
   VOCABULARY_FILTERS,
-  type VocabularyFilter,
 } from '@/services/aic/aic-text.js';
-
-const VOCABULARIES = [
-  'department',
-  'artwork_type',
-  'style',
-  'subject',
-  'classification',
-  'material',
-  'technique',
-  'theme',
-  'place_of_origin',
-  'gallery',
-] as const;
-
-const isFilterParam = (vocabulary: string): vocabulary is VocabularyFilter =>
-  (VOCABULARY_FILTERS as readonly string[]).includes(vocabulary);
 
 export const lookupVocabulary = tool('artic_lookup_vocabulary', {
   title: 'Look up collection vocabulary',
   description:
-    'List the values of an Art Institute of Chicago collection vocabulary with how many artworks carry each, most common first, optionally narrowed by a substring. Department, artwork type, style, subject, classification, place of origin, and gallery values pass to the matching artic_search_artworks filter exactly as listed (case is ignored); material, technique, and theme values work as query text. Counts here span the whole collection; for counts within a filtered set of artworks, request facets from artic_search_artworks.',
+    'List the values of an Art Institute of Chicago collection vocabulary with how many artworks carry each, most common first, optionally narrowed by a substring. Each value passes to the artic_search_artworks filter of the same name exactly as listed (case is ignored). Counts here span the whole collection; for counts within a filtered set of artworks, request facets from artic_search_artworks.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     vocabulary: z
-      .enum(VOCABULARIES)
+      .enum(VOCABULARY_FILTERS)
       .describe(
-        'Vocabulary to list. department, artwork_type, style, subject, classification, place_of_origin, and gallery feed the artic_search_artworks filter of the same name; material, technique, and theme values work as query text.',
+        'Vocabulary to list; its values feed the artic_search_artworks filter of the same name.',
       ),
     contains: blankAsUnset(z.string().trim().max(60).optional()).describe(
-      'Case-insensitive substring the values must contain, such as "impress" for Impressionism and Post-Impressionism. Omit to list the most common values.',
+      'Case- and accent-insensitive substring the values must contain, such as "impress" for Impressionism and Post-Impressionism, or "applique" for appliqué (technique). Omit to list the most common values.',
     ),
     public_domain_only: blankAsUnset(z.boolean().default(false)).describe(
       'Count only public-domain artworks.',
@@ -55,13 +38,10 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
     ),
   }),
   output: z.object({
-    vocabulary: z.enum(VOCABULARIES).describe('The vocabulary listed.'),
+    vocabulary: z.enum(VOCABULARY_FILTERS).describe('The vocabulary listed.'),
     filter_param: z
       .enum(VOCABULARY_FILTERS)
-      .optional()
-      .describe(
-        'The artic_search_artworks parameter that accepts these values as listed; absent for material, technique, and theme, which are not search filters (use their values as query text).',
-      ),
+      .describe('The artic_search_artworks parameter that accepts these values as listed.'),
     values: z
       .array(
         z
@@ -69,7 +49,7 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
             value: z
               .string()
               .describe(
-                'Value as the index stores it (place values are lower-case); pass it back verbatim.',
+                'Value as the index stores it (place values are lower-case without accents); pass it back verbatim.',
               ),
             artwork_count: z.number().describe('Artworks carrying this value.'),
           })
@@ -151,21 +131,15 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
       ctx.enrich.notice(notice);
     }
 
-    return {
-      vocabulary: input.vocabulary,
-      ...(isFilterParam(input.vocabulary) ? { filter_param: input.vocabulary } : {}),
-      values,
-    };
+    return { vocabulary: input.vocabulary, filter_param: input.vocabulary, values };
   },
 
   format: (result) => {
-    const lines = [`# ${result.vocabulary} values (${result.values.length})`];
-    lines.push(
-      result.filter_param
-        ? `Pass a value as \`${result.filter_param}\` to artic_search_artworks; case is ignored.`
-        : 'Not an artic_search_artworks filter; use a value as query text.',
-    );
-    lines.push('');
+    const lines = [
+      `# ${result.vocabulary} values (${result.values.length})`,
+      `Pass a value as \`${result.filter_param}\` to artic_search_artworks; case is ignored.`,
+      '',
+    ];
     if (result.values.length === 0) lines.push('No values.');
     for (const entry of result.values) {
       const unit = entry.artwork_count === 1 ? 'artwork' : 'artworks';

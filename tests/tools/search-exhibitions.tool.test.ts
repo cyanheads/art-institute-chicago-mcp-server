@@ -110,7 +110,7 @@ describe('artic_search_exhibitions request', () => {
     const fetchFake = emptyResults();
     const out = structuredOf<ExhibitionsRun>(await search({ query: '  impressionist  prints ' }));
     const body = bodyOf(fetchFake);
-    expect(body.q).toBe('impressionist  prints');
+    expect(body.q).toBe('impressionist prints');
     expect(body).not.toHaveProperty('sort');
     expect(mustOf(fetchFake)).toEqual([
       {

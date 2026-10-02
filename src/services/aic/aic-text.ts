@@ -2,8 +2,9 @@
  * @fileoverview Pure helpers shared by the Art Institute service and the tool
  * definitions: input preprocessors for form-client blanks and comma lists,
  * HTML-to-text conversion, markdown-safe rendering of upstream text,
- * upstream URL and image-id screening, constructed IIIF and web URLs,
- * vocabulary filter routing, placeholder-year screening, and search-window paging.
+ * upstream URL and image-id screening, constructed IIIF and web URLs, search
+ * ranking text, vocabulary filter routing, placeholder-year screening, and
+ * search-window paging.
  * @module services/aic/aic-text
  */
 
@@ -64,23 +65,27 @@ export function numericIdItem(item: string): unknown {
 }
 
 /**
- * Optional vocabulary filter (department, type, style, subject, classification,
- * place): trimmed, blank → unset, and a `pc-`/`tm-` id prefix upper-cased.
+ * Optional vocabulary filter (every vocabulary but gallery): trimmed, blank →
+ * unset, composed to NFC (every stored title is precomposed, so a decomposed
+ * spelling matches nothing), and a `pc-`/`tm-` id prefix upper-cased.
  */
 export function vocabularyInput(maxLength: number) {
   return z.preprocess((value) => {
     if (typeof value !== 'string') return value;
-    const trimmed = value.trim();
+    const trimmed = value.trim().normalize('NFC');
     if (trimmed === '') return;
     return /^(pc|tm)-\d+$/i.test(trimmed) ? trimmed.toUpperCase() : trimmed;
   }, z.string().max(maxLength).optional());
 }
 
-/** Optional gallery filter: trimmed, blank → unset, a bare number (`240`, `211a`) → `Gallery 240`. */
+/**
+ * Optional gallery filter: trimmed, blank → unset, composed to NFC as
+ * `vocabularyInput` is, and a bare number (`240`, `211a`) → `Gallery 240`.
+ */
 export function galleryInput(maxLength: number) {
   return z.preprocess((value) => {
     if (typeof value !== 'string') return value;
-    const trimmed = value.trim();
+    const trimmed = value.trim().normalize('NFC');
     if (trimmed === '') return;
     return /^\d+[a-z]?$/i.test(trimmed) ? `Gallery ${trimmed}` : trimmed;
   }, z.string().max(maxLength).optional());
@@ -436,6 +441,34 @@ export function buildImage(
   };
 }
 
+// --- Search ranking text -----------------------------------------------------
+
+/** Word breaks for `rankingText`: whitespace, and NUL, which the API trims from the ends of `q`. */
+const WORD_BREAKS = new RegExp(`[\\s${esc(0)}]+`);
+
+/** A `q` the API reads as a color search: `#` and exactly six hex digits. */
+const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+
+/**
+ * The text a search sends as `q`, the API's ranking input, beside its must
+ * clause; `''` means send no `q`. The API makes three things in `q` required
+ * over fewer fields than the must clause searches, which would cut the total:
+ * a `"`-quoted segment (an unterminated quote runs to the end), a
+ * space-separated word whose first character is an ASCII digit, and a `q` that
+ * is exactly `#` and six hex digits (a color search). So quotes become word
+ * breaks, digit-led words are dropped, the remaining words are joined with
+ * single spaces, and a color-shaped remainder sends nothing. Every other
+ * operator in `q` only ranks and stays.
+ */
+export function rankingText(query: string): string {
+  const text = query
+    .replaceAll('"', ' ')
+    .split(WORD_BREAKS)
+    .filter((word) => word !== '' && !/^[0-9]/.test(word))
+    .join(' ');
+  return HEX_COLOR.test(text) ? '' : text;
+}
+
 // --- Vocabulary routing ------------------------------------------------------
 
 /** Vocabularies `artic_lookup_vocabulary` lists, and the keyword field each aggregates. */
@@ -454,22 +487,24 @@ export const VOCABULARY_FIELDS = {
 
 export type Vocabulary = keyof typeof VOCABULARY_FIELDS;
 
-/** Vocabularies that are also `artic_search_artworks` filters (the parameter shares the name). */
+/**
+ * Every vocabulary, each also the `artic_search_artworks` filter of the same
+ * name, in the field table's order (the order filter clauses are sent in).
+ */
 export const VOCABULARY_FILTERS = [
   'department',
   'artwork_type',
   'style',
   'subject',
   'classification',
+  'material',
+  'technique',
+  'theme',
   'place_of_origin',
   'gallery',
 ] as const satisfies readonly Vocabulary[];
 
-export type VocabularyFilter = (typeof VOCABULARY_FILTERS)[number];
-
-const ID_ROUTES: Partial<
-  Record<VocabularyFilter, { field: string; numeric?: true; pattern: RegExp }>
-> = {
+const ID_ROUTES: Partial<Record<Vocabulary, { field: string; numeric?: true; pattern: RegExp }>> = {
   department: { pattern: /^PC-\d+$/, field: 'department_id' },
   artwork_type: { pattern: /^\d+$/, field: 'artwork_type_id', numeric: true },
   style: { pattern: /^TM-\d+$/, field: 'style_ids' },
@@ -478,39 +513,98 @@ const ID_ROUTES: Partial<
 };
 
 /**
- * Query clause for one vocabulary filter value. An id (`PC-n`, `TM-n`, an
- * artwork type number) routes to the exact id field; a title matches the
- * keyword field whole, case-insensitively, since the index stores every value
- * as written.
+ * The `[xX]` class of a letter with one-character lower and upper forms, plus
+ * the letter itself when it is neither (a title-case letter such as `ǅ`), so
+ * the class always matches the letter as written; `undefined` for any other
+ * character.
  */
-export function vocabularyFilterClause(
-  filter: VocabularyFilter,
-  value: string,
-): Record<string, unknown> {
+function casePairClass(char: string): string | undefined {
+  const lower = char.toLowerCase();
+  const upper = char.toUpperCase();
+  if (lower === upper || lower.length !== 1 || upper.length !== 1) return;
+  return `[${lower}${upper}${char === lower || char === upper ? '' : char}]`;
+}
+
+/** A character as a Lucene regex literal: letters, digits, and whitespace as-is, anything else backslash-escaped. */
+function regexLiteral(char: string): string {
+  return /^[\p{L}\p{N}\s]$/u.test(char) ? char : `\\${char}`;
+}
+
+/**
+ * Query clause for one vocabulary filter value. An id (`PC-n`, `TM-n`, an
+ * artwork type number) routes to the exact id field. A title matches the
+ * keyword field whole, since the index stores every value as written, through
+ * `term` with `case_insensitive`, which folds ASCII letters only; a title
+ * holding a non-ASCII cased letter goes as a `regexp` instead, that letter as
+ * its `[xX]` class and every other character literal. `place_of_origin` always
+ * sends `term`: its index folds case and accents itself.
+ */
+export function vocabularyFilterClause(filter: Vocabulary, value: string): Record<string, unknown> {
   const idRoute = ID_ROUTES[filter];
   if (idRoute?.pattern.test(value)) {
     return { term: { [idRoute.field]: idRoute.numeric ? Number(value) : value } };
   }
-  return { term: { [VOCABULARY_FIELDS[filter]]: { value, case_insensitive: true } } };
+  const field = VOCABULARY_FIELDS[filter];
+  const chars = [...value];
+  const pairs = chars.map((char) => (char.charCodeAt(0) > 0x7f ? casePairClass(char) : undefined));
+  if (filter === 'place_of_origin' || pairs.every((pair) => pair === undefined)) {
+    return { term: { [field]: { value, case_insensitive: true } } };
+  }
+  const pattern = chars.map((char, index) => pairs[index] ?? regexLiteral(char)).join('');
+  return { regexp: { [field]: { value: pattern, case_insensitive: true } } };
 }
 
 /**
- * Lucene `include` regex matching values that contain `text`, ignoring case:
- * each cased letter becomes a `[xX]` class, digits and whitespace stay literal,
+ * Each ASCII letter, in either case, mapped to its `contains` class: both cases
+ * plus every precomposed letter in U+00C0–U+024F and U+1E00–U+1EFF whose
+ * canonical decomposition is that letter with marks, runs of three or more
+ * code points written as ranges. No two letters' classes share a character,
+ * which keeps the include regex's automaton as small as the text: one accented
+ * range shared by every class lets a 25-letter `contains` pass the search
+ * backend's determinization limit.
+ */
+const FOLDED_LETTER_CLASSES: ReadonlyMap<string, string> = (() => {
+  const members = new Map<string, number[]>();
+  for (const [from, to] of [
+    [0x41, 0x24f],
+    [0x1e00, 0x1eff],
+  ] as const) {
+    for (let code = from; code <= to; code++) {
+      const base = /^([A-Za-z])\p{M}*$/u.exec(String.fromCodePoint(code).normalize('NFD'))?.[1];
+      if (base) members.set(base.toLowerCase(), [...(members.get(base.toLowerCase()) ?? []), code]);
+    }
+  }
+  const classes = new Map<string, string>();
+  for (const [letter, codes] of members) {
+    let body = '';
+    for (let start = 0; start < codes.length; ) {
+      let end = start;
+      while (codes[end + 1] === (codes[end] ?? 0) + 1) end++;
+      const run = codes.slice(start, end + 1).map((code) => String.fromCodePoint(code));
+      body += run.length >= 3 ? `${run[0]}-${run.at(-1)}` : run.join('');
+      start = end + 1;
+    }
+    classes.set(letter, `[${body}]`).set(letter.toUpperCase(), `[${body}]`);
+  }
+  return classes;
+})();
+
+/** Combining marks following an ASCII letter: the accents `contains` ignores. */
+const ASCII_LETTER_MARKS = /([A-Za-z])\p{M}+/gu;
+
+/**
+ * Lucene `include` regex matching values that contain `text`, ignoring case
+ * and accents. Accents on ASCII letters are dropped (`côte` reads as `cote`),
+ * and each ASCII letter becomes the class of its cases and accented forms, so
+ * `e` also matches `é` or `Ẽ` in that position, never another letter. Any other
+ * cased letter becomes its `[xX]` class, digits and whitespace stay literal,
  * and every other character is backslash-escaped.
  */
 export function containsPattern(text: string): string {
+  const folded = text.normalize('NFD').replace(ASCII_LETTER_MARKS, '$1').normalize('NFC');
   let pattern = '';
-  for (const char of text) {
-    const lower = char.toLowerCase();
-    const upper = char.toUpperCase();
-    if (lower !== upper && lower.length === 1 && upper.length === 1) {
-      pattern += `[${lower}${upper}]`;
-    } else if (/^[\p{L}\p{N}\s]$/u.test(char)) {
-      pattern += char;
-    } else {
-      pattern += `\\${char}`;
-    }
+  for (const char of folded) {
+    pattern += FOLDED_LETTER_CLASSES.get(char) ?? casePairClass(char) ?? regexLiteral(char);
   }
   return `.*${pattern}.*`;
 }

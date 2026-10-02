@@ -13,17 +13,21 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   API_ORIGIN,
   artworkParams,
+  behindFirewall,
   createTestService,
   envelopeOfBytes,
+  GET_QUERY_LIMIT,
   hangingResponder,
   jsonResponder,
   networkErrorResponder,
   queryParam,
+  queryStringBytes,
   rejection,
   rejectionOf,
   routedFetch,
   scriptedFetch,
   searchBodyOf,
+  searchCallOf,
   streamingBody,
   TEST_CONTACT,
   TEST_VERSION,
@@ -491,7 +495,460 @@ describe('AicService request boundary', () => {
     const url = new URL(urlOfCall(fetch));
     expect([...url.searchParams.keys()]).toEqual(['params']);
     expect(url.hash).toBe('');
-    expect(searchBodyOf(urlOfCall(fetch)).q).toBe(query);
+    const body = searchBodyOf(urlOfCall(fetch));
+    expect(body.query).toEqual({
+      bool: { must: [{ simple_query_string: { query, default_operator: 'and' } }] },
+    });
+    expect(body.q).toBe('a&b=c#d quoted é ?x');
+  });
+});
+
+// --- Ranking text (q) -------------------------------------------------------------------
+
+describe('AicService ranking text', () => {
+  type Service = ReturnType<typeof createTestService>['service'];
+  const ctx = makeCtx();
+  const sqs = (query: string, fields?: string[]) => ({
+    simple_query_string: { query, ...(fields ? { fields } : {}), default_operator: 'and' },
+  });
+  const NAME_FIELDS = ['title', 'alt_titles', 'sort_title'];
+
+  /** Each search method, its route, and the body it sends for `query` once `q` is set aside. */
+  const endpoints = [
+    [
+      'searchArtworks',
+      '/api/v1/artworks/search',
+      (s: Service, query: string) => s.searchArtworks(artworkParams({ query }), ctx),
+      (query: string) => ({
+        query: { bool: { must: [sqs(query)] } },
+        page: 1,
+        limit: 10,
+        fields: expect.any(String),
+      }),
+    ],
+    [
+      'searchExhibitions',
+      '/api/v1/exhibitions/search',
+      (s: Service, query: string) =>
+        s.searchExhibitions({ query, sort: 'relevance', when: 'any', limit: 10, page: 1 }, ctx),
+      (query: string) => ({
+        query: { bool: { must: [sqs(query)] } },
+        page: 1,
+        limit: 10,
+        fields: expect.any(String),
+      }),
+    ],
+    [
+      'searchAgents',
+      '/api/v1/agents/search',
+      (s: Service, query: string) =>
+        s.searchAgents({ query, artists_only: true, limit: 10, page: 1 }, ctx),
+      (query: string) => ({
+        query: {
+          bool: { must: [sqs(query, NAME_FIELDS)], filter: [{ term: { is_artist: true } }] },
+        },
+        page: 1,
+        limit: 10,
+        fields: expect.any(String),
+      }),
+    ],
+    [
+      'searchMobileSounds',
+      '/api/v1/mobile-sounds/search',
+      (s: Service, query: string) => s.searchMobileSounds({ query, limit: 5, page: 1 }, ctx),
+      (query: string) => ({
+        query: { bool: { must: [sqs(query)] } },
+        page: 1,
+        limit: 5,
+        fields: expect.any(String),
+      }),
+    ],
+  ] as const;
+
+  it.each(endpoints)(
+    '%s filters on the query as typed and ranks on its text without quotes or numbers',
+    async (_name, path, call, rest) => {
+      const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+      const query = '"van gogh" | monet 1889';
+      await call(service, query);
+      expect(new URL(urlOfCall(fetch)).pathname).toBe(path);
+      expect(searchBodyOf(urlOfCall(fetch))).toEqual({ q: 'van gogh | monet', ...rest(query) });
+    },
+  );
+
+  it.each(endpoints)(
+    '%s sends no q when no ranking text remains, keeping the must clause',
+    async (_name, _path, call, rest) => {
+      const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+      for (const query of ['"1889"', '#facade']) await call(service, query);
+      expect(searchBodyOf(urlOfCall(fetch, 0))).toEqual(rest('"1889"'));
+      expect(searchBodyOf(urlOfCall(fetch, 1))).toEqual(rest('#facade'));
+    },
+  );
+
+  it('keeps q off date-sorted artwork and start-sorted exhibition searches', async () => {
+    const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+    await service.searchArtworks(artworkParams({ query: '"water lilies"', sort: 'date_asc' }), ctx);
+    await service.searchExhibitions(
+      { query: '"water lilies"', sort: 'start_asc', when: 'any', limit: 10, page: 1 },
+      ctx,
+    );
+    expect(searchBodyOf(urlOfCall(fetch, 0))).not.toHaveProperty('q');
+    expect(searchBodyOf(urlOfCall(fetch, 1))).not.toHaveProperty('q');
+  });
+
+  describe('decomposed (NFD) free text', () => {
+    const chars = (...codePoints: number[]) => String.fromCodePoint(...codePoints);
+    /** `"café" crème` precomposed (NFC), the form the index stores, its ranking text, and the query decomposed (NFD). */
+    const NFC_QUERY = `"caf${chars(0xe9)}" cr${chars(0xe8)}me`;
+    const NFC_RANKING = `caf${chars(0xe9)} cr${chars(0xe8)}me`;
+    const NFD_QUERY = `"cafe${chars(0x301)}" cre${chars(0x300)}me`;
+    const NFC_ARTIST = `Jean-L${chars(0xe9)}on G${chars(0xe9)}r${chars(0xf4)}me`;
+    const NFD_ARTIST = `Jean-Le${chars(0x301)}on Ge${chars(0x301)}ro${chars(0x302)}me`;
+    const artistClause = (query: string) => ({
+      match: { artist_titles: { query, operator: 'and' } },
+    });
+
+    it.each(endpoints)(
+      '%s sends a composed (NFC) query as typed in the must clause and q',
+      async (_name, _path, call, rest) => {
+        const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+        await call(service, NFC_QUERY);
+        expect(searchBodyOf(urlOfCall(fetch))).toEqual({ q: NFC_RANKING, ...rest(NFC_QUERY) });
+      },
+    );
+
+    it.each(endpoints)(
+      '%s sends a decomposed (NFD) query byte for byte as its composed twin',
+      async (_name, _path, call, rest) => {
+        expect(NFD_QUERY.normalize('NFC')).toBe(NFC_QUERY);
+        expect(NFD_QUERY).not.toBe(NFC_QUERY);
+        const nfc = createTestService(scriptedFetch(emptySearch()));
+        await call(nfc.service, NFC_QUERY);
+        const nfd = createTestService(scriptedFetch(emptySearch()));
+        await call(nfd.service, NFD_QUERY);
+        expect(urlOfCall(nfd.fetch)).toBe(urlOfCall(nfc.fetch));
+        expect(searchBodyOf(urlOfCall(nfd.fetch))).toEqual({
+          q: NFC_RANKING,
+          ...rest(NFC_QUERY),
+        });
+      },
+    );
+
+    it('searchArtworks sends a composed (NFC) artist as typed in its match clause', async () => {
+      const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+      await service.searchArtworks(artworkParams({ artist: NFC_ARTIST }), ctx);
+      expect(searchBodyOf(urlOfCall(fetch)).query).toEqual({
+        bool: { filter: [artistClause(NFC_ARTIST)] },
+      });
+    });
+
+    it('searchArtworks sends a decomposed (NFD) artist byte for byte as its composed twin', async () => {
+      expect(NFD_ARTIST.normalize('NFC')).toBe(NFC_ARTIST);
+      expect(NFD_ARTIST).not.toBe(NFC_ARTIST);
+      const nfc = createTestService(scriptedFetch(emptySearch()));
+      await nfc.service.searchArtworks(artworkParams({ artist: NFC_ARTIST }), ctx);
+      const nfd = createTestService(scriptedFetch(emptySearch()));
+      await nfd.service.searchArtworks(artworkParams({ artist: NFD_ARTIST }), ctx);
+      expect(urlOfCall(nfd.fetch)).toBe(urlOfCall(nfc.fetch));
+      expect(searchBodyOf(urlOfCall(nfd.fetch)).query).toEqual({
+        bool: { filter: [artistClause(NFC_ARTIST)] },
+      });
+    });
+  });
+});
+
+// --- GET query-string limit -------------------------------------------------------------
+
+describe('AicService GET query-string limit', () => {
+  const ctx = makeCtx();
+  const SEARCH_URL = `${API_ORIGIN}/api/v1/artworks/search`;
+
+  /**
+   * Date-sorted artwork search params (no `q`, so every query letter adds exactly
+   * one byte) whose GET query string is `bytes` long, measured on the service's own request.
+   */
+  async function paramsOfSize(bytes: number) {
+    const probe = createTestService(scriptedFetch(emptySearch()));
+    await probe.service.searchArtworks(artworkParams({ query: 'a', sort: 'date_asc' }), ctx);
+    const base = queryStringBytes(urlOfCall(probe.fetch));
+    return artworkParams({ query: 'a'.repeat(1 + bytes - base), sort: 'date_asc' });
+  }
+
+  /** The body a date-ascending artwork search for `query` sends. */
+  const dateSortedBody = (query: string) => ({
+    query: {
+      bool: {
+        must: [{ simple_query_string: { query, default_operator: 'and' } }],
+        filter: [{ range: { date_start: { gte: -8000, lte: 2100 } } }],
+      },
+    },
+    sort: [{ date_start: { order: 'asc' } }],
+    page: 1,
+    limit: 10,
+    fields: expect.any(String),
+  });
+
+  it('sends a search with exactly 2,048 bytes of query string as GET', async () => {
+    const params = await paramsOfSize(GET_QUERY_LIMIT);
+    const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+    await service.searchArtworks(params, ctx);
+    const sent = searchCallOf(fetch);
+    expect(sent.method).toBe('GET');
+    expect(queryStringBytes(sent.url)).toBe(GET_QUERY_LIMIT);
+    expect(sent.init.body).toBeUndefined();
+    expect(sent.headers).not.toHaveProperty('Content-Type');
+    expect(sent.body).toEqual(dateSortedBody(params.query ?? ''));
+  });
+
+  it('posts a search with 2,049 bytes of query string to the bare path, its body the JSON a GET would carry', async () => {
+    const params = await paramsOfSize(GET_QUERY_LIMIT + 1);
+    const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+    await service.searchArtworks(params, ctx);
+    const sent = searchCallOf(fetch);
+    expect(sent.method).toBe('POST');
+    expect(sent.url).toBe(SEARCH_URL);
+    expect(sent.headers).toEqual({
+      Accept: 'application/json',
+      'AIC-User-Agent': `art-institute-chicago-mcp-server/${TEST_VERSION} (${TEST_CONTACT})`,
+      'Content-Type': 'application/json',
+    });
+    expect(sent.init.redirect).toBe('manual');
+    expect(sent.body).toEqual(dateSortedBody(params.query ?? ''));
+    const asGet = new URLSearchParams({ params: String(sent.init.body) }).toString();
+    expect(asGet.length).toBe(GET_QUERY_LIMIT + 1);
+  });
+
+  it('answers a search the firewall would refuse as a GET', async () => {
+    const { service, fetch } = createTestService(
+      scriptedFetch(behindFirewall(jsonResponder(searchEnvelope([artworkRecord(1)], 1)))),
+    );
+    const result = await service.searchArtworks(
+      artworkParams({ query: 'portrait '.repeat(300), facets: ['department', 'artist'] }),
+      ctx,
+    );
+    expect(result.artworks.map((artwork) => artwork.id)).toEqual([1]);
+    expect(searchCallOf(fetch).method).toBe('POST');
+  });
+
+  it('serves a repeated over-limit search from one upstream request', async () => {
+    const params = await paramsOfSize(GET_QUERY_LIMIT + 1);
+    const { service, fetch } = createTestService(
+      scriptedFetch(jsonResponder(searchEnvelope([artworkRecord(1)], 1))),
+    );
+    const first = await service.searchArtworks(params, ctx);
+    const second = await service.searchArtworks(params, ctx);
+    expect(second).toEqual(first);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('keys over-limit searches by their parameters, so different ones never share an entry', async () => {
+    const params = await paramsOfSize(GET_QUERY_LIMIT + 10);
+    const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+    await service.searchArtworks(params, ctx);
+    await service.searchArtworks({ ...params, query: `${params.query}b` }, ctx);
+    await service.searchArtworks({ ...params, page: 2 }, ctx);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(searchCallOf(fetch, 1).body.query).not.toEqual(searchCallOf(fetch, 0).body.query);
+    expect(searchCallOf(fetch, 2).body.page).toBe(2);
+  });
+
+  it('still fails markup in a posted search as request_blocked, without retrying', async () => {
+    const { service, fetch } = createTestService(scriptedFetch(behindFirewall(emptySearch())));
+    const error = await rejection(
+      service.searchArtworks(
+        artworkParams({ query: `${'portrait '.repeat(300)}<script>alert(1)</script>` }),
+        ctx,
+      ),
+    );
+    expect(error.code).toBe(JsonRpcErrorCode.Forbidden);
+    expect(error.data).toMatchObject({ reason: 'request_blocked', retryable: false, status: 403 });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(searchCallOf(fetch).method).toBe('POST');
+  });
+
+  it('posts an over-limit aggregation through the same rule', async () => {
+    const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+    await service.aggregate(
+      'department_title.keyword',
+      { include: `.*${'[aA]'.repeat(600)}.*`, public_domain_only: false, size: 5 },
+      ctx,
+    );
+    const sent = searchCallOf(fetch);
+    expect(sent.method).toBe('POST');
+    expect(sent.body).toMatchObject({ limit: 0, aggs: { v: { terms: { size: 5 } } } });
+  });
+
+  it('keeps the listing-by-ids routes on GET', async () => {
+    const { service, fetch } = createTestService(scriptedFetch(jsonResponder(envelope([]))));
+    await service.getArtworks([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], ['description', 'provenance'], ctx);
+    const [url, init] = fetch.mock.calls[0] ?? [];
+    expect(init?.method).toBeUndefined();
+    expect(queryParam(url ?? '', 'ids')).toBe('1,2,3,4,5,6,7,8,9,10');
+  });
+
+  it('never posts a listing-by-ids request, even past the limit', async () => {
+    const { service, fetch } = createTestService(scriptedFetch(jsonResponder(envelope([]))));
+    const ids = Array.from(
+      { length: 60 },
+      (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+    );
+    await service.getSounds(ids, ctx);
+    const [url, init] = fetch.mock.calls[0] ?? [];
+    expect(queryStringBytes(url ?? '')).toBeGreaterThan(GET_QUERY_LIMIT);
+    expect(init?.method).toBeUndefined();
+    expect(init?.body).toBeUndefined();
+  });
+});
+
+// --- Both request methods through one boundary ---------------------------------------------
+
+describe.each([
+  ['GET', 'water'],
+  ['POST', 'water lilies '.repeat(200).trim()],
+] as const)('AicService request boundary over %s', (method, query) => {
+  const search = (service: ReturnType<typeof createTestService>['service'], ctx = makeCtx()) =>
+    service.searchArtworks(artworkParams({ query }), ctx);
+  const methodsOf = (fetch: ReturnType<typeof scriptedFetch>) =>
+    fetch.mock.calls.map((_call, index) => searchCallOf(fetch, index).method);
+
+  it(`sends the search as ${method} with the courtesy headers, never following a redirect`, async () => {
+    const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+    await search(service);
+    const sent = searchCallOf(fetch);
+    expect(sent.method).toBe(method);
+    expect(sent.headers['AIC-User-Agent']).toBe(
+      `art-institute-chicago-mcp-server/${TEST_VERSION} (${TEST_CONTACT})`,
+    );
+    expect(sent.headers.Accept).toBe('application/json');
+    expect(sent.init.redirect).toBe('manual');
+    expect(sent.init.signal).toBeInstanceOf(AbortSignal);
+    expect(sent.body).toMatchObject({ q: query });
+  });
+
+  it('maps an edge block page to request_blocked without retrying', async () => {
+    const { service, fetch } = createTestService(
+      scriptedFetch(textResponder(EDGE_BLOCK_HTML, 403, { 'content-type': 'text/html' })),
+    );
+    const error = await rejection(search(service));
+    expect(error.data).toMatchObject({ reason: 'request_blocked', retryable: false });
+    expect(methodsOf(fetch)).toEqual([method]);
+  });
+
+  it('maps the API window refusal to page_beyond_window', async () => {
+    const { service } = createTestService(
+      scriptedFetch(jsonResponder(API_INVALID_RESULTS_BODY, 403)),
+    );
+    const error = await rejection(search(service));
+    expect(error.data).toMatchObject({ reason: 'page_beyond_window' });
+  });
+
+  it('maps the search backend 400 to upstream_rejected_query without retrying', async () => {
+    const { service, fetch } = createTestService(
+      scriptedFetch(textResponder(ES_BAD_REQUEST_TEXT, 400)),
+    );
+    const error = await rejection(search(service));
+    expect(error.data).toMatchObject({ reason: 'upstream_rejected_query', status: 400 });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a 429 up to the attempt budget, re-sending the same request each time', async () => {
+    const { service, fetch } = createTestService(scriptedFetch(jsonResponder({}, 429)));
+    const error = await rejection(search(service));
+    expect(error.data).toMatchObject({ reason: 'rate_limited', status: 429 });
+    expect(methodsOf(fetch)).toEqual([method, method, method]);
+    const first = searchCallOf(fetch, 0);
+    for (const index of [1, 2]) {
+      const again = searchCallOf(fetch, index);
+      expect(again.url).toBe(first.url);
+      expect(again.init.body).toBe(first.init.body);
+    }
+  });
+
+  it('recovers from 5xx answers on later attempts', async () => {
+    const { service, fetch } = createTestService(
+      scriptedFetch(
+        jsonResponder({}, 503),
+        jsonResponder({}, 500),
+        jsonResponder(searchEnvelope([artworkRecord(1)], 1)),
+      ),
+    );
+    await expect(search(service)).resolves.toMatchObject({ total: 1 });
+    expect(methodsOf(fetch)).toEqual([method, method, method]);
+  });
+
+  it('maps a network failure to ServiceUnavailable after three attempts', async () => {
+    const { service, fetch } = createTestService(scriptedFetch(networkErrorResponder()));
+    const error = await rejection(search(service));
+    expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it('stops reading the body once it passes the 5 MiB ceiling', async () => {
+    const chunk = new Uint8Array(MIB).fill(0x78);
+    const body = streamingBody(Array.from({ length: 20 }, () => chunk));
+    const { service } = createTestService(scriptedFetch(body.responder), {
+      retry: { baseDelayMs: 0, maxRetries: 0 },
+    });
+    const error = await rejection(search(service));
+    expect(error.message).toContain('unreadable response');
+    expect(body.cancelled()).toBe(true);
+    expect(body.pulled()).toBeLessThan(10);
+  });
+
+  it('fails with a retry-deadline Timeout when the request outlasts the total deadline', async () => {
+    const { service, fetch } = createTestService(scriptedFetch(hangingResponder), {
+      retry: { baseDelayMs: 0, deadlineMs: 60 },
+    });
+    const error = await rejection(search(service));
+    expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+    expect(error.data).toMatchObject({ reason: 'retry_deadline_exceeded' });
+    expect(methodsOf(fetch)).toEqual([method]);
+  });
+
+  it('rethrows a caller cancellation instead of returning a result', async () => {
+    const controller = new AbortController();
+    const { service, fetch } = createTestService(scriptedFetch(hangingResponder, emptySearch()));
+    const pending = rejectionOf(search(service, createMockContext({ signal: controller.signal })));
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    controller.abort(new DOMException('cancelled by caller', 'AbortError'));
+    const error = await pending;
+    expect(error).toBeInstanceOf(DOMException);
+    expect((error as DOMException).message).toBe('cancelled by caller');
+    expect(methodsOf(fetch)).toEqual([method]);
+  });
+
+  it('paces every attempt', async () => {
+    const inner = createPacer({ name: `aic-test-${method}` });
+    let runs = 0;
+    const pacer: Pacer = {
+      get cooldown() {
+        return inner.cooldown;
+      },
+      dispose: () => inner.dispose(),
+      [Symbol.dispose]: () => inner.dispose(),
+      run: (task, options) => {
+        runs += 1;
+        return inner.run(task, options);
+      },
+    };
+    const { service, fetch } = createTestService(
+      scriptedFetch(jsonResponder({}, 503), emptySearch()),
+      { pacer },
+    );
+    await search(service);
+    expect(runs).toBe(2);
+    expect(methodsOf(fetch)).toEqual([method, method]);
+    inner.dispose();
+  });
+
+  it('serves a repeated search from the cache without pacing or fetching again', async () => {
+    const { service, fetch } = createTestService(
+      scriptedFetch(jsonResponder(searchEnvelope([artworkRecord(1)], 1))),
+    );
+    const first = await search(service);
+    await expect(search(service)).resolves.toEqual(first);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });
 

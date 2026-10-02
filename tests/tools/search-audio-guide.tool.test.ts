@@ -114,7 +114,10 @@ describe('artic_search_audio_guide request', () => {
   it('trims the query before building the request', async () => {
     const fetchFake = emptyResults();
     await listen({ query: '   seurat  ' });
-    expect(bodyOf(fetchFake)).toMatchObject({ q: 'seurat' });
+    expect(bodyOf(fetchFake)).toMatchObject({
+      q: 'seurat',
+      query: { bool: { must: [{ simple_query_string: { query: 'seurat' } }] } },
+    });
   });
 
   it('passes page and limit upstream', async () => {
@@ -123,10 +126,40 @@ describe('artic_search_audio_guide request', () => {
     expect(bodyOf(fetchFake)).toMatchObject({ page: 3, limit: 20 });
   });
 
-  it('keeps query operators and punctuation as typed', async () => {
+  it('keeps query operators and punctuation as typed in the must clause, and ranks without the quotes', async () => {
     const fetchFake = emptyResults();
-    await listen({ query: '"la grande" -jatte | (sunday)' });
-    expect(bodyOf(fetchFake)).toMatchObject({ q: '"la grande" -jatte | (sunday)' });
+    await listen({ query: '"la grande" -jatte | (sunday) 1884' });
+    expect(bodyOf(fetchFake)).toEqual({
+      q: 'la grande -jatte | (sunday)',
+      query: {
+        bool: {
+          must: [
+            {
+              simple_query_string: {
+                query: '"la grande" -jatte | (sunday) 1884',
+                default_operator: 'and',
+              },
+            },
+          ],
+        },
+      },
+      page: 1,
+      limit: 5,
+      fields: FIELDS,
+    });
+  });
+
+  it('sends no q when the query is only a number, filtering on it alone', async () => {
+    const fetchFake = emptyResults();
+    await listen({ query: '1884' });
+    expect(bodyOf(fetchFake)).toEqual({
+      query: {
+        bool: { must: [{ simple_query_string: { query: '1884', default_operator: 'and' } }] },
+      },
+      page: 1,
+      limit: 5,
+      fields: FIELDS,
+    });
   });
 });
 

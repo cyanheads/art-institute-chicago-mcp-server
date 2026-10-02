@@ -41,6 +41,7 @@ import {
   manifestUrl,
   nonEmpty,
   plausibleYear,
+  rankingText,
   stringList,
   VOCABULARY_FIELDS,
   VOCABULARY_FILTERS,
@@ -75,6 +76,8 @@ import type {
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
 /** Per-attempt network budget, clipped to what remains of the total deadline. */
 const ATTEMPT_TIMEOUT_MS = 10_000;
+/** The longest query string, without the `?`, the API's edge firewall lets a GET carry. */
+const MAX_GET_QUERY_BYTES = 2048;
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -196,6 +199,7 @@ export interface ArtworkSearchParams {
   gallery?: string | undefined;
   has_image: boolean;
   limit: number;
+  material?: string | undefined;
   on_view_only: boolean;
   page: number;
   place_of_origin?: string | undefined;
@@ -204,6 +208,8 @@ export interface ArtworkSearchParams {
   sort: ArtworkSort;
   style?: string | undefined;
   subject?: string | undefined;
+  technique?: string | undefined;
+  theme?: string | undefined;
   year_from?: number | undefined;
   year_to?: number | undefined;
 }
@@ -351,7 +357,7 @@ export class AicService {
     if (dateSort) filter.push({ range: { date_start: { gte: YEAR_MIN, lte: YEAR_MAX } } });
     const facets = params.facets ?? [];
     const body = {
-      ...(!dateSort && params.query ? { q: params.query } : {}),
+      ...(dateSort ? {} : rankingParam(params.query)),
       ...boolQuery(must, filter),
       ...(dateSort
         ? { sort: [{ date_start: { order: params.sort === 'date_asc' ? 'asc' : 'desc' } }] }
@@ -443,7 +449,7 @@ export class AicService {
       });
     }
     const body = {
-      q: params.query,
+      ...rankingParam(params.query),
       ...boolQuery([simpleQuery(params.query, ['title', 'alt_titles', 'sort_title'])], filter),
       page: params.page,
       limit: params.limit,
@@ -535,7 +541,7 @@ export class AicService {
         ? 'start_asc'
         : 'start_desc';
     const body = {
-      ...(relevance ? { q: params.query } : {}),
+      ...(relevance ? rankingParam(params.query) : {}),
       ...boolQuery(must, filter),
       ...(relevance
         ? {}
@@ -565,7 +571,7 @@ export class AicService {
     ctx: Context,
   ): Promise<AudioGuideSearchResult> {
     const body = {
-      q: params.query,
+      ...rankingParam(params.query),
       ...boolQuery([simpleQuery(params.query)], []),
       page: params.page,
       limit: params.limit,
@@ -624,22 +630,38 @@ export class AicService {
 
   // --- Request boundary -------------------------------------------------------
 
-  /** `GET <path>?params=<minified JSON>`, the API's documented production query form. */
+  /**
+   * `GET <path>?params=<minified JSON>`, the API's documented production query
+   * form. The edge firewall refuses a GET whose query string passes 2,048 bytes,
+   * so a longer search posts the same JSON as the request body, which the API
+   * answers the same way. Every string value is composed to NFC: the index
+   * stores text precomposed and its analysis composes nothing, so decomposed
+   * text matches nothing, and text already in NFC is sent unchanged.
+   */
   #search<T>(
     path: string,
     body: Record<string, unknown>,
     ttlMs: number,
     ctx: Context,
   ): Promise<RawEnvelope<T>> {
-    return this.#request<T>(path, { params: JSON.stringify(body) }, ttlMs, ctx);
+    const json = JSON.stringify(body, (_key, value: unknown) =>
+      typeof value === 'string' ? value.normalize('NFC') : value,
+    );
+    return this.#request<T>(path, { params: json }, ttlMs, ctx, json);
   }
 
-  /** `GET <path>?<params>`: the listing-by-ids routes call it directly with `ids` and `fields`. */
+  /**
+   * `GET <path>?<params>`, cached under that URL whichever way it is sent. The
+   * listing-by-ids routes call it directly with `ids` and `fields`; a search
+   * passes `postBody`, sent as `POST <path>` instead when the GET query string
+   * would be too long.
+   */
   async #request<T>(
     path: string,
     params: Record<string, string>,
     ttlMs: number,
     ctx: Context,
+    postBody?: string,
   ): Promise<RawEnvelope<T>> {
     const url = new URL(`${API_BASE_URL}${path}`);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
@@ -652,7 +674,20 @@ export class AicService {
       return JSON.parse(cached) as RawEnvelope<T>;
     }
 
-    const fetched = await this.#fetchResilient(href, path, ctx);
+    const headers = { Accept: 'application/json', 'AIC-User-Agent': this.#userAgent };
+    const fetched =
+      postBody === undefined || url.search.length - 1 <= MAX_GET_QUERY_BYTES
+        ? await this.#fetchResilient(href, { headers }, path, ctx)
+        : await this.#fetchResilient(
+            `${API_BASE_URL}${path}`,
+            {
+              method: 'POST',
+              body: postBody,
+              headers: { ...headers, 'Content-Type': 'application/json' },
+            },
+            path,
+            ctx,
+          );
     this.#cache.set(href, fetched.text, fetched.bytes, ttlMs);
     return fetched.body as RawEnvelope<T>;
   }
@@ -662,14 +697,19 @@ export class AicService {
    * charged to the deadline. A pacer shed (the call could not start in time) is
    * not retried and leaves as `rate_limited` so the calling tool's recovery applies.
    */
-  async #fetchResilient(href: string, path: string, ctx: Context): Promise<FetchedBody> {
+  async #fetchResilient(
+    target: string,
+    init: RequestInit,
+    path: string,
+    ctx: Context,
+  ): Promise<FetchedBody> {
     try {
       return await withRetry(
         (attempt) =>
-          this.#pacer.run((signal) => this.#attempt(href, signal, attempt.remainingMs, ctx), {
-            signal: attempt.signal,
-            maxWaitMs: attempt.remainingMs,
-          }),
+          this.#pacer.run(
+            (signal) => this.#attempt(target, init, signal, attempt.remainingMs, ctx),
+            { signal: attempt.signal, maxWaitMs: attempt.remainingMs },
+          ),
         {
           operation: `AicService ${path}`,
           context: ctx,
@@ -695,7 +735,8 @@ export class AicService {
 
   /** One paced attempt: fetch, read the body under the byte ceiling, classify. */
   async #attempt(
-    href: string,
+    target: string,
+    init: RequestInit,
     signal: AbortSignal,
     remainingMs: number,
     ctx: Context,
@@ -704,8 +745,8 @@ export class AicService {
     const timer = new AbortController();
     const handle = setTimeout(() => timer.abort(), timeoutMs);
     try {
-      const response = await this.#fetch(href, {
-        headers: { Accept: 'application/json', 'AIC-User-Agent': this.#userAgent },
+      const response = await this.#fetch(target, {
+        ...init,
         redirect: 'manual',
         signal: AbortSignal.any([signal, timer.signal]),
       });
@@ -873,6 +914,12 @@ function classify(
 }
 
 // --- Query building ------------------------------------------------------------
+
+/** `{ q }` carrying the query's ranking text, or nothing when no ranking text remains. */
+function rankingParam(query: string | undefined): { q?: string } {
+  const q = query === undefined ? '' : rankingText(query);
+  return q ? { q } : {};
+}
 
 function simpleQuery(query: string, fields?: readonly string[]): Record<string, unknown> {
   return {

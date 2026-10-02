@@ -34,9 +34,11 @@ import {
   plausibleYear,
   printableUrl,
   quoteBlock,
+  rankingText,
   SEARCH_WINDOW,
   stringList,
   VOCABULARY_FIELDS,
+  VOCABULARY_FILTERS,
   vocabularyFilterClause,
   vocabularyInput,
   WINDOW_NOTICE,
@@ -53,6 +55,10 @@ const codePointRows = (...codePoints: number[]) =>
 
 /** ZERO WIDTH SPACE, BOM, WORD JOINER, and tag characters (first, `A`, last). */
 const INVISIBLE = codePointRows(0x200b, 0xfeff, 0x2060, 0xe0000, 0xe0041, 0xe007f);
+
+/** A stored style title, precomposed (NFC) as every stored vocabulary value is, and decomposed (NFD). */
+const NFC_TITLE = 'wiener werkstätte';
+const NFD_TITLE = NFC_TITLE.normalize('NFD');
 
 describe('blankAsUnset', () => {
   const optionalText = blankAsUnset(z.string().max(5).optional());
@@ -209,6 +215,23 @@ describe('vocabularyInput', () => {
     expect(field.parse('  Prints  ')).toBe('Prints');
   });
 
+  it('keeps a composed (NFC) accented title as written', () => {
+    expect(field.parse(NFC_TITLE)).toBe('wiener werkstätte');
+    expect(field.parse(` ${NFC_TITLE.toUpperCase()} `)).toBe('WIENER WERKSTÄTTE');
+  });
+
+  it('composes a decomposed (NFD) title to NFC, the form every stored title takes', () => {
+    expect(NFD_TITLE).toBe(`wiener werksta${chars(0x308)}tte`);
+    expect(field.parse(NFD_TITLE)).toBe(NFC_TITLE);
+    expect(field.parse(` ${NFD_TITLE.toUpperCase()} `)).toBe('WIENER WERKSTÄTTE');
+  });
+
+  it('counts the max length on the composed form', () => {
+    const atMax = 'ä'.repeat(20);
+    expect(field.parse(atMax.normalize('NFD'))).toBe(atMax);
+    expect(field.safeParse(`${atMax}x`.normalize('NFD')).success).toBe(false);
+  });
+
   it('reads blank as unset and absent as unset', () => {
     expect(field.parse('')).toBeUndefined();
     expect(field.parse('   ')).toBeUndefined();
@@ -238,7 +261,7 @@ describe('galleryInput', () => {
     expect(field.parse(input)).toBe(expected);
   });
 
-  it.each(['Gallery 240', 'gallery 240', '2a3', '12ab', 'Ryerson Library'])(
+  it.each(['Gallery 240', 'gallery 240', '2a3', '12ab', 'Ryerson Library', 'Café Gallery'])(
     'leaves %j alone',
     (input) => {
       expect(field.parse(input)).toBe(input);
@@ -248,6 +271,10 @@ describe('galleryInput', () => {
   it('reads blank as unset', () => {
     expect(field.parse('')).toBeUndefined();
     expect(field.parse('  ')).toBeUndefined();
+  });
+
+  it('composes a decomposed (NFD) title to NFC', () => {
+    expect(field.parse(' Café Gallery '.normalize('NFD'))).toBe('Café Gallery');
   });
 
   it('enforces the max length on the expanded value', () => {
@@ -416,21 +443,55 @@ describe('htmlToText', () => {
     expect(htmlToText(`a${chars(0x3000)}\n${chars(0x3000)}b`)).toBe('a b');
   });
 
-  describe('time on unterminated markup at 1 MiB', () => {
+  /**
+   * Linear time, measured in process CPU rather than wall-clock time so test
+   * files running beside it cannot fail it: the fastest of several conversions
+   * at 1 MiB stays under an absolute bound, and its ratio to the fastest at
+   * 256 KiB stays below 10x, under quadratic (16x). Linear is 4x, but V8's
+   * global replace grows faster once a pattern matches hundreds of thousands
+   * of times, and the mixed-whitespace case measures 6x to 7.5x on Node.
+   */
+  describe('time on unterminated markup', () => {
     const MIB = 1024 * 1024;
+    const SAMPLES = 5;
+
+    const cpuMs = (work: () => void) => {
+      const start = process.cpuUsage();
+      work();
+      const { user, system } = process.cpuUsage(start);
+      return (user + system) / 1000;
+    };
+
     it.each([
-      ['a whitespace run with no line break', () => `a${' '.repeat(MIB)}b`],
-      ['mixed spaces, tabs, and no-break spaces', () => `a${' \t \u000b'.repeat(MIB / 4)}b`],
-      ['repeated list-tag openings', () => '<li'.repeat(MIB / 3)],
-      ['repeated comment openings', () => '<!--'.repeat(MIB / 4)],
-      ['repeated tag openings', () => '<a '.repeat(MIB / 3)],
-      ['a line-break tag followed by spaces', () => `<br${' '.repeat(MIB)}`],
-      ['an entity name with no semicolon', () => `&${'a'.repeat(MIB)}`],
-    ])('converts %s in under 250 ms', (_name, make) => {
-      const input = make();
-      const started = performance.now();
-      htmlToText(input);
-      expect(performance.now() - started).toBeLessThan(250);
+      ['a whitespace run with no line break', (size: number) => `a${' '.repeat(size)}b`],
+      [
+        'mixed spaces, tabs, and no-break spaces',
+        (size: number) => `a${' \t \u000b'.repeat(size / 4)}b`,
+      ],
+      ['repeated list-tag openings', (size: number) => '<li'.repeat(size / 3)],
+      ['repeated comment openings', (size: number) => '<!--'.repeat(size / 4)],
+      ['repeated tag openings', (size: number) => '<a '.repeat(size / 3)],
+      ['a line-break tag followed by spaces', (size: number) => `<br${' '.repeat(size)}`],
+      ['an entity name with no semicolon', (size: number) => `&${'a'.repeat(size)}`],
+    ])('converts %s in linear time', (_name, make) => {
+      const small = make(MIB / 4);
+      const large = make(MIB);
+      htmlToText(small);
+      htmlToText(large);
+      let smallMs = Number.POSITIVE_INFINITY;
+      let largeMs = Number.POSITIVE_INFINITY;
+      for (let sample = 0; sample < SAMPLES; sample++) {
+        smallMs = Math.min(
+          smallMs,
+          cpuMs(() => htmlToText(small)),
+        );
+        largeMs = Math.min(
+          largeMs,
+          cpuMs(() => htmlToText(large)),
+        );
+      }
+      expect(largeMs).toBeLessThan(1000);
+      expect(largeMs / smallMs).toBeLessThan(10);
     });
   });
 });
@@ -758,6 +819,122 @@ describe('buildImage', () => {
   });
 });
 
+describe('rankingText', () => {
+  it.each([
+    'water lilies',
+    'monet',
+    'nighthawks | lilies',
+    'monet -lilies',
+    'monet +lilies',
+    'nighthawk*',
+    '(water lilies)',
+    'nighthwks~1',
+    'a&b=c#d é ?x',
+    'van gogh 漢字',
+  ])('passes plain text %j through unchanged', (query) => {
+    expect(rankingText(query)).toBe(query);
+  });
+
+  it.each([
+    ['"Ferris Bueller"', 'Ferris Bueller'],
+    ['"Chicago Artists"', 'Chicago Artists'],
+    ['"nighthawks" | "water lilies"', 'nighthawks | water lilies'],
+    ['monet | "van gogh"', 'monet | van gogh'],
+    ['"van gogh" | monet', 'van gogh | monet'],
+    ['"la grande" -jatte | (sunday)', 'la grande -jatte | (sunday)'],
+  ])('turns the quotes of paired phrases in %j into word breaks', (query, expected) => {
+    expect(rankingText(query)).toBe(expected);
+  });
+
+  it.each([
+    ['"water lilies', 'water lilies'],
+    ['water "lilies', 'water lilies'],
+    ['water lilies"', 'water lilies'],
+    ['"a" "b', 'a b'],
+  ])('drops an unterminated quote in %j', (query, expected) => {
+    expect(rankingText(query)).toBe(expected);
+  });
+
+  it('keeps the words on either side of a quote apart', () => {
+    expect(rankingText('foo"bar"baz')).toBe('foo bar baz');
+  });
+
+  it.each([
+    ['grande jatte 1884', 'grande jatte'],
+    ['monet 1891', 'monet'],
+    ['3 musicians', 'musicians'],
+    ['19th century chair', 'century chair'],
+    ['chicago 1893 fair', 'chicago fair'],
+    ['1st 2nd third', 'third'],
+    ['grande jatte "1884"', 'grande jatte'],
+    ['x"1884', 'x'],
+  ])('drops the digit-led words of %j', (query, expected) => {
+    expect(rankingText(query)).toBe(expected);
+  });
+
+  it.each([
+    'monet +1891',
+    'monet -1891',
+    'monet (1891)',
+    'monet .5',
+    'a1884',
+    'monet ½',
+    'monet ３',
+  ])('keeps %j, where no word starts with an ASCII digit', (query) => {
+    expect(rankingText(query)).toBe(query);
+  });
+
+  it.each([
+    ['monet\t1891', 'monet'],
+    ['monet\n1891', 'monet'],
+    [`monet${chars(0xa0)}1891`, 'monet'],
+    [`${chars(0)}1884 monet`, 'monet'],
+  ])('treats any whitespace or NUL as a word break in %j', (query, expected) => {
+    expect(rankingText(query)).toBe(expected);
+  });
+
+  it('collapses whitespace runs and trims the ends', () => {
+    expect(rankingText('  impressionist   prints  ')).toBe('impressionist prints');
+  });
+
+  it.each(['#facade', '#FF00aa', '#000000', '"#facade"', '#facade 1884', '1884 #facade'])(
+    'sends no ranking text when %j leaves exactly a six-digit hex color',
+    (query) => {
+      expect(rankingText(query)).toBe('');
+    },
+  );
+
+  it.each(['#abc', '#facad', '#facade1', '#facadeg', 'facade', '# facade', '#facade x'])(
+    'keeps %j, which is not a six-digit hex color',
+    (query) => {
+      expect(rankingText(query)).toBe(query);
+    },
+  );
+
+  it.each(['1884', '"1884"', '3 1/2', '""', '"', '   ', ''])(
+    'sends no ranking text when nothing remains of %j',
+    (query) => {
+      expect(rankingText(query)).toBe('');
+    },
+  );
+
+  it('never returns a quote, a digit-led word, or edge whitespace', () => {
+    const samples = [
+      '"a 1 "b 2" c 3',
+      ' "x"  "y" ',
+      '1 2 3 a "4" b"5"c',
+      '"#abcdef" 7',
+      '\t"9"\n10 z',
+    ];
+    for (const query of samples) {
+      const text = rankingText(query);
+      expect(text).not.toContain('"');
+      expect(text).toBe(text.trim());
+      for (const word of text.split(' ')) expect(word).not.toMatch(/^[0-9]/);
+    }
+  });
+});
+
 describe('vocabularyFilterClause', () => {
   it('routes a department id to department_id', () => {
     expect(vocabularyFilterClause('department', 'PC-10')).toEqual({
@@ -859,14 +1036,256 @@ describe('vocabularyFilterClause', () => {
       gallery: 'gallery_title.keyword',
     });
   });
+
+  it('makes every vocabulary a filter, in the field table order', () => {
+    expect([...VOCABULARY_FILTERS]).toEqual(Object.keys(VOCABULARY_FIELDS));
+  });
+
+  /** Values the live API matched with `term`, each count equal to its lookup count. */
+  it.each([
+    ['material', 'material_titles.keyword', 'gold leaf'],
+    ['material', 'material_titles.keyword', 'PAPER (FIBER PRODUCT)'],
+    ['technique', 'technique_titles.keyword', 'weaving on loom with jacquard attachment'],
+    ['technique', 'technique_titles.keyword', '3-d printing'],
+    ['theme', 'theme_titles.keyword', 'Women artists'],
+    ['theme', 'theme_titles.keyword', 'contemporary works by bipoc artists, summer 2021'],
+  ] as const)('routes a %s title to %s, case-insensitively', (filter, field, value) => {
+    expect(vocabularyFilterClause(filter, value)).toEqual({
+      term: { [field]: { value, case_insensitive: true } },
+    });
+  });
+
+  it.each([
+    ['material', 'material_titles.keyword'],
+    ['technique', 'technique_titles.keyword'],
+    ['theme', 'theme_titles.keyword'],
+  ] as const)('has no id route for %s', (filter, field) => {
+    expect(vocabularyFilterClause(filter, 'TM-2451')).toEqual({
+      term: { [field]: { value: 'TM-2451', case_insensitive: true } },
+    });
+  });
+});
+
+/**
+ * Stand-in for a Lucene `regexp` with `case_insensitive: true`: anchored, ASCII
+ * letters folded, everything else exact. ASCII letters in the patterns under
+ * test are always literal, never escaped or inside a class, so folding them in
+ * the pattern changes no operator.
+ */
+const asciiLower = (text: string) => text.replace(/[A-Z]/g, (c) => c.toLowerCase());
+const luceneMatches = (pattern: string, value: string) =>
+  new RegExp(`^(?:${asciiLower(pattern)})$`).test(asciiLower(value));
+
+/** The pattern of the `regexp` clause a filter sends; throws when it sends anything else. */
+function regexpOf(filter: Parameters<typeof vocabularyFilterClause>[0], value: string): string {
+  const clause = vocabularyFilterClause(filter, value) as {
+    regexp?: Record<string, { case_insensitive: boolean; value: string }>;
+  };
+  const entry = clause.regexp && Object.values(clause.regexp)[0];
+  if (!entry) throw new Error(`Expected a regexp clause, got ${JSON.stringify(clause)}`);
+  expect(entry.case_insensitive).toBe(true);
+  return entry.value;
+}
+
+/** Swaps the case of every letter that has one-character lower and upper forms. */
+const swapCase = (text: string) =>
+  [...text]
+    .map((c) => {
+      const lower = c.toLowerCase();
+      const upper = c.toUpperCase();
+      if (lower.length !== 1 || upper.length !== 1) return c;
+      return c === lower ? upper : lower;
+    })
+    .join('');
+
+describe('vocabularyFilterClause with non-ASCII cased letters', () => {
+  /** Titles matched against the live API: the sent value, its pattern, and the value as the index stores it. */
+  it.each([
+    [
+      'style',
+      'style_titles.keyword',
+      'WIENER WERKSTÄTTE',
+      'WIENER WERKST[äÄ]TTE',
+      'wiener werkstätte',
+    ],
+    ['subject', 'subject_titles.keyword', 'óthello', '[óÓ]thello', 'Óthello'],
+    [
+      'technique',
+      'technique_titles.keyword',
+      'APPLIQUÉ (TECHNIQUE)',
+      'APPLIQU[éÉ] \\(TECHNIQUE\\)',
+      'appliqué (technique)',
+    ],
+  ] as const)('sends %s %j as a regexp on %s', (filter, field, value, pattern, stored) => {
+    expect(vocabularyFilterClause(filter, value)).toEqual({
+      regexp: { [field]: { value: pattern, case_insensitive: true } },
+    });
+    expect(luceneMatches(pattern, stored)).toBe(true);
+    expect(luceneMatches(pattern, value)).toBe(true);
+  });
+
+  it.each([
+    'department',
+    'artwork_type',
+    'style',
+    'subject',
+    'classification',
+    'material',
+    'technique',
+    'theme',
+    'gallery',
+  ] as const)('applies to the %s title filter', (filter) => {
+    expect(vocabularyFilterClause(filter, 'Café')).toEqual({
+      regexp: { [VOCABULARY_FIELDS[filter]]: { value: 'Caf[éÉ]', case_insensitive: true } },
+    });
+  });
+
+  it('keeps term for place_of_origin, whose index folds case and accents', () => {
+    expect(vocabularyFilterClause('place_of_origin', "Côte d'Ivoire")).toEqual({
+      term: { 'place_of_origin.keyword': { value: "Côte d'Ivoire", case_insensitive: true } },
+    });
+  });
+
+  it('routes an id ahead of any title rule', () => {
+    expect(vocabularyFilterClause('style', 'TM-5')).toEqual({ term: { style_ids: 'TM-5' } });
+  });
+
+  it.each([
+    ['ASCII only, with reserved characters', 'paper (fiber product)'],
+    ['an en dash', '2020–21 acquisitions by BIPOC artists'],
+    ['a sharp s, whose uppercase is two letters', 'Straße'],
+    ['a dotted capital I, whose lowercase is two characters', 'İznik'],
+    ['an uncased script', '漢字'],
+    ['a lone combining mark', `x${chars(0x301)}`],
+  ])('keeps the term clause byte for byte for a title with %s', (_name, value) => {
+    expect(vocabularyFilterClause('subject', value)).toEqual({
+      term: { 'subject_titles.keyword': { value, case_insensitive: true } },
+    });
+  });
+
+  it('escapes every regexp-reserved character so each matches only itself', () => {
+    const reserved = [
+      '(',
+      ')',
+      '.',
+      '+',
+      '*',
+      '?',
+      '|',
+      '[',
+      ']',
+      '{',
+      '}',
+      '"',
+      '#',
+      '@',
+      '&',
+      '~',
+      '\\',
+    ];
+    for (const char of reserved) {
+      const value = `é${char}x`;
+      const pattern = regexpOf('style', value);
+      expect(pattern).toBe(`[éÉ]\\${char}x`);
+      expect(luceneMatches(pattern, value)).toBe(true);
+      expect(luceneMatches(pattern, 'é_x')).toBe(false);
+    }
+    const all = `Été ${reserved.join('')} <a>-/',`;
+    const pattern = regexpOf('subject', all);
+    expect(luceneMatches(pattern, all)).toBe(true);
+    expect(luceneMatches(pattern, swapCase(all))).toBe(true);
+    expect(luceneMatches(pattern, all.replace('.', 'x'))).toBe(false);
+    expect(luceneMatches(pattern, `${all}x`)).toBe(false);
+  });
+
+  it('escapes a trailing backslash', () => {
+    const pattern = regexpOf('style', 'Été\\');
+    expect(pattern).toBe('[éÉ]t[éÉ]\\\\');
+    expect(luceneMatches(pattern, 'ÉTÉ\\')).toBe(true);
+  });
+
+  it('escapes a combining mark that follows a cased letter', () => {
+    const value = `Ét${chars(0x301)}e`;
+    const pattern = regexpOf('style', value);
+    expect(pattern).toBe(`[éÉ]t\\${chars(0x301)}e`);
+    expect(luceneMatches(pattern, value)).toBe(true);
+  });
+
+  it('pairs non-Latin cased letters', () => {
+    const pattern = regexpOf('subject', 'Αθηνά');
+    expect(pattern).toBe('[αΑ][θΘ][ηΗ][νΝ][άΆ]');
+    expect(luceneMatches(pattern, 'ΑΘΗΝΆ')).toBe(true);
+    expect(luceneMatches(pattern, 'αθηνά')).toBe(true);
+  });
+
+  it('keeps letters whose case mapping changes length literal beside paired ones', () => {
+    expect(regexpOf('style', 'Äußere')).toBe('[äÄ]ußere');
+    expect(luceneMatches(regexpOf('style', 'Äußere'), 'ÄUßERE')).toBe(true);
+    expect(regexpOf('style', 'Öİ')).toBe('[öÖ]İ');
+  });
+
+  it('keeps a title-case letter in its own class, so the value as listed still matches', () => {
+    const pattern = regexpOf('style', 'ǅemal');
+    expect(pattern).toBe('[ǆǄǅ]emal');
+    for (const value of ['ǅemal', 'ǆemal', 'ǄEMAL']) {
+      expect(luceneMatches(pattern, value)).toBe(true);
+    }
+  });
+
+  it('matches the value as listed and its case variants across stored titles', () => {
+    const titles = [
+      'wiener werkstätte',
+      'Óthello',
+      'appliqué (technique)',
+      'faïence (composite material)',
+      'Conté crayon (TM)',
+      'chimú capac',
+      'Contemporaine Littéraire',
+      'Nōpiloa',
+      'koryŏ',
+      'papier-mâché',
+      'Ελληνικά [σΣς] {1,2} a|b',
+    ];
+    for (const title of titles) {
+      const pattern = regexpOf('subject', title);
+      expect(luceneMatches(pattern, title)).toBe(true);
+      expect(luceneMatches(pattern, title.toUpperCase())).toBe(true);
+      expect(luceneMatches(pattern, swapCase(title))).toBe(true);
+      expect(luceneMatches(pattern, `${title} `)).toBe(false);
+    }
+  });
 });
 
 describe('containsPattern', () => {
   const matches = (text: string, value: string) =>
     new RegExp(`^${containsPattern(text)}$`).test(value);
+  /** The class one ASCII letter compiles to. */
+  const letterClass = (letter: string) => containsPattern(letter).slice(2, -2);
 
-  it('compiles per-letter case classes', () => {
-    expect(containsPattern('impress')).toBe('.*[iI][mM][pP][rR][eE][sS][sS].*');
+  it('compiles each ASCII letter to one class for both cases', () => {
+    expect(containsPattern('impress')).toBe(containsPattern('IMPRESS'));
+    expect(containsPattern('impress')).toBe(
+      `.*${[...'impress'].map((letter) => letterClass(letter)).join('')}.*`,
+    );
+  });
+
+  it('gives no two letters a shared character, so the include automaton stays the size of the text', () => {
+    const owner = new Map<number, string>();
+    for (const letter of 'abcdefghijklmnopqrstuvwxyz') {
+      const pattern = new RegExp(`^${letterClass(letter)}$`);
+      for (let code = 0; code <= 0x1eff; code++) {
+        if (!pattern.test(String.fromCodePoint(code))) continue;
+        expect(owner.get(code), `U+${code.toString(16)} in ${letter}`).toBeUndefined();
+        owner.set(code, letter);
+      }
+    }
+  });
+
+  it('matches an ASCII letter and its accented forms, never another letter', () => {
+    for (const value of ['e', 'E', 'é', 'È', 'ë', 'ě', 'ȩ', 'ẽ', 'Ệ']) {
+      expect(matches('e', value)).toBe(true);
+    }
+    for (const value of ['a', 'á', 'ø', 'ß', 'æ', '×']) expect(matches('e', value)).toBe(false);
   });
 
   it('matches the substring anywhere, in any case', () => {
@@ -877,12 +1296,12 @@ describe('containsPattern', () => {
   });
 
   it('keeps digits and whitespace literal', () => {
-    expect(containsPattern('a 1')).toBe('.*[aA] 1.*');
+    expect(containsPattern('a 1')).toBe(`.*${letterClass('a')} 1.*`);
     expect(matches('gallery 2', 'Gallery 240')).toBe(true);
   });
 
   it('escapes every regex metacharacter', () => {
-    expect(containsPattern('a.b')).toBe('.*[aA]\\.[bB].*');
+    expect(containsPattern('a.b')).toBe(`.*${letterClass('a')}\\.${letterClass('b')}.*`);
     for (const meta of [
       '.',
       '*',
@@ -920,8 +1339,8 @@ describe('containsPattern', () => {
     expect(matches('(x)', '(x)')).toBe(true);
   });
 
-  it('handles accented letters and uncased scripts', () => {
-    expect(containsPattern('é')).toBe('.*[éÉ].*');
+  it('folds an accented Latin letter to its base letter and handles uncased scripts', () => {
+    expect(containsPattern('é')).toBe(containsPattern('e'));
     expect(containsPattern('漢')).toBe('.*漢.*');
   });
 
@@ -931,6 +1350,54 @@ describe('containsPattern', () => {
 
   it('wraps an empty needle as match-anything', () => {
     expect(containsPattern('')).toBe('.*.*');
+  });
+
+  it.each([
+    ['côte', 'cote'],
+    ['Côte', 'cote'],
+    [`co${chars(0x302)}te`, 'cote'],
+    ['chimú', 'chimu'],
+    ['APPLIQUÉ', 'applique'],
+    ['Nōpiloa', 'nopiloa'],
+    ['İznik', 'iznik'],
+  ])('compiles %j and %j to one pattern', (accented, plain) => {
+    expect(containsPattern(accented)).toBe(containsPattern(plain));
+  });
+
+  /** Each `contains` and the stored values it must find. */
+  it.each([
+    ['côte', ["cote d'ivoire"]],
+    ['cote', ["cote d'ivoire"]],
+    ['applique', ['appliqué (technique)', 'glass appliqué', 'reverse appliqué']],
+    ['faience', ['faïence (composite material)', 'faïence']],
+    ['conte crayon', ['Conté crayon (TM)', 'black conté crayon']],
+    ['chimu', ['chimú', 'chimú capac']],
+    ['litteraire', ['Contemporaine Littéraire']],
+    ['nopiloa', ['Nōpiloa']],
+    ['koryo', ['koryŏ']],
+    ['istanbul', ['İstanbul']],
+  ])('lets %j find values that differ only by accents or case', (text, values) => {
+    for (const value of values) expect(matches(text, value)).toBe(true);
+    expect(matches(text, 'Cubism')).toBe(false);
+  });
+
+  it('keeps marks on letters outside ASCII, so non-Latin input compiles as before', () => {
+    expect(containsPattern('Αθηνά')).toBe('.*[αΑ][θΘ][ηΗ][νΝ][άΆ].*');
+    expect(containsPattern('й')).toBe('.*[йЙ].*');
+    expect(containsPattern('한국')).toBe('.*한국.*');
+    expect(containsPattern('が')).toBe('.*が.*');
+    expect(matches('Αθηνά', 'ΑΘΗΝΆ')).toBe(true);
+    expect(matches('한국', '한국 미술')).toBe(true);
+  });
+
+  it('leaves a lone combining mark escaped, as before', () => {
+    expect(containsPattern(chars(0x301))).toBe(`.*\\${chars(0x301)}.*`);
+  });
+
+  it('keeps metacharacters escaped beside folded letters', () => {
+    expect(containsPattern('é(t)')).toBe(`.*${letterClass('e')}\\(${letterClass('t')}\\).*`);
+    expect(matches('é(t)', 'É(T)')).toBe(true);
+    expect(matches('é(t)', 'éxtx')).toBe(false);
   });
 });
 

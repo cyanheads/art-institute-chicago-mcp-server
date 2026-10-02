@@ -1,7 +1,7 @@
 /**
  * @fileoverview Test kit for driving `AicService` through its constructor
- * seams: scripted and routed fetch fakes, response builders, service
- * construction, and request inspection helpers.
+ * seams: scripted and routed fetch fakes, the edge firewall in front of them,
+ * response builders, service construction, and request inspection helpers.
  * @module tests/fixtures/aic-service-kit
  */
 
@@ -14,8 +14,14 @@ import {
   type ArtworkSearchParams,
   type FetchFn,
 } from '@/services/aic/aic-service.js';
+import { EDGE_BLOCK_HTML } from './aic-upstream.js';
 
 export const API_ORIGIN = 'https://api.artic.edu';
+
+/** The longest query string, in bytes and without the `?`, the API's edge firewall lets a GET carry. */
+export const GET_QUERY_LIMIT = 2048;
+/** The smallest POST body, in bytes, the API's edge firewall blocks (7,528 bytes measured passing). */
+export const POST_BODY_LIMIT = 8192;
 export const TEST_VERSION = '9.9.9';
 export const TEST_CONTACT = 'https://example.test/contact';
 
@@ -73,6 +79,29 @@ export function scriptedFetch(...steps: Responder[]): Mock<FetchFn> {
   });
 }
 
+/**
+ * Puts the API's edge firewall in front of `inner`: a GET whose query string
+ * passes 2,048 bytes, a POST body of 8,192 bytes or more, or any request whose
+ * search text carries markup, gets the 403 block page; everything else reaches `inner`.
+ */
+export function behindFirewall(inner: Responder): Responder {
+  return (url, init) => {
+    const body = typeof init.body === 'string' ? init.body : '';
+    const text = `${new URL(url).searchParams.get('params') ?? ''}${body}`;
+    const tooLong =
+      init.method === 'POST'
+        ? Buffer.byteLength(body) >= POST_BODY_LIMIT
+        : queryStringBytes(url) > GET_QUERY_LIMIT;
+    if (tooLong || /<[a-z/!]/i.test(text)) {
+      return new Response(EDGE_BLOCK_HTML, {
+        status: 403,
+        headers: { 'content-type': 'text/html' },
+      });
+    }
+    return inner(url, init);
+  };
+}
+
 /** A fetch fake that answers by URL pathname (e.g. `/api/v1/sounds`); unrouted paths fail loudly. */
 export function routedFetch(routes: Record<string, Responder>): Mock<FetchFn> {
   return vi.fn<FetchFn>(async (url, init) => {
@@ -126,11 +155,41 @@ export function queryParam(url: string, name: string): string | null {
   return new URL(url).searchParams.get(name);
 }
 
+/** Bytes in a URL's query string, without the `?` (percent-encoding leaves it ASCII). */
+export function queryStringBytes(url: string): number {
+  return Math.max(0, new URL(url).search.length - 1);
+}
+
 /** URL of the nth recorded call. */
 export function urlOfCall(fetchFake: Mock<FetchFn>, call = 0): string {
   const args = fetchFake.mock.calls[call];
   if (!args) throw new Error(`No fetch call at index ${call}`);
   return args[0];
+}
+
+/** One recorded search call as the API receives it. */
+export interface SearchCall {
+  /** The search JSON: the decoded `params` query of a GET, or the parsed body of a POST. */
+  body: Record<string, unknown>;
+  headers: Record<string, string>;
+  init: RequestInit;
+  method: 'GET' | 'POST';
+  url: string;
+}
+
+/** The nth recorded search call, sent as a GET (no `method` set) or a POST. */
+export function searchCallOf(fetchFake: Mock<FetchFn>, call = 0): SearchCall {
+  const args = fetchFake.mock.calls[call];
+  if (!args) throw new Error(`No fetch call at index ${call}`);
+  const [url, init] = args;
+  const headers = (init.headers ?? {}) as Record<string, string>;
+  if (init.method === 'POST') {
+    if (typeof init.body !== 'string') throw new Error(`POST without a string body: ${url}`);
+    const body = JSON.parse(init.body) as Record<string, unknown>;
+    return { body, headers, init, method: 'POST', url };
+  }
+  if (init.method !== undefined) throw new Error(`Unexpected method ${init.method}: ${url}`);
+  return { body: searchBodyOf(url), headers, init, method: 'GET', url };
 }
 
 /** Awaits a promise that must reject and returns what it rejected with. */

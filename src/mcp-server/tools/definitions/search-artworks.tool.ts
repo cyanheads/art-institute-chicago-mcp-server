@@ -79,6 +79,15 @@ const SearchInput = z.object({
   classification: vocabularyInput(120).describe(
     'Classification title as artic_lookup_vocabulary lists it (case ignored), such as oil on canvas or etching.',
   ),
+  material: vocabularyInput(120).describe(
+    'Material title as artic_lookup_vocabulary lists it (case ignored), such as ink or gold leaf.',
+  ),
+  technique: vocabularyInput(120).describe(
+    'Technique title as artic_lookup_vocabulary lists it (case ignored), such as black-and-white photography or plain weaving.',
+  ),
+  theme: vocabularyInput(120).describe(
+    'Theme title as artic_lookup_vocabulary lists it (case ignored), such as Women artists.',
+  ),
   place_of_origin: vocabularyInput(120).describe(
     'Place of origin as artic_lookup_vocabulary lists it (case ignored), such as france.',
   ),

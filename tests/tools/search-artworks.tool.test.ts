@@ -13,12 +13,15 @@ import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { searchArtworks } from '@/mcp-server/tools/definitions/search-artworks.tool.js';
 import { disposeAicService } from '@/services/aic/aic-service.js';
-import { WINDOW_NOTICE } from '@/services/aic/aic-text.js';
+import { VOCABULARY_FILTERS, WINDOW_NOTICE } from '@/services/aic/aic-text.js';
 import {
+  behindFirewall,
   hangingResponder,
   jsonResponder,
+  type Responder,
   scriptedFetch,
   searchBodyOf,
+  searchCallOf,
   urlOfCall,
 } from '../fixtures/aic-service-kit.js';
 import {
@@ -74,6 +77,14 @@ const PAGE_BOUND_RECOVERY =
 const YEAR_RANGE_RECOVERY =
   'Set year_from at or below year_to; use negative years for BCE, for example year_from -500.';
 
+/**
+ * A stored style title, precomposed (NFC) as every stored vocabulary value is,
+ * its regexp, and the same title decomposed (NFD).
+ */
+const NFC_TITLE = 'wiener werkstätte';
+const NFC_TITLE_PATTERN = 'wiener werkst[äÄ]tte';
+const NFD_TITLE = NFC_TITLE.normalize('NFD');
+
 afterEach(() => {
   disposeAicService();
   vi.useRealTimers();
@@ -98,6 +109,10 @@ const filtersOf = (fetchFake: FetchFake, call = 0): unknown[] => {
 
 const search = (input: Record<string, unknown> = {}) =>
   runToolContract(searchArtworks, input as never);
+
+/** Every text block of `content[]`: the `format()` rendering, then the enrichment trailer. */
+const contentText = (result: ToolRun) =>
+  result.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
 
 // --- Request building ----------------------------------------------------------------
 
@@ -151,6 +166,9 @@ describe('artic_search_artworks request', () => {
         'style',
         'subject',
         'classification',
+        'material',
+        'technique',
+        'theme',
         'place_of_origin',
         'gallery',
         'year_from',
@@ -219,10 +237,255 @@ describe('artic_search_artworks request', () => {
         },
       },
     ],
+    [
+      'material',
+      ' gold leaf ',
+      { term: { 'material_titles.keyword': { value: 'gold leaf', case_insensitive: true } } },
+    ],
+    [
+      'technique',
+      'weaving on loom with jacquard attachment',
+      {
+        term: {
+          'technique_titles.keyword': {
+            value: 'weaving on loom with jacquard attachment',
+            case_insensitive: true,
+          },
+        },
+      },
+    ],
+    [
+      'theme',
+      'Women artists',
+      { term: { 'theme_titles.keyword': { value: 'Women artists', case_insensitive: true } } },
+    ],
+    [
+      'material',
+      'tm-2451',
+      { term: { 'material_titles.keyword': { value: 'TM-2451', case_insensitive: true } } },
+    ],
+    [
+      'style',
+      'WIENER WERKSTÄTTE',
+      {
+        regexp: {
+          'style_titles.keyword': { value: 'WIENER WERKST[äÄ]TTE', case_insensitive: true },
+        },
+      },
+    ],
+    [
+      'technique',
+      'APPLIQUÉ (TECHNIQUE)',
+      {
+        regexp: {
+          'technique_titles.keyword': {
+            value: 'APPLIQU[éÉ] \\(TECHNIQUE\\)',
+            case_insensitive: true,
+          },
+        },
+      },
+    ],
+    [
+      'place_of_origin',
+      "Côte d'Ivoire",
+      { term: { 'place_of_origin.keyword': { value: "Côte d'Ivoire", case_insensitive: true } } },
+    ],
   ])('routes %s %j through the schema to %j', async (name, value, clause) => {
     const fetchFake = emptyResults();
     await search({ [name]: value });
     expect(filtersOf(fetchFake)).toEqual([clause]);
+  });
+
+  it('sends an all-ASCII filter set exactly as before the accent-aware routing', async () => {
+    const fetchFake = emptyResults();
+    await search({
+      query: 'lilies',
+      department: 'Prints and Drawings',
+      artwork_type: 'Print',
+      style: 'Impressionism',
+      subject: 'landscapes',
+      classification: 'etching',
+      place_of_origin: 'france',
+      gallery: '240',
+      public_domain_only: true,
+    });
+    const title = (field: string, value: string) => ({
+      term: { [field]: { value, case_insensitive: true } },
+    });
+    const expected = {
+      q: 'lilies',
+      query: {
+        bool: {
+          must: [{ simple_query_string: { query: 'lilies', default_operator: 'and' } }],
+          filter: [
+            title('department_title.keyword', 'Prints and Drawings'),
+            title('artwork_type_title.keyword', 'Print'),
+            title('style_titles.keyword', 'Impressionism'),
+            title('subject_titles.keyword', 'landscapes'),
+            title('classification_titles.keyword', 'etching'),
+            title('place_of_origin.keyword', 'france'),
+            title('gallery_title.keyword', 'Gallery 240'),
+            { term: { is_public_domain: true } },
+          ],
+        },
+      },
+      page: 1,
+      limit: 10,
+      fields: FIELDS,
+    };
+    expect(new URL(urlOfCall(fetchFake)).searchParams.get('params')).toBe(JSON.stringify(expected));
+  });
+
+  it('sends a composed (NFC) accented title byte for byte as its regexp clause', async () => {
+    const fetchFake = emptyResults();
+    await search({ style: NFC_TITLE });
+    const expected = {
+      query: {
+        bool: {
+          filter: [
+            {
+              regexp: {
+                'style_titles.keyword': { value: NFC_TITLE_PATTERN, case_insensitive: true },
+              },
+            },
+          ],
+        },
+      },
+      page: 1,
+      limit: 10,
+      fields: FIELDS,
+    };
+    expect(new URL(urlOfCall(fetchFake)).searchParams.get('params')).toBe(JSON.stringify(expected));
+  });
+
+  it('composes every vocabulary filter value to NFC in the input schema', () => {
+    expect(NFD_TITLE).toBe(`wiener werksta${String.fromCodePoint(0x308)}tte`);
+    const parsed = searchArtworks.input.parse(
+      Object.fromEntries(VOCABULARY_FILTERS.map((name) => [name, NFD_TITLE])),
+    );
+    for (const name of VOCABULARY_FILTERS) expect(parsed[name]).toBe(NFC_TITLE);
+  });
+
+  it.each(VOCABULARY_FILTERS)(
+    'sends a decomposed (NFD) %s title byte for byte as its composed twin',
+    async (name) => {
+      const nfcFetch = emptyResults();
+      await search({ [name]: NFC_TITLE });
+      const nfdFetch = emptyResults();
+      await search({ [name]: NFD_TITLE });
+      expect(urlOfCall(nfdFetch)).toBe(urlOfCall(nfcFetch));
+      expect(JSON.stringify(filtersOf(nfdFetch))).not.toMatch(/\p{M}/u);
+    },
+  );
+
+  it('finds a decomposed (NFD) style title on both surfaces', async () => {
+    /** Answers like the index, which stores the title composed: only its regexp matches. */
+    const storedTitle: Responder = (url, init) =>
+      jsonResponder(
+        JSON.stringify(searchBodyOf(url)).includes(NFC_TITLE_PATTERN)
+          ? searchEnvelope(rows(2), 21)
+          : searchEnvelope([], 0),
+      )(url, init);
+    installAicService(scriptedFetch(storedTitle));
+    const result = await search({ style: NFD_TITLE, limit: 2 });
+    const out = structuredOf<SearchRun>(result);
+    expect(out).toMatchObject({ totalCount: 21, shown: 2, has_more: true, next_page: 2 });
+    const text = textOf(result);
+    expect(text).toContain('# Artworks (2 on this page)');
+    for (const artwork of out.artworks) expect(text).toContain(`(id ${artwork.id})`);
+    expect(text).toContain('**Next page:** 2');
+    expect(contentText(result)).toContain('More matches: call again with page 2.');
+    expect(contentText(result)).not.toContain('No artworks matched.');
+  });
+
+  it('finds decomposed (NFD) query and artist text on both surfaces', async () => {
+    const chars = (...codePoints: number[]) => String.fromCodePoint(...codePoints);
+    const nfcQuery = `caf${chars(0xe9)}`;
+    const nfcArtist = `G${chars(0xe9)}r${chars(0xf4)}me`;
+    /** Answers like the index, which stores text composed and composes nothing: a combining mark matches nothing. */
+    const storedText: Responder = (url, init) =>
+      jsonResponder(
+        /\p{M}/u.test(JSON.stringify(searchBodyOf(url)))
+          ? searchEnvelope([], 0)
+          : searchEnvelope(rows(2), 128),
+      )(url, init);
+    const fetchFake = installAicService(scriptedFetch(storedText));
+    const result = await search({
+      query: `cafe${chars(0x301)}`,
+      artist: `Ge${chars(0x301)}ro${chars(0x302)}me`,
+      limit: 2,
+    });
+    expect(bodyOf(fetchFake)).toMatchObject({
+      q: nfcQuery,
+      query: {
+        bool: {
+          must: [{ simple_query_string: { query: nfcQuery, default_operator: 'and' } }],
+          filter: [{ match: { artist_titles: { query: nfcArtist, operator: 'and' } } }],
+        },
+      },
+    });
+    const out = structuredOf<SearchRun>(result);
+    expect(out).toMatchObject({ totalCount: 128, shown: 2, has_more: true, next_page: 2 });
+    const text = textOf(result);
+    expect(text).toContain('# Artworks (2 on this page)');
+    for (const artwork of out.artworks) expect(text).toContain(`(id ${artwork.id})`);
+    expect(text).toContain('**Next page:** 2');
+    expect(contentText(result)).toContain('More matches: call again with page 2.');
+    expect(contentText(result)).not.toContain('No artworks matched.');
+  });
+
+  it('ANDs every vocabulary filter in the field table order', async () => {
+    const fetchFake = emptyResults();
+    await search({
+      gallery: '240',
+      place_of_origin: 'france',
+      theme: 'Women artists',
+      technique: 'appliqué (technique)',
+      material: 'ink',
+      classification: 'etching',
+      subject: 'Óthello',
+      style: 'Impressionism',
+      artwork_type: 'Print',
+      department: 'Prints and Drawings',
+    });
+    const fields = (filtersOf(fetchFake) as Record<string, Record<string, unknown>>[]).map(
+      (clause) => Object.keys(Object.values(clause)[0] ?? {})[0],
+    );
+    expect(fields).toEqual([
+      'department_title.keyword',
+      'artwork_type_title.keyword',
+      'style_titles.keyword',
+      'subject_titles.keyword',
+      'classification_titles.keyword',
+      'material_titles.keyword',
+      'technique_titles.keyword',
+      'theme_titles.keyword',
+      'place_of_origin.keyword',
+      'gallery_title.keyword',
+    ]);
+    expect(filtersOf(fetchFake)).toContainEqual({
+      regexp: { 'subject_titles.keyword': { value: '[óÓ]thello', case_insensitive: true } },
+    });
+    expect(filtersOf(fetchFake)).toContainEqual({
+      regexp: {
+        'technique_titles.keyword': {
+          value: 'appliqu[éÉ] \\(technique\\)',
+          case_insensitive: true,
+        },
+      },
+    });
+  });
+
+  it('returns a material-filtered page on both surfaces', async () => {
+    serve(searchEnvelope(rows(2), 78));
+    const result = await search({ material: 'gold leaf', limit: 2 });
+    const out = structuredOf<SearchRun>(result);
+    expect(out).toMatchObject({ totalCount: 78, shown: 2, has_more: true, next_page: 2 });
+    const text = textOf(result);
+    expect(text).toContain('# Artworks (2 on this page)');
+    for (const artwork of out.artworks) expect(text).toContain(`(id ${artwork.id})`);
+    expect(text).toContain('**Next page:** 2');
+    expect(contentText(result)).toContain('More matches: call again with page 2.');
   });
 
   it('reaches the id route for a lower-case pc- department input', async () => {
@@ -332,6 +595,9 @@ describe('artic_search_artworks validation', () => {
     ['a 201-character query', { query: 'x'.repeat(201) }, 'query'],
     ['a 121-character artist', { artist: 'x'.repeat(121) }, 'artist'],
     ['a 121-character department', { department: 'x'.repeat(121) }, 'department'],
+    ['a 121-character material', { material: 'x'.repeat(121) }, 'material'],
+    ['a 121-character technique', { technique: 'x'.repeat(121) }, 'technique'],
+    ['a 121-character theme', { theme: 'x'.repeat(121) }, 'theme'],
   ])('rejects %s without calling upstream', async (_name, input, field) => {
     const fetchFake = emptyResults();
     const error = errorOf(await search(input));
@@ -587,6 +853,25 @@ describe('artic_search_artworks zero-hit guidance', () => {
     expect(await zeroHit({ gallery: '240', department: 'Nope' })).toContain(
       '(vocabulary "department", "gallery")',
     );
+  });
+
+  it('names the material, technique, and theme vocabularies in field table order', async () => {
+    expect(await zeroHit({ theme: 'z', material: 'unobtainium', technique: 'y' })).toBe(
+      'No artworks matched. Check filter values with artic_lookup_vocabulary (vocabulary "material", "technique", "theme") — values match exactly, ignoring case.',
+    );
+    expect(await zeroHit({ gallery: '240', theme: 'z', department: 'Nope' })).toContain(
+      '(vocabulary "department", "theme", "gallery")',
+    );
+  });
+
+  it('carries the zero-hit guidance for a new filter on both surfaces', async () => {
+    emptyResults();
+    const result = await search({ material: 'unobtainium', limit: 0 });
+    const out = structuredOf<SearchRun>(result);
+    expect(out).toMatchObject({ totalCount: 0, shown: 0, has_more: false });
+    expect(out.notice).toContain('(vocabulary "material")');
+    expect(textOf(result)).toContain('No artwork rows on this page.');
+    expect(contentText(result)).toContain('(vocabulary "material")');
   });
 
   it('sends an artist name to artic_search_artists', async () => {
@@ -1033,5 +1318,78 @@ describe('artic_search_artworks upstream failures', () => {
       ['request_blocked', JsonRpcErrorCode.Forbidden],
       ['upstream_rejected_query', JsonRpcErrorCode.InternalError],
     ]);
+  });
+});
+
+describe('artic_search_artworks past the 2,048-byte GET limit', () => {
+  /** A 115-character query, five filters, and all seven facets: 2,299 bytes as a GET query string. */
+  const LONG_SEARCH = {
+    query:
+      'portrait of a woman seated in a garden with flowers and a small dog beside her in the afternoon light near a river',
+    department: 'Painting and Sculpture of Europe',
+    artwork_type: 'Painting',
+    style: 'Impressionism',
+    classification: 'oil on canvas',
+    place_of_origin: 'france',
+    facets: [
+      'department',
+      'artwork_type',
+      'style',
+      'subject',
+      'classification',
+      'place_of_origin',
+      'artist',
+    ],
+    limit: 12,
+  };
+
+  /** The query string the search would carry as a GET. */
+  const getBytes = (fetchFake: FetchFake) =>
+    new URLSearchParams({ params: String(searchCallOf(fetchFake).init.body) }).toString().length;
+
+  it('posts the search past the firewall and returns its results on both surfaces', async () => {
+    const fetchFake = installAicService(
+      scriptedFetch(behindFirewall(jsonResponder(searchEnvelope(rows(2), 2)))),
+    );
+    const result = await search(LONG_SEARCH);
+    const out = structuredOf<SearchRun>(result);
+    expect(out).toMatchObject({ totalCount: 2, shown: 2, sort_applied: 'relevance' });
+    expect(out.artworks.map((artwork) => artwork.id)).toEqual([1, 2]);
+    expect(out.facets).toHaveProperty('department', []);
+    const text = textOf(result);
+    expect(text).toContain('# Artworks (2 on this page)');
+    for (const artwork of out.artworks) expect(text).toContain(`(id ${artwork.id})`);
+    const sent = searchCallOf(fetchFake);
+    expect(sent.method).toBe('POST');
+    expect(getBytes(fetchFake)).toBe(2299);
+    expect(sent.body).toMatchObject({ q: LONG_SEARCH.query, limit: 12 });
+    expect(Object.keys(sent.body.aggs as object)).toHaveLength(7);
+  });
+
+  it('reports markup in a posted search as request_blocked with its recovery', async () => {
+    const fetchFake = installAicService(
+      scriptedFetch(behindFirewall(jsonResponder(searchEnvelope([], 0)))),
+    );
+    const result = await search({ ...LONG_SEARCH, query: `${LONG_SEARCH.query} <b>light</b>` });
+    const error = errorOf(result);
+    const hint = recoveryFor(searchArtworks, 'request_blocked');
+    expect(error.code).toBe(JsonRpcErrorCode.Forbidden);
+    expect(error.data.reason).toBe('request_blocked');
+    expect(error.data.recovery?.hint).toBe(hint);
+    expect(textOf(result)).toContain(`Recovery: ${hint}`);
+    expect(fetchFake).toHaveBeenCalledTimes(1);
+    expect(searchCallOf(fetchFake).method).toBe('POST');
+  });
+
+  it('surfaces cancellation of a posted search as RequestCancelled, not a result', async () => {
+    const controller = new AbortController();
+    const fetchFake = installAicService(scriptedFetch(hangingResponder));
+    const pending = runToolContract(searchArtworks, LONG_SEARCH as never, {
+      context: { signal: controller.signal },
+    });
+    await vi.waitFor(() => expect(fetchFake).toHaveBeenCalledTimes(1));
+    controller.abort(new DOMException('cancelled by caller', 'AbortError'));
+    expect(errorOf(await pending).code).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(searchCallOf(fetchFake).method).toBe('POST');
   });
 });

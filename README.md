@@ -19,22 +19,28 @@
 
 </div>
 
+<div align="center">
+
+**Public Hosted Server:** [https://art-institute-chicago.caseyjhand.com/mcp](https://art-institute-chicago.caseyjhand.com/mcp)
+
+</div>
+
 ---
 
 ## Overview
 
-The Art Institute of Chicago's collection through the museum's public API: about 133,000 artworks, plus artists, exhibitions, and audio-guide stops. Search artworks with text, structured filters, and facet counts; read full records with provenance, exhibition history, and rights-aware IIIF image URLs; resolve artists to ids; find exhibitions by topic or date; and search audio-guide transcripts. Runs as a stdio process or a local Streamable HTTP server, with no API key.
+The Art Institute of Chicago's collection through the museum's public API: about 133,000 artworks, plus artists, exhibitions, and audio-guide stops. Search artworks by text, filters, and facet counts; read full records with provenance, exhibition history, and rights-aware IIIF image URLs; resolve artists to ids; find exhibitions by topic or date; search audio-guide transcripts. Runs without an API key, as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
 
 ### Tools
 
 | Tool | Description |
 |:---|:---|
-| `artic_search_artworks` | Search artworks by text and filters (artist, department, type, style, subject, classification, place, gallery, years, public domain, on view, has image), with facet counts and date sorting |
-| `artic_get_artworks` | Fetch full records for up to 10 artworks: description, provenance, exhibition and publication history, image URLs with rights status, related media |
+| `artic_search_artworks` | Search artworks by text and filters, with facet counts and date sorting |
+| `artic_get_artworks` | Fetch full records for up to 10 artworks: description, provenance, histories, image URLs with rights status, related media |
 | `artic_search_artists` | Find artists, cultures, and organizations by name or id, with life dates, artwork counts, and sample works |
-| `artic_search_exhibitions` | Search past, current, and upcoming exhibitions by text and date, with the artworks shown when the museum lists them |
-| `artic_search_audio_guide` | Search the museum's audio-guide stops by text: stop title, MP3 URL, and transcript |
-| `artic_lookup_vocabulary` | List the values a search filter accepts (departments, types, styles, subjects, places, galleries, and more) with artwork counts |
+| `artic_search_exhibitions` | Search past, current, and upcoming exhibitions by text and date |
+| `artic_search_audio_guide` | Search audio-guide stops by text: title, MP3 URL, and transcript |
+| `artic_lookup_vocabulary` | List the values a search filter accepts, with artwork counts |
 
 ### Resources
 
@@ -42,14 +48,14 @@ The Art Institute of Chicago's collection through the museum's public API: about
 |:---|:---|
 | `artic://artworks/{id}` | One artwork record as JSON, with the API license text and description attribution |
 
-The same record is available from `artic_get_artworks` for clients that don't surface resources.
+`artic_get_artworks` returns the same record for clients that don't surface resources.
 
 ## Capability reference
 
 ### `artic_search_artworks` <sub>tool</sub>
 
-- `query` (every word must match; `"exact phrase"`, `-exclude`, and `a | b` work) plus filters `artist`, `artist_id`, `department`, `artwork_type`, `style`, `subject`, `classification`, `place_of_origin`, `gallery`, `year_from` / `year_to` (date-span overlap, negative for BCE), `public_domain_only`, `on_view_only`, and `has_image`, combined with AND
-- Up to 12 rows per page (default 10), so a page of long catalog records stays within common tool-output limits, within the first 1,000 matches; `sort` is `relevance`, `date_asc`, or `date_desc`, and `sort_applied` reports `popularity` when relevance had no query text
+- `query` (every word must match; `"exact phrase"`, `-exclude`, and `a | b` work) plus filters `artist`, `artist_id`, `department`, `artwork_type`, `style`, `subject`, `classification`, `material`, `technique`, `theme`, `place_of_origin`, `gallery`, `year_from` / `year_to` (date-span overlap, negative for BCE), `public_domain_only`, `on_view_only`, and `has_image`, combined with AND
+- Up to 12 rows per page (default 10), within the first 1,000 matches; `sort` is `relevance`, `date_asc`, or `date_desc`, and `sort_applied` reports `popularity` when relevance had no query text
 - `facets` adds the top 15 values for up to seven fields (`artist` rows carry `artist_id`); `limit: 0` returns counts only
 
 ---
@@ -57,7 +63,7 @@ The same record is available from `artic_get_artworks` for clients that don't su
 ### `artic_get_artworks` <sub>tool</sub>
 
 - 1–10 `ids` per call (artwork page URLs are read as their id); `sections` picks the heavy text: `description` and `provenance` by default, plus `exhibition_history`, `publication_history`, and `catalogue`
-- Records return in request order, with `missing_ids` for ids the museum doesn't have and `deferred_ids` for records past a 100,000-byte response budget
+- Records return in request order, with `missing_ids` for ids the museum doesn't have and `deferred_ids` for records held back to keep the response under about 100,000 bytes
 - `include_related_media` (default on) loads up to 20 linked lectures and audio stops per call; `description_attribution` appears whenever CC BY description text is returned
 
 ---
@@ -73,21 +79,21 @@ The same record is available from `artic_get_artworks` for clients that don't su
 
 - `query`, `when` (`current`, `upcoming`, `past`, or the default `any`), and `date_from` / `date_to` (`YYYY-MM-DD`, matched by run overlap); up to 25 per page, pages 1–40
 - `sort` is `relevance`, `start_desc`, or `start_asc`, defaulting to relevance with a query and `start_desc` without; `status` is the museum's label and doesn't say whether a show is open (`when` does)
-- Rows carry dates, gallery, summary, web page, image, `artist_ids`, and the `artworks` shown when the museum lists them
+- Rows carry dates, gallery, summary, web page, image, `artist_ids`, and the `artworks` shown, when the museum lists them
 
 ---
 
 ### `artic_search_audio_guide` <sub>tool</sub>
 
 - `query` is required and matches stop titles and transcripts (every word); up to 20 stops per page (default 5)
-- Each stop has `title`, `audio_url` (MP3), and `transcript` but no artwork id; every response carries `license_text` and `source_citation`, since the content is for noncommercial educational and personal use
+- Each stop has `title`, `audio_url` (MP3), and `transcript` but no artwork id; every response carries `license_text` and `source_citation` (content is for noncommercial educational and personal use)
 
 ---
 
 ### `artic_lookup_vocabulary` <sub>tool</sub>
 
-- `vocabulary` is one of `department`, `artwork_type`, `style`, `subject`, `classification`, `place_of_origin`, `gallery`, `material`, `technique`, or `theme`; optional `contains` substring (case-insensitive), `public_domain_only`, and up to 100 values (default 25)
-- Values come back most common first with `artwork_count`, in the exact form the matching `artic_search_artworks` filter accepts; `filter_param` names that filter and is absent for `material`, `technique`, and `theme`, which work as query text
+- `vocabulary` is one of `department`, `artwork_type`, `style`, `subject`, `classification`, `material`, `technique`, `theme`, `place_of_origin`, or `gallery`; optional `contains` substring (ignoring case and accents, so `applique` finds `appliqué (technique)`), `public_domain_only`, and up to 100 values (default 25)
+- Values come back most common first with `artwork_count`, in the exact form the `artic_search_artworks` filter of the same name accepts; `filter_param` names that filter
 
 ---
 
@@ -103,15 +109,15 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 Art Institute-specific:
 
 - Keyless access to the Art Institute of Chicago public API (`api.artic.edu/api/v1`); IIIF image URLs are built from each record (843 px for every image, 1686 px and a IIIF manifest for public-domain works), never fetched
-- One shared request pacer under the API's published limit of 60 requests a minute, retries for transient failures inside a 20-second deadline, and an in-process response cache (records 6 hours, searches 15 minutes, vocabularies 24 hours), so a repeated call spends no rate budget
-- Text search requires every word to match, so totals are real and a miss reads as zero hits, while results keep the museum's own relevance order
+- One shared request pacer under the API's published limit of 60 requests a minute, retries for transient failures inside a 20-second deadline, and an in-process response cache (records 6 hours, searches 15 minutes, vocabularies 24 hours)
+- Text search requires every word to match, so totals are real and a miss reads as zero hits; results keep the museum's relevance order
 - Placeholder years in the museum's data (outside −8000 to 2100) are left out of output, year filters, and date sorts; `date_display` stays the authority
 
 Agent-friendly output:
 
-- Rights travel with the data: `image.rights` (`public_domain` / `in_copyright`) on every image, with the 1686 px URL only where reuse is allowed; the API's `license_text` verbatim; `description_attribution` when CC BY text is returned; and `source_citation` on audio-guide results
+- Rights travel with the data: `image.rights` (`public_domain` / `in_copyright`) on every image, with the 1686 px URL only where reuse is allowed; the API's `license_text` verbatim; `description_attribution` when CC BY text is returned; `source_citation` on audio-guide results
 - Partial results instead of failures: `artic_get_artworks` reports `missing_ids` and `deferred_ids`, and when a secondary lookup (related media, artist counts) fails, the primary records still return with a `notice` naming what is missing
-- Paging that names the next move: `totalCount`, `has_more`, `next_page`, and a `notice` with the next page, the 1,000-match ceiling, or the filter to loosen after zero hits; facet and vocabulary values come back in the exact form the filters accept
+- Paging that names the next move: `totalCount`, `has_more`, `next_page`, and a `notice` for the next page, the 1,000-match ceiling, or the filter to loosen after zero hits
 
 ## Data and licensing
 
@@ -129,16 +135,35 @@ This server is an independent project and is not affiliated with or endorsed by 
 ## Known limitations
 
 - Only the first 1,000 matches of any search are reachable without an authenticated key. Broad questions need filters or facets.
-- The API's limit of 60 requests a minute is per egress IP, so every client behind one IP shares it. Bursts queue behind the pacer, and a call that cannot start within its 20-second budget fails as `rate_limited`.
+- The API's limit of 60 requests a minute is per egress IP, so every client behind one IP shares it. A call that cannot start within its 20-second budget fails as `rate_limited`.
 - Curatorial text is sparse: about 10% of artworks have a `description`, and in a general sample 94% lack provenance. About 1% of artists have a biography, and there is no nationality field, only `artist_display` prose.
 - About 15 artworks carry placeholder years and about 4,900 carry no dates; neither matches a year filter.
-- Some vocabulary titles are stored cut at 40 characters in the museum's own data (`gelatin silver (developing-out-paper) pr`). Filters match them only as stored, so pass values as `artic_lookup_vocabulary` lists them.
+- Some vocabulary titles are stored cut at 40 characters in the museum's data (`gelatin silver (developing-out-paper) pr`). Pass values as `artic_lookup_vocabulary` lists them.
 - The API's firewall refuses any request whose text contains markup such as `<script>`; the call fails as `request_blocked`.
-- About 4% of exhibitions list their artworks, and `status` doesn't indicate whether a show is open.
+- About 4% of exhibitions list their artworks.
 - Audio-guide stops have no artwork link. Some titles are file names, and some transcripts are in Spanish.
-- Image URLs can stop resolving when the museum unpublishes or replaces an image, and relevance order follows the museum's own ranking, which may shift as its models change.
+- Image URLs can stop resolving when the museum unpublishes or replaces an image, and relevance order follows the museum's ranking, which may shift.
 
 ## Getting started
+
+### Public Hosted Instance
+
+A public instance is available at `https://art-institute-chicago.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
+
+```json
+{
+  "mcpServers": {
+    "art-institute-chicago-mcp-server": {
+      "type": "streamable-http",
+      "url": "https://art-institute-chicago.caseyjhand.com/mcp"
+    }
+  }
+}
+```
+
+Every caller of the hosted instance shares one `api.artic.edu` request budget of 50 requests a minute. For sustained use, run your own instance.
+
+### Self-Hosted / Local
 
 Add the following to your MCP client configuration file. No API key is needed; `AIC_CONTACT` tells the museum how to reach you (see [Configuration](#configuration)).
 
@@ -235,8 +260,8 @@ cp .env.example .env
 
 | Variable | Description | Default |
 |:---|:---|:---|
-| `AIC_CONTACT` | Contact the museum can reach (an email or URL), sent in the `AIC-User-Agent` header the Art Institute API asks clients to include. Printable ASCII only; the server refuses to start on any other character. The default points at this repository; set your own contact for any deployment. | `https://github.com/cyanheads/art-institute-chicago-mcp-server` |
-| `AIC_REQUESTS_PER_MINUTE` | Outbound requests per minute to `api.artic.edu`, 1–600. The default stays under the API's published limit of 60 a minute; raise it only if the museum grants a higher one. | `50` |
+| `AIC_CONTACT` | Email or URL the museum can reach, sent in the `AIC-User-Agent` header. Printable ASCII only; the server refuses to start otherwise. Set your own for any deployment. | `https://github.com/cyanheads/art-institute-chicago-mcp-server` |
+| `AIC_REQUESTS_PER_MINUTE` | Outbound requests per minute to `api.artic.edu`, 1–600. Stays under the API's published limit of 60; raise it only if the museum grants a higher one. | `50` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | HTTP server port. | `3010` |
 | `MCP_SESSION_MODE` | HTTP session mode: `stateless`, `stateful`, or `auto`. `.env.example` and the Docker image set `stateless`. | `auto` |
