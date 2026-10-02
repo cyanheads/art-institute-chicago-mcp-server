@@ -432,7 +432,9 @@ describe('AicService request boundary', () => {
     const { service, fetch } = createTestService(scriptedFetch(jsonResponder(searchEnvelope([]))));
     await service.searchArtworks(artworkParams(), makeCtx());
     const [url, init] = fetch.mock.calls[0] ?? [];
-    expect(url).toMatch(new RegExp(`^${API_ORIGIN}/api/v1/artworks/search\\?params=`));
+    const sent = new URL(url ?? '');
+    expect(`${sent.origin}${sent.pathname}`).toBe(`${API_ORIGIN}/api/v1/artworks/search`);
+    expect(sent.searchParams.has('params')).toBe(true);
     const headers = init?.headers as Record<string, string>;
     expect(headers['AIC-User-Agent']).toBe(
       `art-institute-chicago-mcp-server/${TEST_VERSION} (${TEST_CONTACT})`,
