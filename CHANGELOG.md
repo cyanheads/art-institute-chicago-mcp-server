@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-10-13 · ⚠️ Breaking
+
+Collection relationships, Getty ULAN identifiers, and bounded reads with exact continuation.
+
 ## [0.1.2](changelog/0.1.x/0.1.2.md) — 2026-10-01
 
 Material, technique, and theme filters on artic_search_artworks, full search totals for quoted and numeric queries, long searches sent as POST instead of failing, and accented or decomposed text that now matches in filters, contains, and free text.
