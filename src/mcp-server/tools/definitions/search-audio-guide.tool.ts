@@ -36,11 +36,11 @@ export const searchAudioGuide = tool('artic_search_audio_guide', {
       .describe(
         "Text matched against stop titles and transcripts; every word must match. An artwork's title or the artist's surname works well.",
       ),
-    page: blankAsUnset(z.number().int().min(1).max(200).default(1)).describe(
-      'Page to return (1-based); page times limit may not exceed 1,000.',
+    page: blankAsUnset(z.number().int().min(1).max(1000).default(1)).describe(
+      'Page to return (1-based); page times the applied limit may not exceed 1,000.',
     ),
-    limit: blankAsUnset(z.number().int().min(1).max(20).default(5)).describe(
-      'Stops per page (1-20).',
+    limit: blankAsUnset(z.number().int().min(1).max(1000).default(2)).describe(
+      'Requested stops per page (1-1,000); at most two whole stops are returned.',
     ),
   }),
   output: z.object({
@@ -105,7 +105,7 @@ export const searchAudioGuide = tool('artic_search_audio_guide', {
     {
       reason: 'page_beyond_window',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'page times limit exceeds 1,000, past the reachable search window.',
+      when: 'page times the applied limit exceeds 1,000, past the reachable search window.',
       retryable: false,
       severity: 'notice',
       recovery:
@@ -141,6 +141,8 @@ export const searchAudioGuide = tool('artic_search_audio_guide', {
   ],
 
   async handler(input, ctx) {
+    const requestedLimit = input.limit;
+    input = { ...input, limit: Math.min(input.limit, 2) };
     ctx.enrich.total(0);
     ctx.enrich({ truncated: false, shown: 0, cap: input.limit });
 
@@ -171,6 +173,9 @@ export const searchAudioGuide = tool('artic_search_audio_guide', {
     } else if (paging.windowExhausted) {
       notice = WINDOW_NOTICE;
     }
+    if (requestedLimit > input.limit)
+      notice =
+        `Applied limit ${input.limit} to requested limit ${requestedLimit}; keep the same requested limit on subsequent pages. ${notice}`.trim();
     if (paging.has_more) ctx.enrich.truncated({ shown, cap: input.limit, guidance: notice });
     else if (notice) ctx.enrich.notice(notice);
 

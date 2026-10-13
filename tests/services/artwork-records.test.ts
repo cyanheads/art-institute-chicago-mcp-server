@@ -109,7 +109,7 @@ describe('loadArtworkRecords', () => {
       expect(result.artworks).toEqual([]);
       expect(result.missing_ids).toEqual([5, 6]);
       expect(result.notices).toEqual([
-        'None of these ids exist. Find ids with artic_search_artworks.',
+        'None of the attempted ids exist. Find ids with artic_search_artworks.',
       ]);
       expect(result).not.toHaveProperty('description_attribution');
       expect(idsRequested(fetch, SOUNDS)).toEqual([]);

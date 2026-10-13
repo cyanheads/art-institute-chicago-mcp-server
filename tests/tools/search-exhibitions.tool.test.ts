@@ -94,6 +94,80 @@ const search = (input: Record<string, unknown> = {}) =>
 // --- Request building -----------------------------------------------------------------------
 
 describe('artic_search_exhibitions request', () => {
+  it('sends both exact exhibition relationship filters with text/date conditions', async () => {
+    const fetchFake = emptyResults();
+    const result = await search({
+      artwork_id: 16568,
+      artist_id: 35809,
+      query: 'Monet',
+      date_from: '2020-01-01',
+      date_to: '2020-12-31',
+    });
+    expect(filtersOf(fetchFake)).toEqual([
+      { range: { aic_end_at: { gte: '2020-01-01' } } },
+      { range: { aic_start_at: { lte: '2020-12-31' } } },
+      { term: { artwork_ids: 16568 } },
+      { term: { artist_ids: 35809 } },
+    ]);
+    const out = structuredOf<ExhibitionsRun>(result);
+    expect(out.notice).toContain('artwork_id 16568');
+    expect(out.notice).toContain('artist_id 35809');
+    expect(out.notice).toContain('Remove');
+    expect(
+      result.content.some(
+        (block) => block.type === 'text' && block.text.includes(out.notice ?? 'missing'),
+      ),
+    ).toBe(true);
+  });
+
+  it.each(['artwork_id', 'artist_id'])('rejects malformed %s before upstream', async (key) => {
+    for (const value of [0, -1, 1.5, '16568', 'bad', Number.MAX_SAFE_INTEGER + 1]) {
+      const fetchFake = emptyResults();
+      const result = await search({ [key]: value });
+      expect(errorOf(result).code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(textOf(result)).toContain(key);
+      expect(fetchFake).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(['artwork_id', 'artist_id'])(
+    'sends an individual %s and explains zero recorded matches',
+    async (key) => {
+      const fetchFake = emptyResults();
+      const result = await search({ [key]: 999999999 });
+      expect(filtersOf(fetchFake)).toEqual([
+        { term: { [key === 'artwork_id' ? 'artwork_ids' : 'artist_ids']: 999999999 } },
+      ]);
+      const out = structuredOf<ExhibitionsRun>(result);
+      expect(out.exhibitions).toEqual([]);
+      expect(out.notice).toContain(`${key} 999999999`);
+      expect(out.notice).toContain('recorded relationships');
+      expect(out.notice).toContain('Remove');
+    },
+  );
+  it('keeps listed relationships and output on a later page', async () => {
+    const fetchFake = serve(
+      searchEnvelope(
+        [
+          exhibitionRecord(9036, {
+            artwork_ids: [16568],
+            artwork_titles: ['Water Lilies'],
+            artist_ids: [35809],
+          }),
+        ],
+        2,
+      ),
+    );
+    const result = await search({ page: 2, limit: 1 });
+    const out = structuredOf<ExhibitionsRun>(result);
+    expect(out.exhibitions[0]).toMatchObject({
+      artist_ids: [35809],
+      artworks: [{ id: 16568, title: 'Water Lilies' }],
+    });
+    expect(out.has_more).toBe(false);
+    expect(textOf(result)).toContain('Water Lilies (id 16568)');
+    expect(bodyOf(fetchFake)).toMatchObject({ page: 2, limit: 1 });
+  });
   it('sorts newest-first with no query, sending paging and the field allowlist only', async () => {
     const fetchFake = emptyResults();
     const out = structuredOf<ExhibitionsRun>(await search());
@@ -197,10 +271,9 @@ describe('artic_search_exhibitions request', () => {
     const fetchFake = emptyResults();
     await search();
     const blank = Object.fromEntries(
-      ['query', 'when', 'date_from', 'date_to', 'sort'].map((name, index) => [
-        name,
-        index % 2 === 0 ? '' : '   ',
-      ]),
+      ['query', 'when', 'date_from', 'date_to', 'sort', 'artwork_id', 'artist_id'].map(
+        (name, index) => [name, index % 2 === 0 ? '' : '   '],
+      ),
     );
     const blankFetch = emptyResults();
     const result = await search(blank);
@@ -244,9 +317,9 @@ describe('artic_search_exhibitions input validation', () => {
     ['an impossible day in date_to', { date_to: '2024-02-31' }, 'date_to'],
     ['a text date_to', { date_to: 'tomorrow' }, 'date_to'],
     ['page 0', { page: 0 }, 'page'],
-    ['page 41', { page: 41 }, 'page'],
+    ['page 1001', { page: 1001 }, 'page'],
     ['limit 0', { limit: 0 }, 'limit'],
-    ['limit 26', { limit: 26 }, 'limit'],
+    ['limit 1001', { limit: 1001 }, 'limit'],
     ['a fractional page', { page: 1.5 }, 'page'],
   ])('rejects %s without calling upstream', async (_name, input, field) => {
     const fetchFake = emptyResults();
@@ -317,7 +390,7 @@ describe('artic_search_exhibitions date-range guard', () => {
     expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
     expect(error.data.reason).toBe('page_beyond_window');
     expect(error.data.recovery?.hint).toBe(
-      'Only the first 1,000 matches are reachable. Narrow artic_search_exhibitions with query text, when, or date_from and date_to.',
+      'Only the first 1,000 matches are reachable. Narrow artic_search_exhibitions with artwork_id, artist_id, query text, when, or date_from and date_to.',
     );
   });
 });
@@ -325,6 +398,26 @@ describe('artic_search_exhibitions date-range guard', () => {
 // --- Pagination and enrichment -----------------------------------------------------------------------------
 
 describe('artic_search_exhibitions paging and enrichment', () => {
+  it.each([
+    [40, 25, 5000, 25, WINDOW_NOTICE],
+    [4, 10, 25, 0, 'Page 4 is past the last match (25 total); request a lower page.'],
+  ])(
+    'retains relationship filters at page %i and limit %i',
+    async (page, limit, total, shown, notice) => {
+      const fetchFake = serve(searchEnvelope(rows(shown), total));
+      const result = await search({ page, limit, artwork_id: 16568, artist_id: 35809 });
+      const out = structuredOf<ExhibitionsRun>(result);
+      expect(out).toMatchObject({ shown, notice, totalCount: total });
+      expect(out).not.toHaveProperty('next_page');
+      expect(filtersOf(fetchFake)).toEqual([
+        { term: { artwork_ids: 16568 } },
+        { term: { artist_ids: 35809 } },
+      ]);
+      expect(
+        result.content.some((block) => block.type === 'text' && block.text.includes(notice)),
+      ).toBe(true);
+    },
+  );
   it('returns the zero-result page with every required enrichment field', async () => {
     emptyResults();
     const out = structuredOf<ExhibitionsRun>(await search());

@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/art-institute-chicago-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.1.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/art-institute-chicago-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/art-institute-chicago-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/art-institute-chicago-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/art-institute-chicago-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/art-institute-chicago-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -37,8 +37,8 @@ The Art Institute of Chicago's collection through the museum's public API: about
 |:---|:---|
 | `artic_search_artworks` | Search artworks by text and filters, with facet counts and date sorting |
 | `artic_get_artworks` | Fetch full records for up to 10 artworks: description, provenance, histories, image URLs with rights status, related media |
-| `artic_search_artists` | Find artists, cultures, and organizations by name or id, with life dates, artwork counts, and sample works |
-| `artic_search_exhibitions` | Search past, current, and upcoming exhibitions by text and date |
+| `artic_search_artists` | Find artists, cultures, and organizations by name or id, with available Getty ULAN identifiers, life dates, artwork counts, and sample works |
+| `artic_search_exhibitions` | Search past, current, and upcoming exhibitions by text, date, artwork id, or artist id |
 | `artic_search_audio_guide` | Search audio-guide stops by text: title, MP3 URL, and transcript |
 | `artic_lookup_vocabulary` | List the values a search filter accepts, with artwork counts |
 
@@ -52,32 +52,37 @@ The Art Institute of Chicago's collection through the museum's public API: about
 
 ## Capability reference
 
+Searches and vocabulary lookup accept requested limits through 1,000 and disclose the applied cap: artworks 12, artist query and exhibitions 25, audio guide 2, vocabulary 100. Search pages use the applied size; retain the same requested limit when following `next_page`. Page times applied size must stay within 1,000. At the vocabulary cap, narrow with `contains`.
+
 ### `artic_search_artworks` <sub>tool</sub>
 
 - `query` (every word must match; `"exact phrase"`, `-exclude`, and `a | b` work) plus filters `artist`, `artist_id`, `department`, `artwork_type`, `style`, `subject`, `classification`, `material`, `technique`, `theme`, `place_of_origin`, `gallery`, `year_from` / `year_to` (date-span overlap, negative for BCE), `public_domain_only`, `on_view_only`, and `has_image`, combined with AND
 - Up to 12 rows per page (default 10), within the first 1,000 matches; `sort` is `relevance`, `date_asc`, or `date_desc`, and `sort_applied` reports `popularity` when relevance had no query text
-- `facets` adds the top 15 values for up to seven fields (`artist` rows carry `artist_id`); `limit: 0` returns counts only
+- `facets` adds the top 15 values for up to seven fields (`artist` counts every credited artist and rows carry `artist_id`); `limit: 0` returns counts only
 
 ---
 
 ### `artic_get_artworks` <sub>tool</sub>
 
-- 1–10 `ids` per call (artwork page URLs are read as their id); `sections` picks the heavy text: `description` and `provenance` by default, plus `exhibition_history`, `publication_history`, and `catalogue`
-- Records return in request order, with `missing_ids` for ids the museum doesn't have and `deferred_ids` for records held back to keep the response under about 100,000 bytes
+- `ids` accepts up to 1,000 supplied entries, counting blanks and duplicates; comma strings also have a 100,000-character ceiling. Blanks and duplicates are dropped, and artwork page URLs are read as their id. The first 10 ids are attempted; `sections` picks description and provenance by default, plus exhibition_history, publication_history, and catalogue
+- Records return in request order, with `missing_ids` for attempted ids the museum doesn't have and `deferred_ids` for records held back by the response budget followed by unattempted ids. Pass `deferred_ids` to the same tool again
 - `include_related_media` (default on) loads up to 20 linked lectures and audio stops per call; `description_attribution` appears whenever CC BY description text is returned
+- Requested histories are plain text, preserving paragraphs and safe HTTP(S) citation destinations
 
 ---
 
 ### `artic_search_artists` <sub>tool</sub>
 
-- `query` (all name words must match) or up to 25 `ids`, not both; query mode adds `artists_only` (default `true`), `born_from` / `born_to`, and up to 25 agents per page
-- Each agent carries `artwork_count`, up to three `sample_works` (the museum's highlights first), life years, and `alt_names`; ids mode reports `missing_ids`
+- `query` (all name words must match) or `ids`, not both; ids accepts up to 1,000 supplied entries, counting blanks and duplicates, and comma strings also have a 100,000-character ceiling. The first 25 normalized ids are attempted. Query mode adds `artists_only` (default `true`), `born_from` / `born_to`, and up to 25 agents per page
+- Each agent carries `artwork_count`, up to three `sample_works` (the museum's highlights first), life years, and `alt_names`; ids mode reports attempted `missing_ids` and ordered `deferred_ids` to pass as ids in the next call
+- `ulan_id` is the Getty ULAN identifier when the museum records one; coverage is sparse, and it is distinct from the museum `id` used by other tools
 
 ---
 
 ### `artic_search_exhibitions` <sub>tool</sub>
 
-- `query`, `when` (`current`, `upcoming`, `past`, or the default `any`), and `date_from` / `date_to` (`YYYY-MM-DD`, matched by run overlap); up to 25 per page, pages 1–40
+- `query`, `when` (`current`, `upcoming`, `past`, or the default `any`), `date_from` / `date_to` (`YYYY-MM-DD`, matched by run overlap), and exact `artwork_id` / `artist_id` filters, combined with AND; up to 25 per page within the first 1,000 matches
+- Relationship filters cover recorded museum links; absent links do not prove an artwork or artist never appeared in a show
 - `sort` is `relevance`, `start_desc`, or `start_asc`, defaulting to relevance with a query and `start_desc` without; `status` is the museum's label and doesn't say whether a show is open (`when` does)
 - Rows carry dates, gallery, summary, web page, image, `artist_ids`, and the `artworks` shown, when the museum lists them
 
@@ -85,7 +90,7 @@ The Art Institute of Chicago's collection through the museum's public API: about
 
 ### `artic_search_audio_guide` <sub>tool</sub>
 
-- `query` is required and matches stop titles and transcripts (every word); up to 20 stops per page (default 5)
+- `query` is required and matches stop titles and transcripts (every word); up to two whole stops per page (default 2)
 - Each stop has `title`, `audio_url` (MP3), and `transcript` but no artwork id; every response carries `license_text` and `source_citation` (content is for noncommercial educational and personal use)
 
 ---

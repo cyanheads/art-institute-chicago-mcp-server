@@ -10,6 +10,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   artworkIdItem,
   blankAsUnset,
+  idListInput,
   inlineSafe,
   listInput,
   printableUrl,
@@ -191,11 +192,11 @@ function recordLines(artwork: ArtworkRecord): string[] {
 export const getArtworks = tool('artic_get_artworks', {
   title: 'Get artworks',
   description:
-    'Fetch full Art Institute of Chicago records for up to 10 artworks by id: description, provenance, exhibition and publication history, dimensions, inscriptions, credit line, categorization, gallery, image URLs with rights status, and related multimedia. Long histories are opt-in through sections. Ids come from artic_search_artworks, artic_search_exhibitions, or artic_search_artists.',
+    'Fetch full Art Institute of Chicago records for the first 10 artworks by id, returning deferred_ids for the rest: description, provenance, exhibition and publication history, dimensions, inscriptions, credit line, categorization, gallery, image URLs with rights status, and related multimedia. Long histories are opt-in through sections. Ids come from artic_search_artworks, artic_search_exhibitions, or artic_search_artists.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
-    ids: listInput(z.array(z.number().int().positive()).min(1).max(10), 10, artworkIdItem).describe(
-      'Artwork ids, 1 to 10, as an array or a comma-separated string; https://www.artic.edu/artworks/<id> page URLs are read as their id. Duplicates are dropped.',
+    ids: idListInput(z.array(z.number().int().positive()).min(1).max(1000), artworkIdItem).describe(
+      'Artwork ids as an array or comma-separated string, up to 1,000 supplied entries including blanks and duplicates. Comma strings also have a 100,000-character ceiling. Artwork page URLs are read as their id; blanks and duplicates are dropped. Fetches the first 10; deferred_ids names the remainder.',
     ),
     sections: blankAsUnset(
       listInput(
@@ -216,11 +217,15 @@ export const getArtworks = tool('artic_get_artworks', {
     artworks: z
       .array(ArtworkRecordSchema)
       .describe('Records in request order; ids the museum does not have are left out.'),
-    missing_ids: z.array(z.number()).describe('Requested ids with no artwork, in request order.'),
+    missing_ids: z
+      .array(z.number())
+      .describe(
+        'Attempted ids with no artwork, in request order; unattempted ids are not reported as missing.',
+      ),
     deferred_ids: z
       .array(z.number())
       .describe(
-        'Found ids left out because the response budget was reached; request them in a follow-up call.',
+        'Ids left out by the response budget or beyond the first 10 attempted ids, in request order; pass them to artic_get_artworks again.',
       ),
     license_text: z.string().describe('License statement from the API for this data, verbatim.'),
     description_attribution: z

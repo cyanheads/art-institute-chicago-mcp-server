@@ -20,6 +20,7 @@ import {
   htmlField,
   htmlToText,
   httpUrl,
+  idListInput,
   iiifBaseUrl,
   iiifImageId,
   iiifImageUrl,
@@ -155,6 +156,48 @@ describe('listInput', () => {
     expect(ids.safeParse('12abc').success).toBe(false);
     expect(ids.safeParse('-5').success).toBe(false);
     expect(ids.safeParse('0').success).toBe(false);
+  });
+});
+
+describe('idListInput', () => {
+  const ids = idListInput(z.array(z.number().int().positive()).min(1).max(1000), artworkIdItem);
+  it('normalizes numeric and URL forms and deduplicates in first-occurrence order', () => {
+    expect(ids.parse([' 7 ', '007', '', 8, 'https://www.artic.edu/artworks/7/a', '9'])).toEqual([
+      7, 8, 9,
+    ]);
+  });
+  it('validates every remaining ID, including the deferred tail', () => {
+    expect(ids.safeParse([...Array.from({ length: 999 }, (_, i) => i + 1), 'bad']).success).toBe(
+      false,
+    );
+  });
+  it('accepts the raw ceilings and rejects duplicate-heavy input above them', () => {
+    expect(ids.parse(Array(1000).fill('7'))).toEqual([7]);
+    expect(ids.parse(`7${' '.repeat(99999)}`)).toEqual([7]);
+    expect(ids.safeParse(Array(1001).fill('7')).success).toBe(false);
+    expect(ids.safeParse(['7', ...Array(1000).fill('')]).success).toBe(false);
+    expect(ids.safeParse(`7${' '.repeat(100000)}`).success).toBe(false);
+  });
+  it.each([
+    ['numeric text', (size: number) => '9'.repeat(size)],
+    ['comma blanks', (size: number) => ','.repeat(size)],
+    ['URL suffix', (size: number) => `https://www.artic.edu/artworks/7/${'x'.repeat(size - 31)}`],
+  ])('bounds caller-input CPU over 64x scale for %s', (_name, make) => {
+    const sizes = [5000, 20000, 80000, 320000];
+    const times = sizes.map((size) => {
+      const value = make(size);
+      ids.safeParse(value);
+      return Math.min(
+        ...Array.from({ length: 5 }, () => {
+          const start = process.threadCpuUsage();
+          for (let i = 0; i < 50; i++) ids.safeParse(value);
+          const elapsed = process.threadCpuUsage(start);
+          return (elapsed.user + elapsed.system) / 1000;
+        }),
+      );
+    });
+    expect(Math.max(...times)).toBeLessThan(1000);
+    expect((times.at(-1) ?? 0) / (times[0] ?? 1)).toBeLessThan(256);
   });
 });
 
@@ -359,6 +402,94 @@ describe('plausibleYear', () => {
 });
 
 describe('htmlToText', () => {
+  it('keeps inline nesting, numeric entities, and encoded markup as data', () => {
+    expect(htmlToText('<p><em>A <strong>book</strong></em> &#201; &amp;lt;b&amp;gt;</p>')).toBe(
+      'A book É &lt;b&gt;',
+    );
+  });
+
+  it('preserves exact case of supported Latin entities and leaves arbitrary case unknown', () => {
+    expect(
+      htmlToText('&Eacute;cole &Aacute;ngel &Oslash; &eacute; &aacute; &oslash; &EaCuTe; &AMP;'),
+    ).toBe('École Ángel Ø é á ø &EaCuTe; &');
+  });
+
+  it('separates table cells and rows through nested inline formatting', () => {
+    expect(
+      htmlToText(
+        '<table><tr><th><em>Year</em></th><th>Owner</th></tr><tr><td>1890</td><td><span><b>Durand-Ruel</b></span></td></tr></table>',
+      ),
+    ).toBe('Year Owner\n1890 Durand-Ruel');
+  });
+
+  it('preserves paragraphs in plain and mixed HTML histories', () => {
+    expect(htmlToText('First\r\n\r\nSecond\n\n<p>Third.</p><p>Fourth.</p>')).toBe(
+      'First\n\nSecond\n\nThird.\n\nFourth.',
+    );
+  });
+
+  it('keeps safe citation destinations as text, entity-decoded once', () => {
+    expect(
+      htmlToText(
+        '<a class="x" href="https://x.test/?a=1&amp;b=&amp;lt;">A <em>source</em></a>; <a href=http://x.test/b>B</a>',
+      ),
+    ).toBe('A source (https://x.test/?a=1&b=&lt;); B (http://x.test/b)');
+  });
+
+  it('keeps citations in both directions of nested paragraph/table wrappers', () => {
+    expect(htmlToText('<p><a href="https://x.test/a"><em>Book</em></a></p><p>Next</p>')).toBe(
+      'Book (https://x.test/a)\n\nNext',
+    );
+    expect(htmlToText('<a href="https://x.test/a"><p>Book</p><p>Next</p></a>')).toBe(
+      'Book\n\nNext\n\n(https://x.test/a)',
+    );
+    expect(
+      htmlToText(
+        '<table><tr><td><a href="https://x.test/a">Book</a></td><td>Year</td></tr></table>',
+      ),
+    ).toBe('Book (https://x.test/a) Year');
+    expect(
+      htmlToText(
+        '<a href="https://x.test/a"><table><tr><td>Book</td><td>Year</td></tr></table></a>',
+      ),
+    ).toBe('Book Year\n(https://x.test/a)');
+    expect(
+      htmlToText(
+        '<a href="https://x.test/outer">Outer <a href="https://x.test/inner">Inner</a> end</a>',
+      ),
+    ).toBe('Outer Inner (https://x.test/inner) end (https://x.test/outer)');
+  });
+
+  it('keeps visible text but no URL for unclosed or malformed anchor attributes', () => {
+    expect(htmlToText('<a href="https://x.test">Visible <b>nested</b>')).toBe('Visible nested');
+    expect(htmlToText('<a href="https://x.test>Visible</a>')).toBe('Visible');
+    expect(
+      htmlToText(
+        "<a title=\"href='javascript:bad'\" HREF='https://x.test/?a=1&amp;b=2'>Visible</a>",
+      ),
+    ).toBe('Visible (https://x.test/?a=1&b=2)');
+  });
+
+  it.each([
+    'javascript:alert(1)',
+    'data:text/html,x',
+    '//x.test/a',
+    '/relative',
+    'https://',
+    'https:x',
+    'https://x.test/&#10;evil',
+    'https://x.test/with space',
+  ])('drops unsafe or malformed citation %s but keeps visible text', (href) => {
+    expect(htmlToText(`<a href="${href}"><b>Visible</b></a>`)).toBe('Visible');
+  });
+  it.each([0x1, 0x7f, 0x9f, 0x202e, 0x200b, 0xe0041])(
+    'drops citation destinations carrying control or invisible character code %i',
+    (codePoint) => {
+      for (const value of [chars(codePoint), `&#x${codePoint.toString(16)};`]) {
+        expect(htmlToText(`<a href="https://x.test/${value}path">Visible</a>`)).toBe('Visible');
+      }
+    },
+  );
   it('turns paragraph closers into one blank line and trims', () => {
     expect(htmlToText('<p>First.</p><p>Second.</p>')).toBe('First.\n\nSecond.');
   });
@@ -372,7 +503,7 @@ describe('htmlToText', () => {
       htmlToText(
         '<a href="https://x.test/?q=1&amp;r=2" class="y">link</a> <em>and</em> <i>more</i>',
       ),
-    ).toBe('link and more');
+    ).toBe('link (https://x.test/?q=1&r=2) and more');
   });
 
   it('treats source line breaks as whitespace', () => {
@@ -444,7 +575,7 @@ describe('htmlToText', () => {
   });
 
   /**
-   * Linear time, measured in process CPU rather than wall-clock time so test
+   * Linear time, measured in thread CPU rather than wall-clock time so test
    * files running beside it cannot fail it: the fastest of several conversions
    * at 1 MiB stays under an absolute bound, and its ratio to the fastest at
    * 256 KiB stays below 10x, under quadratic (16x). Linear is 4x, but V8's
@@ -456,9 +587,9 @@ describe('htmlToText', () => {
     const SAMPLES = 5;
 
     const cpuMs = (work: () => void) => {
-      const start = process.cpuUsage();
+      const start = process.threadCpuUsage();
       work();
-      const { user, system } = process.cpuUsage(start);
+      const { user, system } = process.threadCpuUsage(start);
       return (user + system) / 1000;
     };
 
@@ -492,6 +623,38 @@ describe('htmlToText', () => {
       }
       expect(largeMs).toBeLessThan(1000);
       expect(largeMs / smallMs).toBeLessThan(10);
+    });
+
+    it.each([
+      [
+        'nested anchors',
+        (size: number) =>
+          `${'<a href="https://x.test">'.repeat(size / 24)}label${'</a>'.repeat(size / 24)}`,
+      ],
+      [
+        'unterminated href quote',
+        (size: number) => `<a href="${' href='.repeat(size / 6)}>label</a>`,
+      ],
+      ['repeated unclosed anchors', (size: number) => '<a href="'.repeat(size / 9)],
+      [
+        'long attribute names',
+        (size: number) => `<a ${'x'.repeat(size)} href="https://x.test">label</a>`,
+      ],
+      [
+        'nested table markup',
+        (size: number) => '<tr><td><b>x</b></td><td>y</td></tr>'.repeat(size / 35),
+      ],
+    ])('bounds citation/table scanner CPU over 64x scale: %s', (_name, make) => {
+      const small = make(MIB / 64);
+      const large = make(MIB);
+      htmlToText(small);
+      htmlToText(large);
+      const fastest = (text: string) =>
+        Math.min(...Array.from({ length: SAMPLES }, () => cpuMs(() => htmlToText(text))));
+      const smallMs = fastest(small);
+      const largeMs = fastest(large);
+      expect(largeMs).toBeLessThan(1000);
+      expect(largeMs / smallMs).toBeLessThan(256);
     });
   });
 });

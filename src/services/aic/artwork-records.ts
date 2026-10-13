@@ -47,12 +47,12 @@ export interface ArtworkRecordsRequest {
 export interface ArtworkRecordsResult {
   /** Records in request order, cut at the response budget. */
   artworks: ArtworkDetail[];
-  /** Found ids left out by the response budget, in request order. */
+  /** Budget-deferred found ids, followed by unattempted ids, in request order. */
   deferred_ids: number[];
   /** Present when any returned record carries description text (CC BY 4.0). */
   description_attribution?: string;
   license_text: string;
-  /** Requested ids the API does not have, in request order. */
+  /** Attempted ids the API does not have, in request order. */
   missing_ids: number[];
   /** Agent-facing notice fragments, in the order they apply; join with a space. */
   notices: string[];
@@ -63,20 +63,33 @@ export async function loadArtworkRecords(
   request: ArtworkRecordsRequest,
   ctx: Context,
 ): Promise<ArtworkRecordsResult> {
-  const batch = await getAicService().getArtworks(request.ids, request.sections, ctx);
+  const attemptedIds = request.ids.slice(0, 10);
+  const unattemptedIds = request.ids.slice(10);
+  const batch = await getAicService().getArtworks(attemptedIds, request.sections, ctx);
+
+  // The extra remainder travels twice: as a JSON array and as formatted text.
+  const budgetBytes =
+    RECORD_BUDGET_BYTES -
+    (unattemptedIds.length > 0
+      ? jsonBytes(unattemptedIds) + jsonBytes(unattemptedIds.join(', '))
+      : 0);
 
   // Media only adds bytes, so the records that fit without it bound those that fit with it:
   // load media for those alone, then cut again with it counted.
-  const fitting = withinBudget(batch.entries, (entry) => request.wireBytes(entry.detail));
+  const fitting = withinBudget(
+    batch.entries,
+    (entry) => request.wireBytes(entry.detail),
+    budgetBytes,
+  );
   const media = request.include_related_media ? await attachRelatedMedia(fitting, ctx) : undefined;
   const artworks = media
-    ? withinBudget(media.artworks, request.wireBytes)
+    ? withinBudget(media.artworks, request.wireBytes, budgetBytes)
     : fitting.map((entry) => entry.detail);
   const deferredIds = batch.entries.slice(artworks.length).map((entry) => entry.detail.id);
 
   const notices: string[] = [];
   if (batch.entries.length === 0) {
-    notices.push('None of these ids exist. Find ids with artic_search_artworks.');
+    notices.push('None of the attempted ids exist. Find ids with artic_search_artworks.');
   } else if (batch.missing_ids.length > 0) {
     notices.push(
       `No artwork exists for id ${batch.missing_ids.join(', ')}; find ids with artic_search_artworks.`,
@@ -85,6 +98,11 @@ export async function loadArtworkRecords(
   if (deferredIds.length > 0) {
     notices.push(
       `The response budget was reached; call artic_get_artworks again with ids ${deferredIds.join(', ')} (or fewer sections) for the rest.`,
+    );
+  }
+  if (unattemptedIds.length > 0) {
+    notices.push(
+      `The first 10 ids were attempted; call artic_get_artworks again with deferred_ids for the rest.`,
     );
   }
   if (media?.degraded) notices.push(RELATED_MEDIA_DEGRADED);
@@ -100,7 +118,7 @@ export async function loadArtworkRecords(
   );
   return {
     artworks,
-    deferred_ids: deferredIds,
+    deferred_ids: [...deferredIds, ...unattemptedIds],
     ...(hasDescription ? { description_attribution: DESCRIPTION_ATTRIBUTION } : {}),
     license_text: batch.license_text,
     missing_ids: batch.missing_ids,
@@ -109,11 +127,11 @@ export async function loadArtworkRecords(
 }
 
 /** The leading items whose summed size stays within the record budget; the first always stays. */
-function withinBudget<T>(items: readonly T[], size: (item: T) => number): T[] {
+function withinBudget<T>(items: readonly T[], size: (item: T) => number, budgetBytes: number): T[] {
   let bytes = 0;
   const cut = items.findIndex((item, index) => {
     bytes += size(item);
-    return index > 0 && bytes > RECORD_BUDGET_BYTES;
+    return index > 0 && bytes > budgetBytes;
   });
   return items.slice(0, cut === -1 ? items.length : cut);
 }

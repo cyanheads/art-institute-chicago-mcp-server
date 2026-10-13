@@ -559,8 +559,8 @@ describe('artic_search_artworks request', () => {
     await search({ facets: ['artist'] });
     expect(bodyOf(fetchFake).aggs).toEqual({
       artist: {
-        terms: { field: 'artist_id', size: 15 },
-        aggs: { label: { top_hits: { size: 1, _source: ['artist_title'] } } },
+        terms: { field: 'artist_ids', size: 15 },
+        aggs: { label: { top_hits: { size: 1, _source: ['artist_ids', 'artist_titles'] } } },
       },
     });
   });
@@ -582,7 +582,7 @@ describe('artic_search_artworks request', () => {
 
 describe('artic_search_artworks validation', () => {
   it.each([
-    ['limit 13', { limit: 13 }, 'limit'],
+    ['limit 1001', { limit: 1001 }, 'limit'],
     ['a negative limit', { limit: -1 }, 'limit'],
     ['page 0', { page: 0 }, 'page'],
     ['page 1001', { page: 1001 }, 'page'],
@@ -1043,7 +1043,13 @@ describe('artic_search_artworks facets', () => {
         {
           key: 900,
           doc_count: 5,
-          label: { hits: { hits: [{ _source: { artist_title: 'Test Artist' } }] } },
+          label: {
+            hits: {
+              hits: [
+                { _source: { artist_ids: [899, 900], artist_titles: ['Other', 'Test Artist'] } },
+              ],
+            },
+          },
         },
         {
           key: 901,
@@ -1107,7 +1113,13 @@ describe('artic_search_artworks facets', () => {
               {
                 key: 5,
                 doc_count: 1,
-                label: { hits: { hits: [{ _source: { artist_title: HOSTILE_INLINE } }] } },
+                label: {
+                  hits: {
+                    hits: [
+                      { _source: { artist_ids: [4, 5], artist_titles: ['Other', HOSTILE_INLINE] } },
+                    ],
+                  },
+                },
               },
             ],
             sum_other_doc_count: 0,
@@ -1248,14 +1260,15 @@ describe('artic_search_artworks response size', () => {
   };
 
   it('keeps a full page of the heaviest catalog rows with every facet under 100,000 bytes', async () => {
-    const limit = advertisedLimitMax();
+    const limit = 12;
+    expect(advertisedLimitMax()).toBe(1000);
     serve(
       searchEnvelope(heaviestArtworkRows(limit), 5000, {
         aggregations: longestFacetAggregations(),
       }),
     );
     const result = await search({
-      limit,
+      limit: advertisedLimitMax(),
       facets: [
         'department',
         'artwork_type',
@@ -1322,7 +1335,7 @@ describe('artic_search_artworks upstream failures', () => {
 });
 
 describe('artic_search_artworks past the 2,048-byte GET limit', () => {
-  /** A 115-character query, five filters, and all seven facets: 2,299 bytes as a GET query string. */
+  /** A 115-character query, five filters, and all seven facets: 2,320 bytes as a GET query string. */
   const LONG_SEARCH = {
     query:
       'portrait of a woman seated in a garden with flowers and a small dog beside her in the afternoon light near a river',
@@ -1361,7 +1374,7 @@ describe('artic_search_artworks past the 2,048-byte GET limit', () => {
     for (const artwork of out.artworks) expect(text).toContain(`(id ${artwork.id})`);
     const sent = searchCallOf(fetchFake);
     expect(sent.method).toBe('POST');
-    expect(getBytes(fetchFake)).toBe(2299);
+    expect(getBytes(fetchFake)).toBe(2320);
     expect(sent.body).toMatchObject({ q: LONG_SEARCH.query, limit: 12 });
     expect(Object.keys(sent.body.aggs as object)).toHaveLength(7);
   });

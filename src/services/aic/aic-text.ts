@@ -52,6 +52,31 @@ export function listInput<T extends z.ZodType>(
   }, schema);
 }
 
+/** ID lists accept at most 1,000 supplied entries and 100,000 comma-string characters. */
+export function idListInput<T extends z.ZodType>(schema: T, mapItem: (item: string) => unknown) {
+  return z.preprocess(
+    (value, ctx) => {
+      if (typeof value === 'string' && value.length > 100_000) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'Supply at most 100,000 characters in an ID list.',
+        });
+        return z.NEVER;
+      }
+      const items = typeof value === 'string' ? value.split(',') : value;
+      if (Array.isArray(items) && items.length > 1000) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'Supply at most 1,000 ID entries, including blanks and duplicates.',
+        });
+        return z.NEVER;
+      }
+      return items;
+    },
+    listInput(schema, 1000, mapItem),
+  );
+}
+
 /** Maps an artwork id string, or an artic.edu artwork page URL, to its numeric id. */
 export function artworkIdItem(item: string): unknown {
   if (/^\d+$/.test(item)) return Number(item);
@@ -210,6 +235,33 @@ const URL_UNSAFE = new RegExp(
 
 /** A `Map`, so an entity named for an `Object` member (`&constructor;`) finds nothing. */
 const NAMED_ENTITIES = new Map<string, number>([
+  ['Aacute', 0xc1],
+  ['Acirc', 0xc2],
+  ['Agrave', 0xc0],
+  ['AMP', 0x26],
+  ['Aring', 0xc5],
+  ['Atilde', 0xc3],
+  ['Auml', 0xc4],
+  ['Ccedil', 0xc7],
+  ['Eacute', 0xc9],
+  ['Ecirc', 0xca],
+  ['Egrave', 0xc8],
+  ['Euml', 0xcb],
+  ['GT', 0x3e],
+  ['Iacute', 0xcd],
+  ['Icirc', 0xce],
+  ['Iuml', 0xcf],
+  ['LT', 0x3c],
+  ['Ntilde', 0xd1],
+  ['Oacute', 0xd3],
+  ['Ocirc', 0xd4],
+  ['Oslash', 0xd8],
+  ['Ouml', 0xd6],
+  ['QUOT', 0x22],
+  ['Uacute', 0xda],
+  ['Ucirc', 0xdb],
+  ['Ugrave', 0xd9],
+  ['Uuml', 0xdc],
   ['aacute', 0xe1],
   ['acirc', 0xe2],
   ['agrave', 0xe0],
@@ -275,7 +327,7 @@ function decodeEntities(text: string): string {
           ? Number.parseInt(body.slice(2), 16)
           : Number.parseInt(body.slice(1), 10);
     } else {
-      codePoint = NAMED_ENTITIES.get(body) ?? NAMED_ENTITIES.get(body.toLowerCase());
+      codePoint = NAMED_ENTITIES.get(body);
     }
     return codePoint !== undefined && codePoint > 0 && codePoint <= 0x10ffff
       ? String.fromCodePoint(codePoint)
@@ -283,26 +335,86 @@ function decodeEntities(text: string): string {
   });
 }
 
+/** Reads attributes once; an unterminated quote ends the scan rather than restarting it. */
+function citationHref(tag: string): string | undefined {
+  let cursor = 2;
+  while (cursor < tag.length - 1) {
+    while (/\s/.test(tag[cursor] ?? '')) cursor++;
+    const nameStart = cursor;
+    while (cursor < tag.length - 1 && !/[\s=/>]/.test(tag[cursor] ?? '')) cursor++;
+    const name = tag.slice(nameStart, cursor).toLowerCase();
+    while (/\s/.test(tag[cursor] ?? '')) cursor++;
+    if (tag[cursor] !== '=') {
+      if (cursor === nameStart) cursor++;
+      continue;
+    }
+    cursor++;
+    while (/\s/.test(tag[cursor] ?? '')) cursor++;
+    const quote = tag[cursor];
+    let value: string;
+    if (quote === '"' || quote === "'") {
+      const end = tag.indexOf(quote, cursor + 1);
+      if (end === -1) return;
+      value = tag.slice(cursor + 1, end);
+      cursor = end + 1;
+    } else {
+      const valueStart = cursor;
+      while (cursor < tag.length - 1 && !/\s/.test(tag[cursor] ?? '')) cursor++;
+      value = tag.slice(valueStart, cursor);
+    }
+    if (name === 'href') {
+      const decoded = decodeEntities(value);
+      if (
+        !/^https?:\/\//i.test(decoded) ||
+        /[\s\\<>"']/.test(decoded) ||
+        decoded.search(UNSAFE_INLINE) !== -1
+      )
+        return;
+      return httpUrl(decoded);
+    }
+  }
+  return;
+}
+
 /**
- * Converts upstream HTML (`<p>`, `<em>`, `<br>`, entities) to plain text:
- * source line breaks are whitespace, `<br>` and block closers become line
- * breaks, other tags are removed, entities decoded, runs of blank lines
- * collapsed, and the result trimmed. Tags are stripped before entities are
- * decoded, so `&lt;b&gt;` stays the text `<b>`; the markdown sinks escape it.
- *
- * Every pattern runs in linear time on unterminated markup: an unclosed
- * comment runs to the end of the text, a tag ends at the first `<` or `>`, and
- * a whitespace run is matched once, then collapsed only when it holds a line break.
+ * Converts HTML to plain text with paragraphs, table boundaries, and safe
+ * citation URLs. Single source newlines fold to spaces; blank-line paragraphs
+ * survive. Text and href entities decode once, after tag recognition, so
+ * encoded markup stays data. Tags stop at the next angle bracket; attribute
+ * scans and comment stripping make bounded progress on malformed openers.
  */
 export function htmlToText(html: string): string {
-  const withBreaks = html
-    .replace(/<!--[\s\S]*?(?:-->|$)/g, '')
-    .replace(/\s+/g, (run) => (/[\r\n]/.test(run) ? ' ' : run))
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/(?:p|div|blockquote|h[1-6])\s*>/gi, '\n\n')
-    .replace(/<\/?(?:li|ul|ol)\b[^<>]*>/gi, '\n')
-    .replace(/<\/?[a-z][^<>]*>/gi, '');
-  return decodeEntities(withBreaks)
+  const source = html.replace(/<!--[\s\S]*?(?:-->|$)/g, '').replace(/\s+/g, (run) => {
+    const breaks = run.match(/\r\n|[\r\n]/g)?.length ?? 0;
+    return breaks > 1 ? '\n\n' : breaks === 1 ? ' ' : run;
+  });
+  const parts: string[] = [];
+  const anchors: (string | undefined)[] = [];
+  let cursor = 0;
+  for (const match of source.matchAll(/<\/?([a-z][a-z0-9]*)\b[^<>]*>/gi)) {
+    parts.push(decodeEntities(source.slice(cursor, match.index)));
+    const tag = match[0];
+    const name = match[1]?.toLowerCase();
+    const closing = tag[1] === '/';
+    if (name === 'a') {
+      if (closing) {
+        const href = anchors.pop();
+        if (href !== undefined) parts.push(` (${href})`);
+      } else anchors.push(citationHref(tag));
+    } else if (name === 'tr') {
+      if (closing) parts.push('\n');
+    } else if (name === 'br' || name === 'li' || name === 'ul' || name === 'ol') {
+      parts.push('\n');
+    } else if (name === 'td' || name === 'th') {
+      parts.push(' ');
+    } else if (closing && /^(?:p|div|blockquote|h[1-6])$/.test(name ?? '')) {
+      parts.push('\n\n');
+    }
+    cursor = match.index + tag.length;
+  }
+  parts.push(decodeEntities(source.slice(cursor)));
+  return parts
+    .join('')
     .split('\n')
     .map((line) => line.replace(INLINE_WHITESPACE, ' ').trim())
     .join('\n')

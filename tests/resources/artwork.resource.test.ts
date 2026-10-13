@@ -208,6 +208,30 @@ describe('artic://artworks/{id} read', () => {
     expect(body.artwork.provenance).toBe('p');
   });
 
+  it('normalizes default description citations without adding history sections', async () => {
+    const fetchFake = serve((url) => {
+      const fields = queryParam(url, 'fields')?.split(',') ?? [];
+      const raw = artworkRecord(7, {
+        description: '<p>&Eacute;cole <a href="https://x.test/?a=1&amp;b=2">Source</a></p>',
+        provenance_text: 'Owner A\n\nOwner B',
+        exhibition_history: '<p>Show</p>',
+        publication_history: '<p>Book</p>',
+      });
+      return Response.json(
+        envelope([Object.fromEntries(Object.entries(raw).filter(([key]) => fields.includes(key)))]),
+      );
+    });
+    const body = await read('7');
+    expect(body.artwork.description).toBe('École Source (https://x.test/?a=1&b=2)');
+    expect(body.artwork.provenance).toBe('Owner A\n\nOwner B');
+    expect(body.artwork).not.toHaveProperty('exhibition_history');
+    expect(body.artwork).not.toHaveProperty('publication_history');
+    expect(body.description_attribution).toBe(DESCRIPTION_ATTRIBUTION);
+    expect(queryParam(urlOfCall(fetchFake), 'fields')).toBe(
+      `${DETAIL_FIELDS},description,short_description,provenance_text`,
+    );
+  });
+
   it('adds the attribution for a short description alone', async () => {
     serve([artworkRecord(7, { short_description: '<p>Short.</p>' })]);
     expect((await read('7')).description_attribution).toBe(DESCRIPTION_ATTRIBUTION);

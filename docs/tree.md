@@ -1,6 +1,6 @@
 # art-institute-chicago-mcp-server - Directory Structure
 
-Generated on: 2026-10-01 05:16:29
+Generated on: 2026-10-13 15:54:23
 
 ```text
 art-institute-chicago-mcp-server/
@@ -130,6 +130,7 @@ art-institute-chicago-mcp-server/
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
 ├── src/
@@ -165,7 +166,8 @@ art-institute-chicago-mcp-server/
 │   ├── fixtures/
 │   │   ├── aic-service-kit.ts
 │   │   ├── aic-tool-kit.ts
-│   │   └── aic-upstream.ts
+│   │   ├── aic-upstream.ts
+│   │   └── audio-heaviest.json
 │   ├── fuzz/
 │   ├── integration/
 │   ├── prompts/
@@ -179,6 +181,7 @@ art-institute-chicago-mcp-server/
 │   ├── smoke/
 │   └── tools/
 │       ├── get-artworks.tool.test.ts
+│       ├── limits.tool.test.ts
 │       ├── lookup-vocabulary.tool.test.ts
 │       ├── search-artists.tool.test.ts
 │       ├── search-artworks.tool.test.ts

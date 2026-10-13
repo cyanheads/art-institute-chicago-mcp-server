@@ -1514,8 +1514,8 @@ describe('AicService.searchArtworks', () => {
     expect(body.aggs).toEqual({
       department: { terms: { field: 'department_title.keyword', size: 15 } },
       artist: {
-        terms: { field: 'artist_id', size: 15 },
-        aggs: { label: { top_hits: { size: 1, _source: ['artist_title'] } } },
+        terms: { field: 'artist_ids', size: 15 },
+        aggs: { label: { top_hits: { size: 1, _source: ['artist_ids', 'artist_titles'] } } },
       },
       place_of_origin: { terms: { field: 'place_of_origin.keyword', size: 15 } },
     });
@@ -1525,6 +1525,27 @@ describe('AicService.searchArtworks', () => {
     const { body, result } = await run({ facets: [] });
     expect(body).not.toHaveProperty('aggs');
     expect(result).not.toHaveProperty('facets');
+  });
+
+  it('keeps filtered counts-only totals and non-artist facets independent of labels', async () => {
+    const { body, result } = await run(
+      { artist_id: 30329, limit: 0, facets: ['artist', 'department'] },
+      jsonResponder(
+        searchEnvelope([], 37, {
+          aggregations: {
+            artist: { buckets: [{ key: 30329, doc_count: 37 }] },
+            department: { buckets: [{ key: 'Arts of the Americas', doc_count: 37 }] },
+          },
+        }),
+      ),
+    );
+    expect(body.query).toEqual({ bool: { filter: [{ term: { artist_ids: 30329 } }] } });
+    expect(result.total).toBe(37);
+    expect(result.artworks).toEqual([]);
+    expect(result.facets).toEqual({
+      artist: [{ artist_id: 30329, count: 37 }],
+      department: [{ value: 'Arts of the Americas', count: 37 }],
+    });
   });
 
   it('passes limit 0 through for a counts-only request', async () => {
@@ -1550,7 +1571,18 @@ describe('AicService.searchArtworks', () => {
               {
                 key: 900,
                 doc_count: 5,
-                label: { hits: { hits: [{ _source: { artist_title: 'Test Artist' } }] } },
+                label: {
+                  hits: {
+                    hits: [
+                      {
+                        _source: {
+                          artist_ids: [899, 900],
+                          artist_titles: ['Other', 'Test Artist'],
+                        },
+                      },
+                    ],
+                  },
+                },
               },
               {
                 key: '901',
@@ -1576,6 +1608,46 @@ describe('AicService.searchArtworks', () => {
     const { result } = await run({ facets: ['style', 'artist'] });
     expect(result.facets).toEqual({ style: [], artist: [] });
   });
+
+  it.each([
+    [[null, 30329], ['Other', 'Lambayeque'], 'Lambayeque'],
+    [[29992, 30329], [null, 'Lambayeque'], 'Lambayeque'],
+    [[30329, 29992], ['Lambayeque', 'Chimú'], 'Lambayeque'],
+    [[29992, 30329], ['Chimú'], undefined],
+    [[29992], ['Chimú'], undefined],
+    [[30329], [42], undefined],
+    [[30329], [' '], undefined],
+    [null, ['Chimú'], undefined],
+  ])(
+    'pairs artist facet labels at raw source indices: %j / %j',
+    async (artist_ids, artist_titles, name) => {
+      const { result } = await run(
+        { facets: ['artist'] },
+        jsonResponder(
+          searchEnvelope([], 37, {
+            aggregations: {
+              artist: {
+                buckets: [
+                  {
+                    key: 30329,
+                    doc_count: 37,
+                    label: {
+                      hits: {
+                        hits: [{ _source: { artist_ids, artist_titles, artist_title: 'Chimú' } }],
+                      },
+                    },
+                  },
+                ],
+              },
+            },
+          }),
+        ),
+      );
+      expect(result.facets?.artist).toEqual([
+        { artist_id: 30329, count: 37, ...(name === undefined ? {} : { name }) },
+      ]);
+    },
+  );
 
   it('reads total from pagination and falls back to the row count', async () => {
     const withTotal = await run({}, jsonResponder(searchEnvelope([artworkRecord(1)], 5000)));
@@ -2097,6 +2169,39 @@ describe('AicService.getSounds', () => {
 describe('AicService agents', () => {
   const ctx = makeCtx();
 
+  it.each(['query', 'ids'])(
+    'requests and preserves numeric ULAN with sparse/malformed omission in %s mode',
+    async (mode) => {
+      const raw = [
+        agentRecord(40610, { ulan_id: 500115588 }),
+        ...[null, undefined, '500115588', 1.5, -1, 0, Number.MAX_SAFE_INTEGER + 1].map(
+          (ulan_id, index) => agentRecord(index + 1, { ulan_id }),
+        ),
+      ];
+      const { service, fetch } = createTestService(
+        scriptedFetch(jsonResponder(searchEnvelope(raw))),
+      );
+      const result =
+        mode === 'query'
+          ? await service.searchAgents(
+              { query: 'artist', artists_only: true, page: 1, limit: 10 },
+              ctx,
+            )
+          : await service.getAgents(
+              raw.map((record) => record.id as number),
+              ctx,
+            );
+      const fields =
+        mode === 'query'
+          ? searchBodyOf(urlOfCall(fetch)).fields
+          : queryParam(urlOfCall(fetch), 'fields');
+      expect(String(fields).split(',')).toContain('ulan_id');
+      expect(result.agents.map((agent) => agent.id)).toEqual(raw.map((record) => record.id));
+      expect(result.agents[0]).toHaveProperty('ulan_id', 500115588);
+      expect(result.agents.slice(1).every((agent) => !('ulan_id' in agent))).toBe(true);
+    },
+  );
+
   describe('searchAgents', () => {
     const run = async (
       params: Partial<
@@ -2131,7 +2236,7 @@ describe('AicService agents', () => {
         },
       });
       expect(body.fields).toBe(
-        'id,title,sort_title,alt_titles,is_artist,agent_type_title,birth_date,death_date,description',
+        'id,title,sort_title,alt_titles,is_artist,agent_type_title,birth_date,death_date,description,ulan_id',
       );
     });
 
@@ -2360,6 +2465,30 @@ describe('AicService.searchExhibitions', () => {
       { range: { aic_end_at: { lt: 'now' } } },
       { range: { aic_end_at: { gte: '2010-01-01' } } },
     ]);
+  });
+
+  it('ANDs exact exhibition relationship filters with text and date overlap', async () => {
+    const { body } = await run({
+      artwork_id: 16568,
+      artist_id: 35809,
+      query: 'Monet',
+      when: 'past',
+      date_from: '2020-01-01',
+      date_to: '2020-12-31',
+      sort: 'relevance',
+    });
+    expect(filterOf(body)).toEqual([
+      { range: { aic_end_at: { lt: 'now' } } },
+      { range: { aic_end_at: { gte: '2020-01-01' } } },
+      { range: { aic_start_at: { lte: '2020-12-31' } } },
+      { term: { artwork_ids: 16568 } },
+      { term: { artist_ids: 35809 } },
+    ]);
+    expect(body.query).toMatchObject({
+      bool: { must: [{ simple_query_string: { query: 'Monet', default_operator: 'and' } }] },
+    });
+    expect(body.q).toBe('Monet');
+    expect(body).not.toHaveProperty('sort');
   });
 
   it('ranks by relevance with q and a must clause when a query is given and sort is relevance', async () => {

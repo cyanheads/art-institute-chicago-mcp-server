@@ -10,8 +10,8 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getAicService } from '@/services/aic/aic-service.js';
 import {
   blankAsUnset,
+  idListInput,
   inlineSafe,
-  listInput,
   numericIdItem,
   pageInfo,
   quoteBlock,
@@ -29,6 +29,14 @@ const STATS_DEGRADED =
 const ArtistSchema = z
   .object({
     id: z.number().describe('Agent id; pass as artist_id to artic_search_artworks.'),
+    ulan_id: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        'Getty ULAN authority identifier when recorded; sparse coverage. Distinct from the museum agent id used in other tools.',
+      ),
     name: z
       .string()
       .describe('Name as the museum catalogues it; empty when the museum lists none.'),
@@ -83,6 +91,7 @@ type Artist = z.infer<typeof ArtistSchema>;
 function artistLines(artist: Artist): string[] {
   const name = artist.name === '' ? '(name not recorded)' : inlineSafe(artist.name);
   const lines = [`## ${name} (id ${artist.id})`];
+  if (artist.ulan_id !== undefined) lines.push(`- **Getty ULAN:** ${artist.ulan_id}`);
   if (artist.sort_name) lines.push(`- **Sort name:** ${inlineSafe(artist.sort_name)}`);
   const kind = [`**Artist:** ${yesNo(artist.is_artist)}`];
   if (artist.agent_type) kind.push(`**Agent type:** ${inlineSafe(artist.agent_type)}`);
@@ -117,10 +126,11 @@ export const searchArtists = tool('artic_search_artists', {
     query: blankAsUnset(z.string().trim().max(120).optional()).describe(
       'Name to find, matched against names and alternate names; every word must match. Pass query or ids, not both.',
     ),
-    ids: blankAsUnset(
-      listInput(z.array(z.number().int().positive()).max(25).optional(), 25, numericIdItem),
+    ids: idListInput(
+      z.array(z.number().int().positive()).max(1000).optional(),
+      numericIdItem,
     ).describe(
-      "Agent ids to fetch (up to 25), such as an artwork's artist_id, as an array or a comma-separated string. Pass query or ids, not both; the other filters and page apply to query only.",
+      'Agent ids as an array or comma-separated string, up to 1,000 supplied entries including blanks and duplicates. Comma strings also have a 100,000-character ceiling. Blanks and duplicates are dropped; fetches the first 25 and returns deferred_ids. Pass query or ids, not both; other filters and page apply to query only.',
     ),
     artists_only: blankAsUnset(z.boolean().default(true)).describe(
       'Query mode: only agents the museum records as artists. Set false to include donors, funds, and organizations.',
@@ -131,11 +141,11 @@ export const searchArtists = tool('artic_search_artists', {
     born_to: blankAsUnset(z.number().int().min(YEAR_MIN).max(YEAR_MAX).optional()).describe(
       'Query mode: latest birth year, negative for BCE.',
     ),
-    page: blankAsUnset(z.number().int().min(1).max(100).default(1)).describe(
-      'Query mode: page to return (1-based); page times limit may not exceed 1,000.',
+    page: blankAsUnset(z.number().int().min(1).max(1000).default(1)).describe(
+      'Query mode: page to return (1-based); page times the applied limit may not exceed 1,000.',
     ),
-    limit: blankAsUnset(z.number().int().min(1).max(25).default(10)).describe(
-      'Query mode: agents per page (1-25).',
+    limit: blankAsUnset(z.number().int().min(1).max(1000).default(10)).describe(
+      'Query mode: requested agents per page (1-1,000); at most 25 are returned.',
     ),
   }),
   output: z.object({
@@ -145,9 +155,21 @@ export const searchArtists = tool('artic_search_artists', {
     missing_ids: z
       .array(z.number())
       .optional()
-      .describe('Requested ids with no agent, in request order; present when ids were passed.'),
+      .describe(
+        'Attempted ids with no agent, in request order; present in ids mode. Deferred ids have not been checked.',
+      ),
     page: z.number().describe('Page returned (1-based); always 1 when ids were passed.'),
-    has_more: z.boolean().describe('True when more matches exist beyond this page.'),
+    deferred_ids: z
+      .array(z.number())
+      .optional()
+      .describe(
+        'Unattempted ids beyond the first 25, in request order; pass them as ids to artic_search_artists again. Present in ids mode.',
+      ),
+    has_more: z
+      .boolean()
+      .describe(
+        'True when more query matches exist beyond this page, or ids mode has deferred ids.',
+      ),
     next_page: z
       .number()
       .optional()
@@ -164,10 +186,18 @@ export const searchArtists = tool('artic_search_artists', {
   enrichment: {
     totalCount: z
       .number()
-      .describe('Matches for the query and filters before paging, or agents found for ids.'),
-    truncated: z.boolean().describe('True when more matches exist beyond this page.'),
+      .describe(
+        'Matches for the query and filters before paging, or agents found among attempted ids.',
+      ),
+    truncated: z
+      .boolean()
+      .describe(
+        'True when more query matches exist beyond this page, or ids mode has deferred ids.',
+      ),
     shown: z.number().describe('Agents returned on this page.'),
-    cap: z.number().describe('The limit applied to this page, or the number of ids requested.'),
+    cap: z
+      .number()
+      .describe('The limit applied to this page, or the number of ids attempted (up to 25).'),
     notice: z
       .string()
       .optional()
@@ -205,7 +235,7 @@ export const searchArtists = tool('artic_search_artists', {
     {
       reason: 'page_beyond_window',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'page times limit exceeds 1,000, past the reachable search window.',
+      when: 'page times the applied limit exceeds 1,000, past the reachable search window.',
       retryable: false,
       severity: 'notice',
       recovery:
@@ -241,8 +271,14 @@ export const searchArtists = tool('artic_search_artists', {
   ],
 
   async handler(input, ctx) {
+    const requestedLimit = input.limit;
+    input = { ...input, limit: Math.min(input.limit, 25) };
     ctx.enrich.total(0);
-    ctx.enrich({ truncated: false, shown: 0, cap: input.ids?.length || input.limit });
+    ctx.enrich({
+      truncated: false,
+      shown: 0,
+      cap: input.ids?.length ? Math.min(input.ids.length, 25) : input.limit,
+    });
 
     const { query } = input;
     const ids = input.ids?.length ? input.ids : undefined;
@@ -251,14 +287,16 @@ export const searchArtists = tool('artic_search_artists', {
     }
 
     if (ids) {
-      const batch = await getAicService().getAgents(ids, ctx);
+      const attemptedIds = ids.slice(0, 25);
+      const deferredIds = ids.slice(25);
+      const batch = await getAicService().getAgents(attemptedIds, ctx);
       const { artists, degraded } = await attachWorkStats(batch.agents, ctx);
       ctx.enrich.total(artists.length);
       ctx.enrich({ shown: artists.length });
       const fragments: string[] = [];
       if (artists.length === 0) {
         fragments.push(
-          "None of these ids is an agent. Find ids with artic_search_artists query, or take an artwork's artist_id.",
+          "None of the attempted ids is an agent. Find ids with artic_search_artists query, or take an artwork's artist_id.",
         );
       } else if (batch.missing_ids.length > 0) {
         fragments.push(
@@ -266,12 +304,23 @@ export const searchArtists = tool('artic_search_artists', {
         );
       }
       if (degraded) fragments.push(STATS_DEGRADED);
+      if (deferredIds.length > 0) {
+        fragments.push(
+          'The first 25 ids were attempted; call artic_search_artists again with deferred_ids as ids for the rest.',
+        );
+        ctx.enrich.truncated({
+          shown: artists.length,
+          cap: attemptedIds.length,
+          guidance: fragments.join(' '),
+        });
+      }
       if (fragments.length > 0) ctx.enrich.notice(fragments.join(' '));
       return {
         artists,
         missing_ids: batch.missing_ids,
+        deferred_ids: deferredIds,
         page: 1,
-        has_more: false,
+        has_more: deferredIds.length > 0,
         artists_only_applied: false,
         license_text: batch.license_text,
       };
@@ -315,6 +364,10 @@ export const searchArtists = tool('artic_search_artists', {
     ctx.enrich({ shown });
 
     const fragments: string[] = [];
+    if (requestedLimit > input.limit)
+      fragments.push(
+        `Applied limit ${input.limit} to requested limit ${requestedLimit}; keep the same requested limit on subsequent pages.`,
+      );
     if (result.total === 0) {
       fragments.push('No agents matched.', 'All name words must match; try the surname alone.');
       if (input.artists_only) {
@@ -366,6 +419,10 @@ export const searchArtists = tool('artic_search_artists', {
         `**Missing ids:** ${result.missing_ids.length > 0 ? result.missing_ids.join(', ') : 'none'}`,
       );
     }
+    if (result.deferred_ids)
+      lines.push(
+        `**Deferred ids:** ${result.deferred_ids.length > 0 ? result.deferred_ids.join(', ') : 'none'}`,
+      );
     lines.push('', '## License', quoteBlock(result.license_text));
     return [{ type: 'text', text: lines.join('\n') }];
   },

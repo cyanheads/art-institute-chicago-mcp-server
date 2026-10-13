@@ -62,6 +62,7 @@ import type {
   FacetName,
   RawAgent,
   RawAggregation,
+  RawArtistFacetHit,
   RawArtwork,
   RawEnvelope,
   RawExhibition,
@@ -154,7 +155,7 @@ const SECTION_FIELDS: Record<ArtworkSection, readonly string[]> = {
 };
 
 const AGENT_FIELDS =
-  'id,title,sort_title,alt_titles,is_artist,agent_type_title,birth_date,death_date,description';
+  'id,title,sort_title,alt_titles,is_artist,agent_type_title,birth_date,death_date,description,ulan_id';
 
 const EXHIBITION_FIELDS =
   'id,title,status,aic_start_at,aic_end_at,gallery_id,gallery_title,short_description,web_url,image_id,image_url,artwork_ids,artwork_titles,artist_ids,is_featured';
@@ -268,6 +269,8 @@ export type ExhibitionWhen = 'any' | 'current' | 'upcoming' | 'past';
 export type ExhibitionSort = 'relevance' | 'start_desc' | 'start_asc';
 
 export interface ExhibitionSearchParams {
+  artist_id?: number | undefined;
+  artwork_id?: number | undefined;
   date_from?: string | undefined;
   date_to?: string | undefined;
   limit: number;
@@ -535,6 +538,8 @@ export class AicService {
     const filter: unknown[] = [...whenFilters(params.when)];
     if (params.date_from) filter.push({ range: { aic_end_at: { gte: params.date_from } } });
     if (params.date_to) filter.push({ range: { aic_start_at: { lte: params.date_to } } });
+    if (params.artwork_id !== undefined) filter.push({ term: { artwork_ids: params.artwork_id } });
+    if (params.artist_id !== undefined) filter.push({ term: { artist_ids: params.artist_id } });
     const sortApplied: ExhibitionSort = relevance
       ? 'relevance'
       : params.sort === 'start_asc'
@@ -973,8 +978,8 @@ function facetAggregations(facets: readonly FacetName[]): Record<string, unknown
       name,
       name === 'artist'
         ? {
-            terms: { field: 'artist_id', size: FACET_SIZE },
-            aggs: { label: { top_hits: { size: 1, _source: ['artist_title'] } } },
+            terms: { field: 'artist_ids', size: FACET_SIZE },
+            aggs: { label: { top_hits: { size: 1, _source: ['artist_ids', 'artist_titles'] } } },
           }
         : { terms: { field: VOCABULARY_FIELDS[name], size: FACET_SIZE } },
     ]),
@@ -1077,8 +1082,8 @@ function toArtworkDetail(raw: RawArtwork, iiifUrl: string): ArtworkDetail {
       description: htmlField(raw.description),
       short_description: htmlField(raw.short_description),
       provenance: nonEmpty(raw.provenance_text),
-      exhibition_history: nonEmpty(raw.exhibition_history),
-      publication_history: nonEmpty(raw.publication_history),
+      exhibition_history: htmlField(raw.exhibition_history),
+      publication_history: htmlField(raw.publication_history),
       catalogue: htmlField(raw.catalogue_display),
     }),
     main_reference_number: nonEmpty(raw.main_reference_number) ?? '',
@@ -1112,6 +1117,10 @@ function toAgent(raw: RawAgent): Agent {
       birth_year: plausibleYear(raw.birth_date),
       death_year: plausibleYear(raw.death_date),
       biography: htmlField(raw.description),
+      ulan_id:
+        typeof raw.ulan_id === 'number' && Number.isSafeInteger(raw.ulan_id) && raw.ulan_id > 0
+          ? raw.ulan_id
+          : undefined,
     }),
     alt_names: stringList(raw.alt_titles),
     is_artist: raw.is_artist === true,
@@ -1176,8 +1185,15 @@ function parseFacets(
     const buckets = aggregations?.[name]?.buckets ?? [];
     if (name === 'artist') {
       out.artist = buckets.map((bucket) => {
-        const label = (bucket.label as RawTopHits<{ artist_title?: string | null }> | undefined)
-          ?.hits?.hits?.[0]?._source?.artist_title;
+        const source = (bucket.label as RawTopHits<RawArtistFacetHit> | undefined)?.hits?.hits?.[0]
+          ?._source;
+        const ids = source?.artist_ids;
+        const titles = source?.artist_titles;
+        const index = Array.isArray(ids) ? ids.indexOf(Number(bucket.key)) : -1;
+        const label =
+          Array.isArray(ids) && Array.isArray(titles) && ids.length === titles.length && index >= 0
+            ? titles[index]
+            : undefined;
         return {
           artist_id: Number(bucket.key),
           count: bucket.doc_count,

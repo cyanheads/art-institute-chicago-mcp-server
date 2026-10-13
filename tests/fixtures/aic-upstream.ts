@@ -292,7 +292,18 @@ export function longestFacetAggregations(): Record<string, unknown> {
     artist: buckets((index) => ({
       key: 100_001 + index,
       doc_count: 133_118,
-      label: { hits: { hits: [{ _source: { artist_title: filler(LONGEST_ARTIST_NAME) } }] } },
+      label: {
+        hits: {
+          hits: [
+            {
+              _source: {
+                artist_ids: [100_001 + index],
+                artist_titles: [filler(LONGEST_ARTIST_NAME)],
+              },
+            },
+          ],
+        },
+      },
     })),
   };
 }

@@ -106,7 +106,7 @@ describe('artic_search_audio_guide request', () => {
         },
       },
       page: 1,
-      limit: 5,
+      limit: 2,
       fields: FIELDS,
     });
   });
@@ -121,9 +121,9 @@ describe('artic_search_audio_guide request', () => {
   });
 
   it('passes page and limit upstream', async () => {
-    const fetchFake = serve(envelopeOf(rows(3, 41), 100));
+    const fetchFake = serve(envelopeOf(rows(2, 5), 100));
     await listen({ query: 'a', page: 3, limit: 20 });
-    expect(bodyOf(fetchFake)).toMatchObject({ page: 3, limit: 20 });
+    expect(bodyOf(fetchFake)).toMatchObject({ page: 3, limit: 2 });
   });
 
   it('keeps query operators and punctuation as typed in the must clause, and ranks without the quotes', async () => {
@@ -144,7 +144,7 @@ describe('artic_search_audio_guide request', () => {
         },
       },
       page: 1,
-      limit: 5,
+      limit: 2,
       fields: FIELDS,
     });
   });
@@ -157,7 +157,7 @@ describe('artic_search_audio_guide request', () => {
         bool: { must: [{ simple_query_string: { query: '1884', default_operator: 'and' } }] },
       },
       page: 1,
-      limit: 5,
+      limit: 2,
       fields: FIELDS,
     });
   });
@@ -173,10 +173,10 @@ describe('artic_search_audio_guide input validation', () => {
     ['an object query', { query: { text: 'a' } }, 'query'],
     ['a query over 200 characters', { query: 'x'.repeat(201) }, 'query'],
     ['page 0', { query: 'a', page: 0 }, 'page'],
-    ['page 201', { query: 'a', page: 201 }, 'page'],
+    ['page 1001', { query: 'a', page: 1001 }, 'page'],
     ['a fractional page', { query: 'a', page: 1.5 }, 'page'],
     ['limit 0', { query: 'a', limit: 0 }, 'limit'],
-    ['limit 21', { query: 'a', limit: 21 }, 'limit'],
+    ['limit 1001', { query: 'a', limit: 1001 }, 'limit'],
   ])('rejects %s without calling upstream', async (_name, input, field) => {
     const fetchFake = emptyResults();
     const error = errorOf(await listen(input));
@@ -189,8 +189,8 @@ describe('artic_search_audio_guide input validation', () => {
   it.each([
     ['a query of exactly 200 characters', { query: 'x'.repeat(200) }],
     ['limit 20', { query: 'a', limit: 20 }],
-    ['page 50 at limit 20, which ends on match 1,000', { query: 'a', page: 50, limit: 20 }],
-    ['page 200 at limit 5, which ends on match 1,000', { query: 'a', page: 200, limit: 5 }],
+    ['page 500 at limit 20, applied as two stops', { query: 'a', page: 500, limit: 20 }],
+    ['page 1000 at limit 1, which ends on match 1,000', { query: 'a', page: 1000, limit: 1 }],
   ])('accepts %s', async (_name, input) => {
     emptyResults();
     expect((await listen(input)).isError).toBeUndefined();
@@ -203,7 +203,7 @@ describe('artic_search_audio_guide input validation', () => {
     const fetchFake = emptyResults();
     const result = await listen({ query: 'a', ...extra });
     expect(result.isError).toBeUndefined();
-    expect(bodyOf(fetchFake)).toMatchObject({ page: 1, limit: 5 });
+    expect(bodyOf(fetchFake)).toMatchObject({ page: 1, limit: 2 });
   });
 });
 
@@ -211,9 +211,9 @@ describe('artic_search_audio_guide input validation', () => {
 
 describe('artic_search_audio_guide window guard', () => {
   it.each([
-    ['page 51 at limit 20', { page: 51, limit: 20 }],
-    ['page 101 at limit 10', { page: 101, limit: 10 }],
-    ['page 200 at limit 6', { page: 200, limit: 6 }],
+    ['page 501 at limit 20', { page: 501, limit: 20 }],
+    ['page 501 at limit 10', { page: 501, limit: 10 }],
+    ['page 1000 at limit 6', { page: 1000, limit: 6 }],
   ])('fails page_beyond_window for %s before any upstream call', async (_name, paging) => {
     const fetchFake = emptyResults();
     const result = await listen({ query: 'a', ...paging });
@@ -226,12 +226,12 @@ describe('artic_search_audio_guide window guard', () => {
   });
 
   it('serves the last reachable page, where page times limit equals 1,000', async () => {
-    const fetchFake = serve(envelopeOf(rows(20, 981), 5000));
-    const out = structuredOf<AudioRun>(await listen({ query: 'a', page: 50, limit: 20 }));
-    expect(out).toMatchObject({ page: 50, has_more: true, truncated: true, shown: 20 });
+    const fetchFake = serve(envelopeOf(rows(2, 999), 5000));
+    const out = structuredOf<AudioRun>(await listen({ query: 'a', page: 500, limit: 2 }));
+    expect(out).toMatchObject({ page: 500, has_more: true, truncated: true, shown: 2 });
     expect(out).not.toHaveProperty('next_page');
     expect(out.notice).toBe(WINDOW_NOTICE);
-    expect(bodyOf(fetchFake)).toMatchObject({ page: 50, limit: 20 });
+    expect(bodyOf(fetchFake)).toMatchObject({ page: 500, limit: 2 });
   });
 
   it.each([
@@ -264,60 +264,60 @@ describe('artic_search_audio_guide paging and enrichment', () => {
       totalCount: 0,
       truncated: false,
       shown: 0,
-      cap: 5,
+      cap: 2,
       notice: ZERO_HIT_NOTICE,
     });
   });
 
-  it('reports the caller limit as the cap on the zero-result page', async () => {
+  it('reports the applied limit as the cap on the zero-result page', async () => {
     emptyResults();
     const out = structuredOf<AudioRun>(await listen({ query: 'nothing', limit: 17 }));
-    expect(out).toMatchObject({ cap: 17, shown: 0, totalCount: 0 });
+    expect(out).toMatchObject({ cap: 2, shown: 0, totalCount: 0 });
   });
 
   it('returns the under-cap page with the total, no next page, and no notice', async () => {
-    serve(envelopeOf(rows(3), 3));
+    serve(envelopeOf(rows(1), 1));
     const out = structuredOf<AudioRun>(await listen());
     expect(out).toMatchObject({
       page: 1,
       has_more: false,
-      totalCount: 3,
+      totalCount: 1,
       truncated: false,
-      shown: 3,
-      cap: 5,
+      shown: 1,
+      cap: 2,
       license_text: MOBILE_SOUND_LICENSE,
       source_citation: SOURCE_CITATION,
     });
-    expect(out.stops.map((stop) => stop.id)).toEqual([1, 2, 3]);
+    expect(out.stops.map((stop) => stop.id)).toEqual([1]);
     expect(out).not.toHaveProperty('next_page');
     expect(out).not.toHaveProperty('notice');
   });
 
   it('points at the next page when matches remain inside the window', async () => {
-    serve(envelopeOf(rows(5), 12));
+    serve(envelopeOf(rows(2), 12));
     const out = structuredOf<AudioRun>(await listen());
     expect(out).toMatchObject({
       has_more: true,
       next_page: 2,
       totalCount: 12,
       truncated: true,
-      shown: 5,
-      cap: 5,
+      shown: 2,
+      cap: 2,
       notice: 'More matches: call again with page 2.',
     });
   });
 
   it('ends on the last partial page', async () => {
-    serve(envelopeOf(rows(2, 11), 12));
-    const out = structuredOf<AudioRun>(await listen({ query: 'a', page: 3 }));
-    expect(out).toMatchObject({ page: 3, has_more: false, truncated: false, shown: 2 });
+    serve(envelopeOf(rows(1, 11), 11));
+    const out = structuredOf<AudioRun>(await listen({ query: 'a', page: 6 }));
+    expect(out).toMatchObject({ page: 6, has_more: false, truncated: false, shown: 1 });
     expect(out).not.toHaveProperty('next_page');
     expect(out).not.toHaveProperty('notice');
   });
 
   it('has no more when the page ends exactly on the total', async () => {
-    serve(envelopeOf(rows(5, 6), 10));
-    const out = structuredOf<AudioRun>(await listen({ query: 'a', page: 2 }));
+    serve(envelopeOf(rows(2, 9), 10));
+    const out = structuredOf<AudioRun>(await listen({ query: 'a', page: 5 }));
     expect(out.has_more).toBe(false);
     expect(out).not.toHaveProperty('next_page');
   });
@@ -329,10 +329,10 @@ describe('artic_search_audio_guide paging and enrichment', () => {
     expect(out.notice).toBe('Page 9 is past the last match (12 total); request a lower page.');
   });
 
-  it('offers page 50 at limit 20 because it still ends inside the window', async () => {
-    serve(envelopeOf(rows(20, 961), 5000));
-    const out = structuredOf<AudioRun>(await listen({ query: 'a', page: 49, limit: 20 }));
-    expect(out).toMatchObject({ has_more: true, next_page: 50 });
+  it('offers page 500 at requested limit 20 because the applied size still fits the window', async () => {
+    serve(envelopeOf(rows(2, 997), 5000));
+    const out = structuredOf<AudioRun>(await listen({ query: 'a', page: 499, limit: 20 }));
+    expect(out).toMatchObject({ has_more: true, next_page: 500 });
   });
 
   it('skips upstream rows with no integer id and counts only what it returns', async () => {

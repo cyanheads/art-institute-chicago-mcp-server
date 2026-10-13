@@ -31,6 +31,12 @@ export interface RawTopHits<S> {
   hits?: { hits?: { _source?: S }[] };
 }
 
+/** Parallel raw credit arrays; validate only after finding the bucket's source index. */
+export interface RawArtistFacetHit {
+  artist_ids?: unknown;
+  artist_titles?: unknown;
+}
+
 export interface RawThumbnail {
   alt_text?: string | null;
   height?: number | null;
@@ -98,6 +104,7 @@ export interface RawAgent {
   is_artist?: boolean | null;
   sort_title?: string | null;
   title?: string | null;
+  ulan_id?: number | null;
 }
 
 export interface RawExhibition {
@@ -250,6 +257,7 @@ export interface Agent {
   is_artist: boolean;
   name: string;
   sort_name?: string;
+  ulan_id?: number;
 }
 
 export interface SampleWork {

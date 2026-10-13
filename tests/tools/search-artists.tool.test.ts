@@ -65,7 +65,7 @@ const AGENTS = '/agents';
 const ARTWORKS_SEARCH = '/artworks/search';
 
 const AGENT_FIELDS =
-  'id,title,sort_title,alt_titles,is_artist,agent_type_title,birth_date,death_date,description';
+  'id,title,sort_title,alt_titles,is_artist,agent_type_title,birth_date,death_date,description,ulan_id';
 
 const STATS_DEGRADED =
   "Artwork counts could not be loaded; pass an id as artist_id to artic_search_artworks to count and list that agent's works.";
@@ -208,7 +208,7 @@ describe('artic_search_artists mode guards', () => {
 describe('artic_search_artists input validation', () => {
   it.each([
     ['a query over 120 characters', { query: 'x'.repeat(121) }, 'query'],
-    ['more than 25 ids', { ids: Array.from({ length: 26 }, (_, i) => i + 1) }, 'ids'],
+    ['more than 1,000 supplied ids', { ids: Array.from({ length: 1001 }, (_, i) => i + 1) }, 'ids'],
     ['a zero id', { ids: [0] }, 'ids'],
     ['a negative id', { ids: [-3] }, 'ids'],
     ['a fractional id', { ids: [1.5] }, 'ids'],
@@ -218,9 +218,9 @@ describe('artic_search_artists input validation', () => {
     ['born_to below the year floor', { query: 'a', born_to: -8001 }, 'born_to'],
     ['a fractional born_to', { query: 'a', born_to: 1900.5 }, 'born_to'],
     ['page 0', { query: 'a', page: 0 }, 'page'],
-    ['page 101', { query: 'a', page: 101 }, 'page'],
+    ['page 1001', { query: 'a', page: 1001 }, 'page'],
     ['limit 0', { query: 'a', limit: 0 }, 'limit'],
-    ['limit 26', { query: 'a', limit: 26 }, 'limit'],
+    ['limit 1001', { query: 'a', limit: 1001 }, 'limit'],
     ['a fractional limit', { query: 'a', limit: 2.5 }, 'limit'],
     ['a non-boolean artists_only', { query: 'a', artists_only: 'maybe' }, 'artists_only'],
   ])('rejects %s without calling upstream', async (_name, input, field) => {
@@ -232,12 +232,12 @@ describe('artic_search_artists input validation', () => {
     expect(fetchFake).not.toHaveBeenCalled();
   });
 
-  it('cuts an over-long ids list before validation, leaving one bounded issue', async () => {
+  it('rejects a raw ids list above the ceiling with one bounded issue', async () => {
     serve({});
-    const error = errorOf(await find({ ids: Array.from({ length: 80 }, (_, i) => i + 1) }));
+    const error = errorOf(await find({ ids: Array.from({ length: 1001 }, (_, i) => i + 1) }));
     const issues = error.data.issues as { code: string; path: unknown[] }[];
     expect(issues).toHaveLength(1);
-    expect(issues[0]).toMatchObject({ code: 'too_big', path: ['ids'] });
+    expect(issues[0]).toMatchObject({ code: 'custom', path: ['ids'] });
   });
 
   it('accepts exactly 25 ids', async () => {
@@ -731,6 +731,7 @@ describe('artic_search_artists ids mode', () => {
     expect(out).toEqual({
       artists: [],
       missing_ids: [11, 12],
+      deferred_ids: [],
       page: 1,
       has_more: false,
       artists_only_applied: false,
@@ -740,7 +741,7 @@ describe('artic_search_artists ids mode', () => {
       shown: 0,
       cap: 2,
       notice:
-        "None of these ids is an agent. Find ids with artic_search_artists query, or take an artwork's artist_id.",
+        "None of the attempted ids is an agent. Find ids with artic_search_artists query, or take an artwork's artist_id.",
     });
     expect(paths(fetchFake)).toEqual(['/agents']);
   });
@@ -932,6 +933,45 @@ describe('artic_search_artists upstream failures', () => {
 // --- format() ---------------------------------------------------------------------------------------------------
 
 describe('artic_search_artists format', () => {
+  it.each(['query', 'ids'])(
+    'preserves and renders Getty ULAN through stats and degradation in %s mode',
+    async (mode) => {
+      for (const degraded of [false, true]) {
+        const records = [
+          agentRecord(40610, { ulan_id: 500115588 }),
+          agentRecord(35809, { ulan_id: null }),
+        ];
+        const stats = degraded ? textResponder('boom', 500) : statsFor(bucket(40610, 3));
+        const fetchFake =
+          mode === 'query' ? serveSearch(records, 2, stats) : serveIds(records, stats);
+        const result = await find(mode === 'query' ? { query: 'artist' } : { ids: [40610, 35809] });
+        const out = structuredOf<ArtistsRun>(result);
+        expect(out.artists[0]).toHaveProperty('ulan_id', 500115588);
+        expect(out.artists[1]).not.toHaveProperty('ulan_id');
+        expect(textOf(result)).toContain('- **Getty ULAN:** 500115588');
+        expect(textOf(result).match(/Getty ULAN/g)).toHaveLength(1);
+        const fields =
+          mode === 'query'
+            ? bodyTo(fetchFake, AGENTS_SEARCH).fields
+            : queryParam(callTo(fetchFake, AGENTS), 'fields');
+        expect(String(fields).split(',')).toContain('ulan_id');
+        if (degraded) {
+          expect(out.artists[0]).not.toHaveProperty('artwork_count');
+          expect(out.notice).toBe(STATS_DEGRADED);
+        } else expect(out.artists[0]).toHaveProperty('artwork_count', 3);
+      }
+    },
+  );
+  it('keeps sparse authority values absent through degraded stats', async () => {
+    serveIds([agentRecord(35809, { ulan_id: null }), agentRecord(1)], textResponder('boom', 500));
+    const result = await find({ ids: [35809, 1] });
+    expect(structuredOf<ArtistsRun>(result).artists.map((artist) => artist.id)).toEqual([35809, 1]);
+    expect(structuredOf<ArtistsRun>(result).artists.every((artist) => !('ulan_id' in artist))).toBe(
+      true,
+    );
+    expect(textOf(result)).not.toContain('Getty ULAN');
+    expect(structuredOf<ArtistsRun>(result).notice).toBe(STATS_DEGRADED);
+  });
   const unenriched = (result: Awaited<ReturnType<typeof find>>) => {
     const { totalCount, truncated, shown, cap, notice, ...output } =
       structuredOf<ArtistsRun>(result);

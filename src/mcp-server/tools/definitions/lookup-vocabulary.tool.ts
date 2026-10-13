@@ -33,8 +33,8 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
     public_domain_only: blankAsUnset(z.boolean().default(false)).describe(
       'Count only public-domain artworks.',
     ),
-    limit: blankAsUnset(z.number().int().min(1).max(100).default(25)).describe(
-      'Values to return, most common first (1-100).',
+    limit: blankAsUnset(z.number().int().min(1).max(1000).default(25)).describe(
+      'Requested values, most common first (1-1,000); at most 100 are returned. Narrow with contains for more specific values.',
     ),
   }),
   output: z.object({
@@ -97,6 +97,12 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
   ],
 
   async handler(input, ctx) {
+    const requestedLimit = input.limit;
+    input = { ...input, limit: Math.min(input.limit, 100) };
+    const capNotice =
+      requestedLimit > input.limit
+        ? `Applied limit ${input.limit} to requested limit ${requestedLimit}. `
+        : '';
     ctx.enrich({ truncated: false, shown: 0, cap: input.limit });
 
     const result = await getAicService().aggregate(
@@ -118,7 +124,11 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
       ctx.enrich.truncated({
         shown: values.length,
         cap: input.limit,
-        guidance: 'More values exist: raise limit or narrow with contains.',
+        guidance:
+          capNotice +
+          (input.limit === 100
+            ? 'More values exist: narrow with contains.'
+            : 'More values exist: raise limit (up to 100) or narrow with contains.'),
       });
     }
     if (values.length === 0) {
@@ -128,7 +138,9 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
       } else if (input.public_domain_only) {
         notice = `No ${input.vocabulary} values were returned for public-domain works; call artic_lookup_vocabulary again without public_domain_only to count every artwork.`;
       }
-      ctx.enrich.notice(notice);
+      ctx.enrich.notice(capNotice + notice);
+    } else if (result.sum_other_doc_count === 0 && capNotice) {
+      ctx.enrich.notice(capNotice.trim());
     }
 
     return { vocabulary: input.vocabulary, filter_param: input.vocabulary, values };

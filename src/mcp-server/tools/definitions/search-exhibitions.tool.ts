@@ -1,6 +1,6 @@
 /**
  * @fileoverview `artic_search_exhibitions` — searches past, current, and
- * upcoming exhibitions by text and an overlapping date window, with the
+ * upcoming exhibitions by text, recorded artwork/artist relationships, and an overlapping date window, with the
  * artworks shown when the museum lists them.
  * @module mcp-server/tools/definitions/search-exhibitions.tool
  */
@@ -109,9 +109,15 @@ function exhibitionLines(exhibition: Exhibition): string[] {
 export const searchExhibitions = tool('artic_search_exhibitions', {
   title: 'Search exhibitions',
   description:
-    'Search Art Institute of Chicago exhibitions by text and date: what is on now, what is coming, or past shows on a topic. Results carry dates, gallery, summary, web page, and the artworks shown when the museum lists them. Pass artwork ids to artic_get_artworks for full records.',
+    'Search Art Institute of Chicago exhibitions by text, date, artwork_id, or artist_id. Relationship filters cover recorded museum links; an absent link does not prove an artwork or artist never appeared in a show. Results carry dates, gallery, summary, web page, and listed artworks. Pass artwork ids to artic_get_artworks for full records.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
+    artwork_id: blankAsUnset(z.number().int().positive().optional()).describe(
+      'Exact museum artwork id, from artic_search_artworks or artic_get_artworks; matches recorded exhibition relationships. Combined with every other condition using AND.',
+    ),
+    artist_id: blankAsUnset(z.number().int().positive().optional()).describe(
+      'Exact museum agent id, from artic_search_artists or an artwork artist_id; matches recorded exhibition relationships. Combined with every other condition using AND.',
+    ),
     query: blankAsUnset(z.string().trim().max(200).optional()).describe(
       'Text matched against exhibition titles, descriptions, and other fields; every word must match.',
     ),
@@ -127,11 +133,11 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
     sort: blankAsUnset(z.enum(SORTS).optional()).describe(
       'relevance ranks by query text; start_desc and start_asc sort by opening date. Defaults to relevance with a query, else start_desc; relevance without a query sorts as start_desc.',
     ),
-    page: blankAsUnset(z.number().int().min(1).max(40).default(1)).describe(
-      'Page to return (1-based, 1-40); page times limit may not exceed 1,000.',
+    page: blankAsUnset(z.number().int().min(1).max(1000).default(1)).describe(
+      'Page to return (1-based); page times the applied limit may not exceed 1,000.',
     ),
-    limit: blankAsUnset(z.number().int().min(1).max(25).default(10)).describe(
-      'Exhibitions per page (1-25).',
+    limit: blankAsUnset(z.number().int().min(1).max(1000).default(10)).describe(
+      'Requested exhibitions per page (1-1,000); at most 25 are returned.',
     ),
   }),
   output: z.object({
@@ -175,12 +181,11 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
     {
       reason: 'page_beyond_window',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The API refused the page as past the first 1,000 matches (the page and limit bounds keep calls inside it).',
+      when: 'page times the applied limit exceeds 1,000, past the reachable search window.',
       retryable: false,
       severity: 'notice',
       recovery:
-        'Only the first 1,000 matches are reachable. Narrow artic_search_exhibitions with query text, when, or date_from and date_to.',
-      thrownBy: 'service',
+        'Only the first 1,000 matches are reachable. Narrow artic_search_exhibitions with artwork_id, artist_id, query text, when, or date_from and date_to.',
     },
     {
       reason: 'rate_limited',
@@ -206,14 +211,23 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
       when: 'The Art Institute API rejected a request this server built from valid inputs.',
       retryable: false,
       recovery:
-        'Retry artic_search_exhibitions with fewer query words and without date_from and date_to; the server built a query the API rejected.',
+        'Retry artic_search_exhibitions with fewer query words and without date_from, date_to, artwork_id, and artist_id; the server built a query the API rejected.',
       thrownBy: 'service',
     },
   ],
 
   async handler(input, ctx) {
+    const requestedLimit = input.limit;
+    input = { ...input, limit: Math.min(input.limit, 25) };
     ctx.enrich.total(0);
     ctx.enrich({ truncated: false, shown: 0, cap: input.limit });
+
+    if (input.page * input.limit > 1000) {
+      throw ctx.fail(
+        'page_beyond_window',
+        `Page ${input.page} with applied limit ${input.limit} reaches match ${input.page * input.limit}, past the first 1,000.`,
+      );
+    }
 
     if (input.date_from && input.date_to && input.date_from > input.date_to) {
       throw ctx.fail(
@@ -224,6 +238,8 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
 
     const result = await getAicService().searchExhibitions(
       {
+        artwork_id: input.artwork_id,
+        artist_id: input.artist_id,
         query: input.query,
         when: input.when,
         date_from: input.date_from,
@@ -240,8 +256,20 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
     ctx.enrich({ shown });
 
     const fragments: string[] = [];
+    if (requestedLimit > input.limit)
+      fragments.push(
+        `Applied limit ${input.limit} to requested limit ${requestedLimit}; keep the same requested limit on subsequent pages.`,
+      );
     if (result.total === 0) {
       fragments.push('No exhibitions matched.');
+      const relationships: string[] = [];
+      if (input.artwork_id !== undefined) relationships.push(`artwork_id ${input.artwork_id}`);
+      if (input.artist_id !== undefined) relationships.push(`artist_id ${input.artist_id}`);
+      if (relationships.length > 0) {
+        fragments.push(
+          `Applied ${relationships.join(' and ')} to recorded relationships. Remove artwork_id or artist_id to widen the search; absent museum links do not prove an artwork or artist never appeared in an exhibition.`,
+        );
+      }
       if (input.when !== 'any') fragments.push('Set when to "any" to include all dates.');
       if (input.date_from || input.date_to) fragments.push('Widen date_from/date_to.');
       if (input.query) fragments.push('All words must match; try fewer words.');

@@ -173,7 +173,7 @@ describe('artic_get_artworks ids', () => {
     ['zero', [0]],
     ['a negative id', [-4]],
     ['a fractional id', [1.5]],
-    ['more than 10 ids', Array.from({ length: 11 }, (_, i) => i + 1)],
+    ['more than 1,000 supplied ids', Array.from({ length: 1001 }, (_, i) => i + 1)],
   ])('rejects %s without calling upstream', async (_name, ids) => {
     const fetchFake = serve([]);
     const error = errorOf(await get({ ids }));
@@ -197,16 +197,16 @@ describe('artic_get_artworks ids', () => {
   });
 
   it.each([
-    ['an array', Array.from({ length: 60 }, (_, i) => i + 1)],
-    ['a comma string', Array.from({ length: 60 }, (_, i) => i + 1).join(',')],
+    ['an array', Array.from({ length: 1001 }, (_, i) => i + 1)],
+    ['a comma string', Array.from({ length: 1001 }, (_, i) => i + 1).join(',')],
   ])(
-    'cuts an over-long id list from %s before validation, leaving one bounded issue',
+    'rejects a raw id list above the ceiling from %s with one bounded issue',
     async (_name, ids) => {
       serve([]);
       const error = errorOf(await get({ ids }));
       const issues = error.data.issues as { code: string; path: unknown[] }[];
       expect(issues).toHaveLength(1);
-      expect(issues[0]).toMatchObject({ code: 'too_big', path: ['ids'] });
+      expect(issues[0]).toMatchObject({ code: 'custom', path: ['ids'] });
     },
   );
 });
@@ -301,7 +301,7 @@ describe('artic_get_artworks results', () => {
       missing_ids: [11, 12],
       deferred_ids: [],
       license_text: ARTWORK_LICENSE,
-      notice: 'None of these ids exist. Find ids with artic_search_artworks.',
+      notice: 'None of the attempted ids exist. Find ids with artic_search_artworks.',
     });
     expect(paths(fetchFake)).toEqual(['/artworks']);
   });
@@ -451,6 +451,88 @@ describe('artic_get_artworks results', () => {
       provenance: 'Owner A\n\nOwner B',
     });
     expect(out.description_attribution).toBe(DESCRIPTION_ATTRIBUTION);
+  });
+
+  it('keeps plain history paragraphs whole and histories opt-in', async () => {
+    const fetchFake = serve((url) => {
+      const fields = queryParam(url, 'fields')?.split(',') ?? [];
+      const raw = artworkRecord(1, {
+        exhibition_history: 'Show A\n\nShow B',
+        publication_history: 'Book A\n\nBook B',
+      });
+      return Response.json(
+        envelope([Object.fromEntries(Object.entries(raw).filter(([key]) => fields.includes(key)))]),
+      );
+    });
+    const result = await get({
+      ids: [1],
+      sections: ['exhibition_history', 'publication_history'],
+      include_related_media: false,
+    });
+    expect(structuredOf<GetRun>(result).artworks[0]).toMatchObject({
+      exhibition_history: 'Show A\n\nShow B',
+      publication_history: 'Book A\n\nBook B',
+    });
+    expect(textOf(result)).toContain('> Show A\n>\n> Show B');
+    const defaultResult = await get({ ids: [1], include_related_media: false });
+    expect(structuredOf<GetRun>(defaultResult).artworks[0]).not.toHaveProperty(
+      'exhibition_history',
+    );
+    expect(structuredOf<GetRun>(defaultResult).artworks[0]).not.toHaveProperty(
+      'publication_history',
+    );
+    expect(queryParam(urlOfCall(fetchFake, 1), 'fields')).not.toContain('exhibition_history');
+  });
+
+  it('normalizes requested histories, entity case and tables on both surfaces', async () => {
+    serve([
+      artworkRecord(1, {
+        description: '<p>&Eacute;cole &Aacute;ngel &Oslash;</p>',
+        catalogue_display:
+          '<table><tr><th>Year</th><th>Owner</th></tr><tr><td>1890</td><td>Durand-Ruel</td></tr></table>',
+        exhibition_history:
+          '<p>Show <em>A</em>.</p><p>Read <a href="https://x.test/?a=1&amp;b=2"><strong>source</strong></a>.</p>',
+        publication_history: 'Book A\n\nBook B &lt;b&gt; <a href="javascript:alert(1)">bad</a>',
+      }),
+    ]);
+    const result = await get({
+      ids: [1],
+      sections: ['description', 'catalogue', 'exhibition_history', 'publication_history'],
+      include_related_media: false,
+    });
+    expect(structuredOf<GetRun>(result).artworks[0]).toMatchObject({
+      description: 'École Ángel Ø',
+      catalogue: 'Year Owner\n1890 Durand-Ruel',
+      exhibition_history: 'Show A.\n\nRead source (https://x.test/?a=1&b=2).',
+      publication_history: 'Book A\n\nBook B <b> bad',
+    });
+    const text = textOf(result);
+    expect(text).toContain('> École Ángel Ø');
+    expect(text).toContain('> Year Owner\n> 1890 Durand-Ruel');
+    expect(text).toContain('> Show A.\n>\n> Read source (https://x.test/?a=1&b=2).');
+    expect(text).toContain('> Book A\n>\n> Book B \\<b\\> bad');
+    expect(text).not.toContain('javascript:');
+  });
+
+  it('omits unsafe citation destinations on both normalized history surfaces', async () => {
+    serve([
+      artworkRecord(1, {
+        exhibition_history: '<a href="https://x.test/&#x202e;path">Show</a>',
+        publication_history: '<a href="https://x.test/&#1;path">Book</a>',
+      }),
+    ]);
+    const result = await get({
+      ids: [1],
+      sections: ['exhibition_history', 'publication_history'],
+      include_related_media: false,
+    });
+    expect(structuredOf<GetRun>(result).artworks[0]).toMatchObject({
+      exhibition_history: 'Show',
+      publication_history: 'Book',
+    });
+    expect(textOf(result)).toContain('> Show');
+    expect(textOf(result)).toContain('> Book');
+    expect(JSON.stringify(result)).not.toContain('x.test');
   });
 
   it('attributes a record that carries only a short description', async () => {
@@ -897,13 +979,11 @@ describe('artic_get_artworks format', () => {
       `- ${HOSTILE_CONVERTED_RENDERED} (${HOSTILE_INLINE_RENDERED}) · https://www.artic.edu/assets/${soundUuid(1)}`,
     );
 
-    for (const heading of [
-      'Inscriptions',
-      'Provenance',
-      'Exhibition history',
-      'Publication history',
-    ]) {
+    for (const heading of ['Inscriptions', 'Provenance']) {
       expect(text).toContain(`### ${heading}\n> Line one\n> # Injected heading\n>\n> Line three`);
+    }
+    for (const heading of ['Exhibition history', 'Publication history']) {
+      expect(text).toContain(`### ${heading}\n> Line one # Injected heading\n>\n> Line three`);
     }
     expect(text).toContain('> First\n> # Injected description\n> Third');
     expect(text).toContain('> Short\n> # Injected short');

@@ -2,9 +2,9 @@
 
 **Server:** art-institute-chicago-mcp-server
 **Version:** 0.1.2
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.10`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
-**MCP SDK:** `@modelcontextprotocol/server` ^2.1.0
+**MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
 **Zod:** ^4.6.5
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
@@ -17,9 +17,10 @@ The server wraps the Art Institute of Chicago public API (`https://api.artic.edu
 
 - **One service, one host.** `AicService` (`src/services/aic/aic-service.ts`) makes every upstream call: a process-wide pacer (`AIC_REQUESTS_PER_MINUTE`, default 50, under the published 60/min anonymous limit), `withRetry` inside a 20 s deadline per request, an in-process LRU cache keyed by request URL, a 5 MiB body ceiling, and the `AIC-User-Agent` header built from `AIC_CONTACT`. Image URLs are constructed in `aic-text.ts`, never fetched.
 - **Request boundary.** Plain `fetch`, not `fetchWithTimeout`: the API reports paging errors as 403 JSON, search-backend rejections as 400 text, and firewall blocks as a non-JSON 403, and each maps to its own reason (`page_beyond_window`, `upstream_rejected_query`, `request_blocked`). Only a 429 is `rate_limited`. A search whose GET query string would pass 2,048 bytes, the firewall's limit, goes out as `POST <path>` with the same JSON body and is cached under its GET URL; the listing-by-ids routes stay GET.
-- **Search window.** Anonymous callers reach only `offset + limit ≤ 1000`. Every search tool keeps `page × limit` inside it and names the window in its notice.
+- **Search window.** Requested limits reach 1,000; applied caps are artworks 12, artist query/exhibitions 25, audio 2 (default 2), vocabulary 100. Page calculations and upstream calls use the applied cap. Every search checks `page × applied_limit ≤ 1000`; clamping and continuation are disclosed on both surfaces.
 - **Licensing is per surface.** Artwork metadata, agents, exhibitions, vocabulary terms, and `/sounds` assets are CC0; artwork `description` is CC BY 4.0 (`description_attribution`); images are reusable only when `is_public_domain`; audio-guide content is for noncommercial educational and personal use (`license_text` plus `source_citation`). An output that returns licensed text carries its terms.
-- **Upstream text is data.** HTML becomes plain text once, at the service boundary, where upstream URLs also pass `httpUrl()`, the IIIF base `iiifBaseUrl()`, and image ids `iiifImageId()`, so a value that fails is absent. In `format()`, free text goes through `quoteBlock()`, inline slots through `inlineSafe()`, and URLs through `printableUrl()`; `structuredContent` keeps every string as received.
+- **Upstream text is data.** HTML, including requested exhibition/publication histories, becomes plain text once at the service boundary. Preserve blank-line paragraphs, exact entity case, table boundaries, and safe absolute HTTP(S) citations as plain text; decode href entities once and omit unsafe destinations. Upstream URLs also pass `httpUrl()`, the IIIF base `iiifBaseUrl()`, and image ids `iiifImageId()`. In `format()`, free text goes through `quoteBlock()`, inline slots through `inlineSafe()`, and URLs through `printableUrl()`; `structuredContent` keeps normalized strings without rendering escapes.
+- **Relationship and authority ids.** Exhibition `artwork_id`/`artist_id` filters AND exact recorded links with text/date conditions; missing links do not establish historical exclusion. Artist `ulan_id` is an optional Getty authority identifier, never a museum relationship id. Artist facets aggregate every `artist_ids` credit and pair labels by raw source index before validation.
 - **Secondary calls degrade.** When the second request fails in `artic_get_artworks` (related media) or `artic_search_artists` (artwork counts), the primary records return with a notice. Cancellation still rethrows.
 
 ---
@@ -82,7 +83,7 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
     // Every optional input is wrapped: a form client's "" becomes unset, or the default.
     contains: blankAsUnset(z.string().trim().max(60).optional()).describe('Case- and accent-insensitive substring …'),
     public_domain_only: blankAsUnset(z.boolean().default(false)).describe('Count only public-domain artworks.'),
-    limit: blankAsUnset(z.number().int().min(1).max(100).default(25)).describe('Values to return, most common first (1-100).'),
+    limit: blankAsUnset(z.number().int().min(1).max(1000).default(25)).describe('Requested values (1-1,000); at most 100 returned, most common first.'),
   }),
   output: z.object({
     vocabulary: z.enum(VOCABULARY_FILTERS).describe('The vocabulary listed.'),
@@ -108,7 +109,7 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
   ],
 
   async handler(input, ctx) {
-    // Required enrichment fields are written first, before any branch or upstream call.
+    input = { ...input, limit: Math.min(input.limit, 100) }; // Clamp before requests and enrichment.
     ctx.enrich({ truncated: false, shown: 0, cap: input.limit });
     const result = await getAicService().aggregate(
       VOCABULARY_FIELDS[input.vocabulary],
@@ -122,7 +123,7 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
     const values = result.buckets.map((b) => ({ value: b.key, artwork_count: b.doc_count }));
     ctx.enrich({ shown: values.length });
     if (result.sum_other_doc_count > 0) {
-      ctx.enrich.truncated({ shown: values.length, cap: input.limit, guidance: 'More values exist: raise limit or narrow with contains.' });
+      ctx.enrich.truncated({ shown: values.length, cap: input.limit, guidance: input.limit === 100 ? 'More values exist: narrow with contains.' : 'More values exist: raise limit (up to 100) or narrow with contains.' });
     }
     // … zero-value notice
     return { vocabulary: input.vocabulary, filter_param: input.vocabulary, values };
@@ -489,7 +490,7 @@ security: false                            # optional — true ONLY for a source
 
 ## Publishing
 
-**Every release goes through a release PR, straight-through** — `git-wrapup`'s "Release PR mode", mode `straight-through`. One run: `git-wrapup` lands the commit stack on `release/<version>`, pushes it, and opens the PR (title = the release commit subject, body = the changelog entry plus a gates section); `release-and-publish` then fast-forwards `main` locally with `git merge --ff-only`, creates the tag on `main`'s tip, pushes `main` and the tag, deletes the branch, and publishes. A caller's brief may run a given release as `gated` instead — a `release-pr-review` pass on the open PR before `release-and-publish`. **Never merge through the GitHub UI or `gh pr merge`**: squash and rebase-merge are disabled in the repo settings because both rewrite the stack (rebase-merge also strips the SSH signatures), and a merge commit breaks the linear history.
+**Every release goes through a release PR, straight-through** — `git-wrapup`'s "Release PR mode", mode `straight-through`. One run: `git-wrapup` lands the commit stack on `release/<version>`, pushes it, and opens the PR (title = the release commit subject, body = the release digest: theme line, `## Changes`, `## Gates`, changelog link last); `release-and-publish` then fast-forwards `main` locally with `git merge --ff-only`, creates the tag on `main`'s tip, pushes `main` and the tag, deletes the branch, and publishes. A caller's brief may run a given release as `gated` instead — a `release-pr-review` pass on the open PR before `release-and-publish`. **Never merge through the GitHub UI or `gh pr merge`**: squash and rebase-merge are disabled in the repo settings because both rewrite the stack (rebase-merge also strips the SSH signatures), and a merge commit breaks the linear history.
 
 ---
 
@@ -518,7 +519,7 @@ import { getAicService } from '@/services/aic/aic-service.js';
 - [ ] If wrapping external API: normalization and `format()` preserve uncertainty; do not fabricate facts from missing upstream data
 - [ ] If wrapping external API: tests include at least one sparse payload case with omitted upstream fields
 - [ ] Registered in `createApp()` arrays (directly or via barrel exports)
-- [ ] Optional inputs wrapped in `blankAsUnset()`; array inputs go through `listInput()` with a `.max()` cap
+- [ ] Optional inputs use `blankAsUnset()`; ID lists use `idListInput()` with raw ceilings (1,000 entries, 100,000 comma-string characters) before blank dropping and ordered deduplication. Other arrays retain `listInput()` with a `.max()` cap
 - [ ] Upstream strings in `format()` pass through `inlineSafe()` (inline slots), `quoteBlock()` (free text), or `printableUrl()` (URLs); `structuredContent` keeps them as received
 - [ ] Every definition that calls the service declares `rate_limited`, `request_blocked`, and `upstream_rejected_query` (`thrownBy: 'service'`), each `recovery` naming that tool's own levers
 - [ ] Licensed text carries its terms: `license_text` on every artwork, artist, exhibition, and audio-guide result, `description_attribution` with description text, `source_citation` with audio-guide content

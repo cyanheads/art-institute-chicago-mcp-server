@@ -171,7 +171,7 @@ describe('artic_lookup_vocabulary input', () => {
     ['a missing vocabulary', {}, 'vocabulary'],
     ['contains over 60 characters', { vocabulary: 'style', contains: 'x'.repeat(61) }, 'contains'],
     ['limit 0', { vocabulary: 'style', limit: 0 }, 'limit'],
-    ['limit 101', { vocabulary: 'style', limit: 101 }, 'limit'],
+    ['limit 1001', { vocabulary: 'style', limit: 1001 }, 'limit'],
     ['a fractional limit', { vocabulary: 'style', limit: 2.5 }, 'limit'],
   ])('rejects %s as invalid arguments without calling upstream', async (_name, input, field) => {
     const fetchFake = installAicService(scriptedFetch(jsonResponder(aggregationEnvelope('v', []))));
@@ -249,7 +249,7 @@ describe('artic_lookup_vocabulary output and enrichment', () => {
       truncated: true,
       shown: 1,
       cap: 1,
-      notice: 'More values exist: raise limit or narrow with contains.',
+      notice: 'More values exist: raise limit (up to 100) or narrow with contains.',
     });
   });
 

@@ -114,10 +114,10 @@ const SearchInput = z.object({
     'relevance ranks by query text, or by museum popularity without it; date_asc and date_desc sort by start year.',
   ),
   page: blankAsUnset(z.number().int().min(1).max(SEARCH_WINDOW).default(1)).describe(
-    'Page to return (1-based); page times limit may not exceed 1,000.',
+    'Page to return (1-based); page times the applied limit may not exceed 1,000.',
   ),
-  limit: blankAsUnset(z.number().int().min(0).max(LIMIT_MAX).default(10)).describe(
-    `Rows per page (0-${LIMIT_MAX}; capped so a page of long catalog records with every facet stays within common tool-output limits); 0 returns only totalCount and facets.`,
+  limit: blankAsUnset(z.number().int().min(0).max(1000).default(10)).describe(
+    `Requested rows per page (0-1,000); at most ${LIMIT_MAX} are returned. 0 returns only totalCount and facets.`,
   ),
 });
 
@@ -226,7 +226,7 @@ export const searchArtworks = tool('artic_search_artworks', {
     {
       reason: 'page_beyond_window',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'page times limit exceeds 1,000, past the reachable search window.',
+      when: 'page times the applied limit exceeds 1,000, past the reachable search window.',
       retryable: false,
       severity: 'notice',
       recovery:
@@ -271,6 +271,8 @@ export const searchArtworks = tool('artic_search_artworks', {
   ],
 
   async handler(input, ctx) {
+    const requestedLimit = input.limit;
+    input = { ...input, limit: Math.min(input.limit, LIMIT_MAX) };
     ctx.enrich.total(0);
     ctx.enrich({ truncated: false, shown: 0, cap: input.limit });
 
@@ -298,6 +300,10 @@ export const searchArtworks = tool('artic_search_artworks', {
     ctx.enrich({ shown });
 
     const fragments: string[] = [];
+    if (requestedLimit > input.limit)
+      fragments.push(
+        `Applied limit ${input.limit} to requested limit ${requestedLimit}; keep the same requested limit on subsequent pages.`,
+      );
     if (result.total === 0) {
       fragments.push(...zeroHitFragments(input));
     } else if (input.limit === 0) {
