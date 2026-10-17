@@ -29,7 +29,7 @@
 
 ## Overview
 
-The Art Institute of Chicago's collection through the museum's public API: about 133,000 artworks, plus artists, exhibitions, and audio-guide stops. Search artworks by text, filters, and facet counts; read full records with provenance, exhibition history, and rights-aware IIIF image URLs; resolve artists to ids; find exhibitions by topic or date; search audio-guide transcripts. Runs without an API key, as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+The Art Institute of Chicago's collection: about 133,000 artworks, plus artists, exhibitions, and audio-guide stops. Search with filters and facet counts, read full records with provenance and IIIF image URLs, and search audio-guide transcripts. No API key required.
 
 ### Tools
 
@@ -52,7 +52,7 @@ The Art Institute of Chicago's collection through the museum's public API: about
 
 ## Capability reference
 
-Searches and vocabulary lookup accept requested limits through 1,000 and disclose the applied cap: artworks 12, artist query and exhibitions 25, audio guide 2, vocabulary 100. Search pages use the applied size; retain the same requested limit when following `next_page`. Page times applied size must stay within 1,000. At the vocabulary cap, narrow with `contains`.
+Searches and vocabulary lookup accept limits up to 1,000, and the response states the cap actually applied: artworks 12, artist query and exhibitions 25, audio guide 2, vocabulary 100. Keep the same requested limit when following `next_page`; page times applied size must stay within 1,000. At the vocabulary cap, narrow with `contains`.
 
 ### `artic_search_artworks` <sub>tool</sub>
 
@@ -64,17 +64,16 @@ Searches and vocabulary lookup accept requested limits through 1,000 and disclos
 
 ### `artic_get_artworks` <sub>tool</sub>
 
-- `ids` accepts up to 1,000 supplied entries, counting blanks and duplicates; comma strings also have a 100,000-character ceiling. Blanks and duplicates are dropped, and artwork page URLs are read as their id. The first 10 ids are attempted; `sections` picks description and provenance by default, plus exhibition_history, publication_history, and catalogue
-- Records return in request order, with `missing_ids` for attempted ids the museum doesn't have and `deferred_ids` for records held back by the response budget followed by unattempted ids. Pass `deferred_ids` to the same tool again
-- `include_related_media` (default on) loads up to 20 linked lectures and audio stops per call; `description_attribution` appears whenever CC BY description text is returned
-- Requested histories are plain text, preserving paragraphs and safe HTTP(S) citation destinations
+- `ids` takes up to 1,000 entries (comma strings up to 100,000 characters); blanks and duplicates are dropped and artwork page URLs are read as ids. The first 10 are fetched; `sections` chooses from description and provenance (default), exhibition_history, publication_history, and catalogue
+- Records return in request order. `missing_ids` lists ids the museum doesn't have; `deferred_ids` lists records held back by the response budget plus ids not yet tried, to pass to the same tool again
+- `include_related_media` (default on) loads up to 20 linked lectures and audio stops; `description_attribution` appears whenever CC BY description text is returned
 
 ---
 
 ### `artic_search_artists` <sub>tool</sub>
 
-- `query` (all name words must match) or `ids`, not both; ids accepts up to 1,000 supplied entries, counting blanks and duplicates, and comma strings also have a 100,000-character ceiling. The first 25 normalized ids are attempted. Query mode adds `artists_only` (default `true`), `born_from` / `born_to`, and up to 25 agents per page
-- Each agent carries `artwork_count`, up to three `sample_works` (the museum's highlights first), life years, and `alt_names`; ids mode reports attempted `missing_ids` and ordered `deferred_ids` to pass as ids in the next call
+- `query` (all name words must match) or `ids`, not both; ids takes up to 1,000 entries (comma strings up to 100,000 characters) and the first 25 are fetched. Query mode adds `artists_only` (default `true`), `born_from` / `born_to`, and up to 25 agents per page
+- Each agent carries `artwork_count`, up to three `sample_works` (the museum's highlights first), life years, and `alt_names`; ids mode reports `missing_ids` and `deferred_ids` to pass as ids in the next call
 - `ulan_id` is the Getty ULAN identifier when the museum records one; coverage is sparse, and it is distinct from the museum `id` used by other tools
 
 ---
