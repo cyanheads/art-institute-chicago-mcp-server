@@ -1061,7 +1061,7 @@ describe('artic_search_artists format', () => {
     const text = textOf(result);
     const [artist] = structuredOf<ArtistsRun>(result).artists;
 
-    expect(text).toContain('## Name # Injected name \\<x\\> \\[y\\] (id 1)');
+    expect(text).toContain('## Name # Injected name \\<x> \\[y\\] (id 1)');
     expect(text).toContain(`- **Sort name:** ${HOSTILE_INLINE_RENDERED}`);
     expect(text).toContain(`**Agent type:** ${HOSTILE_INLINE_RENDERED}`);
     expect(text).toContain(`- **Other names:** ${HOSTILE_INLINE_RENDERED}; Plain Alias`);
@@ -1071,7 +1071,7 @@ describe('artic_search_artists format', () => {
       '# Agents (1 on this page)',
     ]);
     const biography = text.slice(text.indexOf('### Biography')).split('\n').slice(1, 5);
-    expect(biography).toEqual(['> Line one', '> # Fake heading', '>', '> Line three']);
+    expect(biography).toEqual(['> Line one', '> \\# Fake heading', '>', '> Line three']);
 
     expect(artist?.name).toBe('Name\n# Injected name <x> [y]');
     expect(artist?.sort_name).toBe(HOSTILE_INLINE);
@@ -1087,7 +1087,7 @@ describe('artic_search_artists format', () => {
     const result = await find({ query: 'a' });
     const text = textOf(result);
     const licenseLines = text.slice(text.indexOf('## License')).split('\n').slice(1);
-    expect(licenseLines).toEqual(['> License one', '> # Fake heading', '>', '> License three']);
+    expect(licenseLines).toEqual(['> License one', '> \\# Fake heading', '>', '> License three']);
     expect(structuredOf<ArtistsRun>(result).license_text).toBe(
       'License one\r\n# Fake heading\r\n\r\nLicense three',
     );

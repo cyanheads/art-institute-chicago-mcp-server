@@ -51,6 +51,7 @@ import {
   searchEnvelope,
   sparseArtworkRecord,
 } from '../fixtures/aic-upstream.js';
+import { markdownHtml, markdownText } from '../fixtures/markdown.js';
 
 interface SearchRun {
   artworks: Record<string, unknown>[];
@@ -1158,7 +1159,7 @@ describe('artic_search_artworks format', () => {
     }
     expect(text).toContain('**Gallery:** Gallery 240');
     expect(text).toContain('## License');
-    expect(text).toContain(`> ${out.license_text}`);
+    expect(markdownText(text)).toContain(out.license_text);
     expect(text).toContain('Image (public_domain)');
     expect(text).toContain('Image (in_copyright)');
   });
@@ -1184,9 +1185,9 @@ describe('artic_search_artworks format', () => {
     const result = await search();
     const text = textOf(result);
     expect(text).toContain(
-      `https://www.artic.edu/iiif/a%5B1%5D/${IMAGE_ID}/full/843,/0/default.jpg`,
+      `(<https://www.artic.edu/iiif/a[1]/${IMAGE_ID}/full/843,/0/default.jpg>)`,
     );
-    expect(text).not.toContain('a[1]');
+    expect(markdownHtml(text)).toContain('<img src="https://www.artic.edu/iiif/a%5B1%5D/');
     const [row] = structuredOf<SearchRun>(result).artworks;
     expect(fieldOf<{ url: string }>(row, 'image').url).toContain('a[1]');
   });
@@ -1215,7 +1216,7 @@ describe('artic_search_artworks format', () => {
     const text = textOf(result);
     const [row] = structuredOf<SearchRun>(result).artworks;
 
-    expect(text).toContain('## Study # Injected title \\<x\\> \\[y\\] (id 1)');
+    expect(text).toContain('## Study # Injected title \\<x> \\[y\\] (id 1)');
     expect(text).toContain(`- **Artist:** ${HOSTILE_INLINE_RENDERED} · artist_id 900`);
     expect(text).toContain(`- **Date:** ${HOSTILE_INLINE_RENDERED} · start 1890 · end 1890`);
     expect(text).toContain(`- **Medium:** ${HOSTILE_INLINE_RENDERED}`);
@@ -1230,7 +1231,7 @@ describe('artic_search_artworks format', () => {
     ]);
 
     const licenseLines = text.slice(text.indexOf('## License')).split('\n').slice(1);
-    expect(licenseLines).toEqual(['> License one', '> # Fake heading', '>', '> License three']);
+    expect(licenseLines).toEqual(['> License one', '> \\# Fake heading', '>', '> License three']);
 
     expect(row?.title).toBe('Study\n# Injected title <x> [y]');
     expect(row?.artist_display).toBe(HOSTILE_INLINE);

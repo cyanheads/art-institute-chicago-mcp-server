@@ -40,6 +40,7 @@ import {
   IMAGE_ID,
   searchEnvelope,
 } from '../fixtures/aic-upstream.js';
+import { markdownHtml, markdownText } from '../fixtures/markdown.js';
 
 interface ExhibitionsRun {
   cap: number;
@@ -831,15 +832,15 @@ describe('artic_search_exhibitions format', () => {
       expect(text).toContain(String(exhibition.end));
     }
     expect(text).toContain('**Status:** Confirmed · **Gallery:** Gallery 100 · **Featured:** yes');
-    expect(text).toContain('- **Web:** https://www.artic.edu/exhibitions/7/synthetic');
-    expect(text).toContain('- **Image:** https://images.example.test/show.jpg');
+    expect(markdownText(text)).toContain('Web: https://www.artic.edu/exhibitions/7/synthetic');
+    expect(markdownHtml(text)).toContain('<img src="https://images.example.test/show.jpg"');
     expect(text).toContain('- **Artist ids:** 900, 901');
     expect(text).toContain('- **Artworks listed:** 2');
     expect(text).toContain('  - First Work (id 101)');
     expect(text).toContain('  - Second Work (id 102)');
     expect(text).toContain('### Summary\n> A synthetic show.');
     expect(text).toContain('## License');
-    expect(text).toContain(`> ${out.license_text}`);
+    expect(markdownText(text)).toContain(out.license_text);
   });
 
   it('equals the format() of the structured output', async () => {
@@ -873,7 +874,7 @@ describe('artic_search_exhibitions format', () => {
     const result = await search();
     const text = textOf(result);
     expect(text).toContain('https://www.artic.edu/exhibitions/a%5B1%5D');
-    expect(text).toContain('https://images.example.test/b%5B2%5D.jpg');
+    expect(markdownHtml(text)).toContain('<img src="https://images.example.test/b%5B2%5D.jpg"');
     expect(text).not.toContain('a[1]');
     const [exhibition] = structuredOf<ExhibitionsRun>(result).exhibitions;
     expect(exhibition?.web_url).toBe('https://www.artic.edu/exhibitions/a[1]');
@@ -902,7 +903,7 @@ describe('artic_search_exhibitions format', () => {
     const text = textOf(result);
     const [exhibition] = structuredOf<ExhibitionsRun>(result).exhibitions;
 
-    expect(text).toContain('## Show # Injected title \\<x\\> \\[y\\] (id 1)');
+    expect(text).toContain('## Show # Injected title \\<x> \\[y\\] (id 1)');
     expect(text).toContain(
       `- **Dates:** opens ${HOSTILE_INLINE_RENDERED} · closes ${HOSTILE_INLINE_RENDERED}`,
     );
@@ -915,9 +916,9 @@ describe('artic_search_exhibitions format', () => {
       '# Exhibitions (1 on this page)',
     ]);
     const summary = text.slice(text.indexOf('### Summary')).split('\n').slice(1, 5);
-    expect(summary).toEqual(['> Line one', '> # Fake heading', '>', '> Line three']);
+    expect(summary).toEqual(['> Line one', '> \\# Fake heading', '>', '> Line three']);
     const licenseLines = text.slice(text.indexOf('## License')).split('\n').slice(1);
-    expect(licenseLines).toEqual(['> License one', '> # Fake heading', '>', '> License three']);
+    expect(licenseLines).toEqual(['> License one', '> \\# Fake heading', '>', '> License three']);
 
     expect(exhibition?.title).toBe('Show\n# Injected title <x> [y]');
     expect(exhibition?.status).toBe(HOSTILE_INLINE);

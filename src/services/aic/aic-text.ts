@@ -9,6 +9,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import type { ArtworkImage, ImageRights, RawThumbnail } from './types.js';
 
 // --- Input preprocessing -----------------------------------------------------
@@ -424,51 +425,45 @@ export function htmlToText(html: string): string {
 
 // --- Rendering upstream text in format() -------------------------------------
 
-/** A backslash run, or one of the characters that open link, image, and HTML syntax. */
-const MARKUP = /\\+|[[\]<>]/g;
-
-/**
- * Backslash-escapes `[`, `]`, `<`, and `>`, so link, image, and HTML syntax
- * renders as text. A backslash run directly in front of one is doubled, so it
- * cannot cancel the escape; other backslashes, and `(`, `)`, `!`, and
- * backticks, stay as written.
- */
-function escapeMarkup(text: string): string {
-  return text.replace(MARKUP, (match: string, offset: number) => {
-    if (match[0] !== '\\') return `\\${match}`;
-    return /[[\]<>]/.test(text.charAt(offset + match.length)) ? match + match : match;
-  });
-}
-
 /**
  * Upstream text for an inline markdown slot (heading, bold label, list item):
  * line breaks flattened to spaces, C0/C1 control, bidi control, and invisible
- * characters stripped, and `[ ] < >` backslash-escaped.
+ * characters stripped, then escaped for literal CommonMark rendering.
  */
 export function inlineSafe(text: string): string {
-  return escapeMarkup(text.replace(LINE_BREAKS, ' ').replace(UNSAFE_INLINE, ''));
+  return escapeMarkdownInline(inlineText(text));
+}
+
+/** One line of text with display controls removed, before Markdown rendering. */
+export function inlineText(text: string): string {
+  return text.replace(LINE_BREAKS, ' ').replace(UNSAFE_INLINE, '');
 }
 
 /**
  * Upstream free text as a markdown blockquote: line structure kept, control,
- * bidi, and invisible characters stripped, and `[ ] < >` backslash-escaped.
+ * bidi, and invisible characters stripped, and each line rendered literally.
  */
 export function quoteBlock(text: string): string {
-  return escapeMarkup(text.replace(LINE_BREAKS, '\n').replace(UNSAFE_BLOCK, ''))
+  return text
+    .replace(LINE_BREAKS, '\n')
+    .replace(UNSAFE_BLOCK, '')
     .split('\n')
-    .map((line) => (line === '' ? '>' : `> ${line}`))
+    .map((line) => (line === '' ? '>' : `> ${escapeMarkdownInline(line)}`))
     .join('\n');
 }
 
 /**
- * A URL for printing in an inline markdown slot: brackets, angle brackets,
+ * A Markdown link with a URL label: brackets, angle brackets,
  * quotes, backticks, whitespace, line breaks, and control, bidi, and invisible
  * characters percent-encoded, so an upstream URL cannot break out of its list
  * item or carry markup. Existing percent-escapes are untouched. Parentheses
- * stay: a printed URL never sits inside a markdown link target.
+ * stay: the framework wraps the target in angle brackets.
  */
 export function printableUrl(url: string): string {
-  return url.replace(URL_UNSAFE, (char) => (char === "'" ? '%27' : encodeURIComponent(char)));
+  const target = url.replace(URL_UNSAFE, (char) =>
+    char === "'" ? '%27' : encodeURIComponent(char),
+  );
+  return markdownLink(target, target);
 }
 
 // --- Constructed URLs --------------------------------------------------------

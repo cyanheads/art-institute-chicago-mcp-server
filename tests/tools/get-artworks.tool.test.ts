@@ -56,6 +56,7 @@ import {
   soundUuid,
   sparseArtworkRecord,
 } from '../fixtures/aic-upstream.js';
+import { markdownText } from '../fixtures/markdown.js';
 
 interface GetRun {
   artworks: Record<string, unknown>[];
@@ -510,7 +511,7 @@ describe('artic_get_artworks results', () => {
     expect(text).toContain('> École Ángel Ø');
     expect(text).toContain('> Year Owner\n> 1890 Durand-Ruel');
     expect(text).toContain('> Show A.\n>\n> Read source (https://x.test/?a=1&b=2).');
-    expect(text).toContain('> Book A\n>\n> Book B \\<b\\> bad');
+    expect(text).toContain('> Book A\n>\n> Book B \\<b> bad');
     expect(text).not.toContain('javascript:');
   });
 
@@ -623,7 +624,7 @@ describe('artic_get_artworks response budget', () => {
   );
 
   it('defers records once their wire bytes would pass the budget', async () => {
-    serve([big(1, 20_000), big(2, 20_000), big(3, 20_000)]);
+    serve([big(1, 19_000), big(2, 19_000), big(3, 19_000)]);
     const result = await get({
       ids: [1, 2, 3],
       sections: ['provenance'],
@@ -649,7 +650,7 @@ describe('artic_get_artworks response budget', () => {
   });
 
   it('defers nothing when the records fit', async () => {
-    serve([big(1, 20_000), big(2, 20_000)]);
+    serve([big(1, 19_000), big(2, 19_000)]);
     const out = structuredOf<GetRun>(
       await get({ ids: [1, 2], sections: ['provenance'], include_related_media: false }),
     );
@@ -856,13 +857,15 @@ describe('artic_get_artworks format', () => {
     expect(text).toContain('- **On loan:** On loan from a synthetic lender');
     expect(text).toContain('- **Styles:** Impressionism; Realism');
     expect(text).toContain('- **Classification:** oil on canvas');
-    expect(text).toContain(`display ${IIIF_URL}/${ALT_IMAGE_ID}/full/843,/0/default.jpg`);
+    expect(markdownText(text)).toContain(
+      `display ${IIIF_URL}/${ALT_IMAGE_ID}/full/843,/0/default.jpg`,
+    );
     expect(text).toContain('### Description\n> A description.');
     expect(text).toContain('### Provenance\n> Owner A\n> Owner B');
     expect(text).toContain('**Missing ids:** 3');
     expect(text).toContain('**Deferred ids:** none');
     expect(text).toContain(`**Description attribution:** ${DESCRIPTION_ATTRIBUTION}`);
-    expect(text).toContain(`## License\n> ${ARTWORK_LICENSE}`);
+    expect(markdownText(text)).toContain(ARTWORK_LICENSE);
   });
 
   it('says there are no records when every id is missing', async () => {
@@ -889,7 +892,9 @@ describe('artic_get_artworks format', () => {
     const result = await get({ ids: [1] });
     const text = textOf(result);
     expect(text).toContain('### Related media');
-    expect(text).toContain(`- A stop (sound) · https://www.artic.edu/assets/a%5B1%5D · id ${uuid}`);
+    expect(markdownText(text)).toContain(
+      `A stop (sound) · https://www.artic.edu/assets/a%5B1%5D · id ${uuid}`,
+    );
     expect(text).not.toContain('a[1]');
     const [record] = structuredOf<GetRun>(result).artworks;
     expect(fieldOf<{ url: string }[]>(record, 'related_media')[0]?.url).toBe(
@@ -905,8 +910,8 @@ describe('artic_get_artworks format', () => {
     );
     const result = await get({ ids: [1] });
     const text = textOf(result);
-    expect(text).toContain(
-      '- A (sound) · https://www.artic.edu/assets/x%0A#%20Injected%20url · id uuid # Injected id',
+    expect(markdownText(text)).toContain(
+      'A (sound) · https://www.artic.edu/assets/x%0A#%20Injected%20url · id uuid # Injected id',
     );
     expect(text.split('\n').filter((line) => line.startsWith('# Injected'))).toEqual([]);
     const [record] = structuredOf<GetRun>(result).artworks;
@@ -960,7 +965,7 @@ describe('artic_get_artworks format', () => {
     const text = textOf(result);
     const [record] = structuredOf<GetRun>(result).artworks;
 
-    expect(text).toContain('## Study # Injected title \\<x\\> \\[y\\] (id 1)');
+    expect(text).toContain('## Study # Injected title \\<x> \\[y\\] (id 1)');
     expect(text).toContain(`- **Artist:** ${HOSTILE_INLINE_RENDERED} · artist_id 900`);
     expect(text).toContain(`- **Reference number:** ${HOSTILE_INLINE_RENDERED}`);
     expect(text).toContain(`- **Alternate titles:** ${HOSTILE_CONVERTED_RENDERED}`);
@@ -976,18 +981,18 @@ describe('artic_get_artworks format', () => {
     }
     expect(text).toContain(`- **On loan:** ${HOSTILE_INLINE_RENDERED}`);
     expect(text).toContain(
-      `- ${HOSTILE_CONVERTED_RENDERED} (${HOSTILE_INLINE_RENDERED}) · https://www.artic.edu/assets/${soundUuid(1)}`,
+      `- ${HOSTILE_CONVERTED_RENDERED} (${HOSTILE_INLINE_RENDERED}) · [https://www.artic.edu/assets/${soundUuid(1)}](<https://www.artic.edu/assets/${soundUuid(1)}>)`,
     );
 
     for (const heading of ['Inscriptions', 'Provenance']) {
-      expect(text).toContain(`### ${heading}\n> Line one\n> # Injected heading\n>\n> Line three`);
+      expect(text).toContain(`### ${heading}\n> Line one\n> \\# Injected heading\n>\n> Line three`);
     }
     for (const heading of ['Exhibition history', 'Publication history']) {
       expect(text).toContain(`### ${heading}\n> Line one # Injected heading\n>\n> Line three`);
     }
-    expect(text).toContain('> First\n> # Injected description\n> Third');
-    expect(text).toContain('> Short\n> # Injected short');
-    expect(text).toContain('> Cat\n> # Injected catalogue');
+    expect(text).toContain('> First\n> \\# Injected description\n> Third');
+    expect(text).toContain('> Short\n> \\# Injected short');
+    expect(text).toContain('> Cat\n> \\# Injected catalogue');
 
     expect(hasNoUnsafeCharacters(text)).toBe(true);
     const bareHeadings = text.split('\n').filter((line) => /^#{1,6} (Injected|Fake)/.test(line));
@@ -1012,7 +1017,7 @@ describe('artic_get_artworks format', () => {
     const text = textOf(result);
     const [record] = structuredOf<GetRun>(result).artworks;
 
-    expect(text).toContain('### Description\n> \\<img src=x onerror=alert(1)\\> is shown.');
+    expect(text).toContain('### Description\n> \\<img src=x onerror=alert(1)> is shown.');
     expect(text).toContain(
       '### Provenance\n> See \\[the file\\](https://x.test/f) and !\\[p\\](https://x.test/p.png).',
     );

@@ -194,7 +194,7 @@ describe('bounded oversized reads', () => {
         ...data.flatMap((stop) => [
           '',
           `## ${stop.title} (id ${stop.id})`,
-          `- **Audio:** ${stop.web_url}`,
+          `- **Audio:** [${stop.web_url}](<${stop.web_url}>)`,
           '',
           '### Transcript',
           quotedTranscript,

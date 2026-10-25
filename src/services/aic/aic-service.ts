@@ -36,7 +36,7 @@ import {
   iiifImageId,
   iiifImageUrl,
   iiifInfoUrl,
-  inlineSafe,
+  inlineText,
   integerList,
   manifestUrl,
   nonEmpty,
@@ -825,9 +825,9 @@ function isApiErrorBody(body: unknown): body is { error: string; status: number 
   return isRecord(body) && typeof body.status === 'number' && typeof body.error === 'string';
 }
 
-/** The API's `error` string as an error message quotes it: cut to 100 characters, one line, markup escaped. */
+/** The API's error as raw text: bounded and normalized; the framework owns Markdown escaping. */
 function quotedApiError(error: string): string {
-  return inlineSafe(error.length > 100 ? `${error.slice(0, 100).toWellFormed()}…` : error);
+  return inlineText(error.length > 100 ? `${error.slice(0, 100).toWellFormed()}…` : error);
 }
 
 function retryAfterOf(response: Response): { retryAfter?: number | string } {

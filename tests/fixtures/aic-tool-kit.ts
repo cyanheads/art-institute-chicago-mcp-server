@@ -188,7 +188,7 @@ export const HOSTILE_INLINE =
 
 /** What `inlineSafe(HOSTILE_INLINE)` must render: flattened, escaped, controls stripped. */
 export const HOSTILE_INLINE_RENDERED =
-  'Bad \\[link\\](https://example.test) \\<img src=x\\> end # Injected heading tail';
+  'Bad \\[link\\](https://example.test) \\<img src=x> end # Injected heading tail';
 
 /** Asserts a rendered text carries no raw control or bidi characters and no CR. */
 export function hasNoUnsafeCharacters(text: string): boolean {

@@ -36,6 +36,7 @@ import {
   mobileSoundRecord,
   searchEnvelope,
 } from '../fixtures/aic-upstream.js';
+import { markdownText } from '../fixtures/markdown.js';
 
 interface AudioRun {
   cap: number;
@@ -505,7 +506,7 @@ describe('artic_search_audio_guide format', () => {
     for (const stop of out.stops) {
       expect(text).toContain(`## ${stop.title} (id ${stop.id})`);
     }
-    expect(text).toContain('- **Audio:** https://www.artic.edu/iiif/audio/970%20fixed.mp3');
+    expect(markdownText(text)).toContain('Audio: https://www.artic.edu/iiif/audio/970%20fixed.mp3');
     expect(text).toContain('- **Audio:** no recording URL');
     expect(text).toContain('### Transcript\n> A synthetic transcript.');
     expect(text).toContain('## License');
@@ -561,17 +562,17 @@ describe('artic_search_audio_guide format', () => {
     const text = textOf(result);
     const stops = structuredOf<AudioRun>(result).stops;
 
-    expect(text).toContain('## Stop # Injected title \\<x\\> \\[y\\] (id 1)');
+    expect(text).toContain('## Stop # Injected title \\<x> \\[y\\] (id 1)');
     expect(text).toContain(`## ${HOSTILE_CONVERTED_RENDERED} (id 2)`);
     expect(hasNoUnsafeCharacters(text)).toBe(true);
     expect(text.split('\n').filter((line) => line.startsWith('# '))).toEqual([
       '# Audio-guide stops (2 on this page)',
     ]);
     const transcript = text.slice(text.indexOf('### Transcript')).split('\n').slice(1, 5);
-    expect(transcript).toEqual(['> Line one', '> # Fake heading', '>', '> Line three']);
+    expect(transcript).toEqual(['> Line one', '> \\# Fake heading', '>', '> Line three']);
     const licenseStart = text.indexOf('## License');
     const licenseLines = text.slice(licenseStart).split('\n').slice(1, 5);
-    expect(licenseLines).toEqual(['> License one', '> # Fake heading', '>', '> License three']);
+    expect(licenseLines).toEqual(['> License one', '> \\# Fake heading', '>', '> License three']);
 
     expect(stops[0]?.title).toBe('Stop\n# Injected title <x> [y]');
     expect(structuredOf<AudioRun>(result).license_text).toBe(

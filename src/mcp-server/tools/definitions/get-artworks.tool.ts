@@ -7,6 +7,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { markdownImage } from '@cyanheads/mcp-ts-core/utils';
 import {
   artworkIdItem,
   blankAsUnset,
@@ -165,7 +166,7 @@ function recordLines(artwork: ArtworkRecord): string[] {
     lines.push(`- **IIIF manifest:** ${printableUrl(artwork.manifest_url)}`);
   for (const [index, image] of (artwork.alt_images ?? []).entries()) {
     lines.push(
-      `- **Alternate image ${index + 1}:** display ${printableUrl(image.url)} · IIIF info ${printableUrl(image.iiif_info_url)}`,
+      `- **Alternate image ${index + 1}:** display ${markdownImage(image.url, image.url)} · IIIF info ${printableUrl(image.iiif_info_url)}`,
     );
   }
   lines.push(

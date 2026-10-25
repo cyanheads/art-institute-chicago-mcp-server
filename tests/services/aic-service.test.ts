@@ -106,7 +106,7 @@ describe('AicService status classification', () => {
       expect(fetch).toHaveBeenCalledTimes(1);
     });
 
-    it('quotes the API 403 error string on one line, escaped, and cut to 100 characters', async () => {
+    it('keeps the API 403 error string raw, on one line, and cut to 100 characters', async () => {
       const apiError = `Refused [x](https://x.test)\r\n# Injected <b>​${'y'.repeat(500)}`;
       const { service } = createTestService(
         scriptedFetch(jsonResponder({ ...API_OTHER_403_BODY, error: apiError }, 403)),
@@ -114,7 +114,7 @@ describe('AicService status classification', () => {
       const error = await rejection(search(service));
       expect(error.data).toMatchObject({ reason: 'upstream_rejected_query' });
       expect(error.message).toBe(
-        `The Art Institute API rejected the request this server built (HTTP 403, "Refused \\[x\\](https://x.test) # Injected \\<b\\>${'y'.repeat(56)}…").`,
+        `The Art Institute API rejected the request this server built (HTTP 403, "Refused [x](https://x.test) # Injected <b>${'y'.repeat(56)}…").`,
       );
     });
 

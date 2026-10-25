@@ -2,10 +2,10 @@
 
 **Server:** art-institute-chicago-mcp-server
 **Version:** 0.2.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.15`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.16`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.3.1
-**Zod:** ^4.6.5
+**Zod:** ^4.6.7
 
 > **Read the framework docs first:** `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` contains the full API reference — builders, Context, error codes, exports, patterns. This file covers server-specific conventions only.
 
@@ -242,6 +242,7 @@ A new variable lands in `.env.example`, both `server.json` packages, `manifest.j
 await createApp({
   name: 'art-institute-chicago-mcp-server',
   title: 'art-institute-chicago-mcp-server',
+  sessionMode: 'stateless',
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   instructions: 'Art Institute of Chicago collection data: about 133,000 artworks, artists, exhibitions, and audio-guide stops. …',
@@ -255,7 +256,7 @@ await createApp({
 });
 ```
 
-Identity is `name` + `title`, both the unscoped package name (`lint:packaging` enforces the match); `description` comes from `package.json`. `instructions` (under the 2,048-character limit) carries the cross-tool workflow and the licensing terms, so update it with the tool names whenever the surface changes. `teardown()` disposes the service's pacer. No `sessionMode` is set: no tool calls `ctx.requestInput`, so the default posture applies, and `.env.example` and the Dockerfile set `MCP_SESSION_MODE=stateless`.
+Identity is `name` + `title`, both the unscoped package name (`lint:packaging` enforces the match); `description` comes from `package.json`. `instructions` (under the 2,048-character limit) carries the cross-tool workflow and the licensing terms, so update it with the tool names whenever the surface changes. `teardown()` disposes the service's pacer. `sessionMode: 'stateless'` declares the HTTP posture in source because no tool calls `ctx.requestInput`; `.env.example` and the Dockerfile agree. A meaningful `MCP_SESSION_MODE` overrides the declaration. A future tool that requests input must declare `{ default: 'stateful', require: 'stateful' }` so startup refuses incompatible HTTP deployment settings.
 
 ---
 

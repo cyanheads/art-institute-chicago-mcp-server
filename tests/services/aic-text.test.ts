@@ -44,6 +44,7 @@ import {
   vocabularyInput,
   WINDOW_NOTICE,
 } from '@/services/aic/aic-text.js';
+import { markdownHtml, markdownText } from '../fixtures/markdown.js';
 
 const IIIF = 'https://www.artic.edu/iiif/2';
 
@@ -660,6 +661,12 @@ describe('htmlToText', () => {
 });
 
 describe('inlineSafe', () => {
+  it('keeps emphasis, code, entities, and punctuation visible without activating markup', () => {
+    const value = 'A*p* `code` ~text~ _value_ | &copy; [x](https://x.test) <b>bold</b>';
+    expect(markdownText(inlineSafe(value))).toBe(value);
+    expect(markdownHtml(inlineSafe(value))).not.toMatch(/<(?:em|strong|code|a|b)\b/);
+    expect(markdownText(quoteBlock(value))).toBe(value);
+  });
   it.each([
     ['LF', '\n'],
     ['CR', '\r'],
@@ -686,7 +693,7 @@ describe('inlineSafe', () => {
 
   it('backslash-escapes brackets and angle brackets', () => {
     expect(inlineSafe('[link](https://x.test) <script>')).toBe(
-      '\\[link\\](https://x.test) \\<script\\>',
+      '\\[link\\](https://x.test) \\<script>',
     );
   });
 
@@ -718,13 +725,13 @@ describe('inlineSafe', () => {
 
   it('doubles a backslash run in front of an escaped character, so the escape holds', () => {
     expect(inlineSafe('\\[x](https://x.test)')).toBe('\\\\\\[x\\](https://x.test)');
-    expect(inlineSafe('\\\\<b>')).toBe('\\\\\\\\\\<b\\>');
+    expect(inlineSafe('\\\\<b>')).toBe('\\\\\\\\\\<b>');
     expect(inlineSafe('C:\\path and a\\b')).toBe('C:\\path and a\\b');
   });
 
   it('renders angle brackets that entity decoding produced as text', () => {
     expect(inlineSafe(htmlToText('&lt;img src=x onerror=alert(1)&gt;'))).toBe(
-      '\\<img src=x onerror=alert(1)\\>',
+      '\\<img src=x onerror=alert(1)>',
     );
   });
 
@@ -772,23 +779,23 @@ describe('quoteBlock', () => {
     expect(quoteBlock('')).toBe('>');
   });
 
-  it('escapes link, image, and HTML syntax, and leaves parentheses, bangs, and backticks', () => {
+  it('renders link, image, HTML, and code syntax literally', () => {
     expect(
       quoteBlock('![p](https://x.test/p.png) [click](https://x.test) <img src=x> `code` (note)!'),
     ).toBe(
-      '> !\\[p\\](https://x.test/p.png) \\[click\\](https://x.test) \\<img src=x\\> `code` (note)!',
+      '> !\\[p\\](https://x.test/p.png) \\[click\\](https://x.test) \\<img src=x> \\`code\\` (note)!',
     );
   });
 
   it('doubles a backslash run in front of an escaped character, so the escape holds', () => {
     expect(quoteBlock('\\[x](https://x.test)\n\\\\<b>')).toBe(
-      '> \\\\\\[x\\](https://x.test)\n> \\\\\\\\\\<b\\>',
+      '> \\\\\\[x\\](https://x.test)\n> \\\\\\\\\\<b>',
     );
   });
 
   it('renders a tag that entity decoding produced as text', () => {
     expect(quoteBlock(htmlToText('<p>&lt;img src=x onerror=alert(1)&gt;</p>'))).toBe(
-      '> \\<img src=x onerror=alert(1)\\>',
+      '> \\<img src=x onerror=alert(1)>',
     );
   });
 
@@ -804,30 +811,30 @@ describe('quoteBlock', () => {
 
 describe('printableUrl', () => {
   it('percent-encodes square brackets and leaves other URL characters alone', () => {
-    expect(printableUrl('https://x.test/a[1]/b%20c?q=[x]&r=(y)')).toBe(
+    expect(markdownText(printableUrl('https://x.test/a[1]/b%20c?q=[x]&r=(y)'))).toBe(
       'https://x.test/a%5B1%5D/b%20c?q=%5Bx%5D&r=(y)',
     );
   });
 
   it('percent-encodes whitespace, line breaks, and control and bidi characters', () => {
-    expect(printableUrl('https://x.test/a b\r\n# Injected\u0007\u0085 ‮')).toBe(
+    expect(markdownText(printableUrl('https://x.test/a b\r\n# Injected\u0007\u0085 ‮'))).toBe(
       'https://x.test/a%20b%0D%0A#%20Injected%07%C2%85%E2%80%A8%E2%80%AE',
     );
   });
 
   it('leaves an already-encoded url as it was', () => {
     const url = 'https://www.artic.edu/iiif/audio/970%20fixed.mp3';
-    expect(printableUrl(url)).toBe(url);
+    expect(markdownText(printableUrl(url))).toBe(url);
   });
 
   it('percent-encodes angle brackets, quotes, and backticks', () => {
-    expect(printableUrl('https://x.test/<script>"q"\'s\'`t`')).toBe(
+    expect(markdownText(printableUrl('https://x.test/<script>"q"\'s\'`t`'))).toBe(
       'https://x.test/%3Cscript%3E%22q%22%27s%27%60t%60',
     );
   });
 
   it('percent-encodes invisible characters', () => {
-    expect(printableUrl(`https://x.test/a${chars(0x200b)}b${chars(0xe0041)}c`)).toBe(
+    expect(markdownText(printableUrl(`https://x.test/a${chars(0x200b)}b${chars(0xe0041)}c`))).toBe(
       'https://x.test/a%E2%80%8Bb%F3%A0%81%81c',
     );
   });

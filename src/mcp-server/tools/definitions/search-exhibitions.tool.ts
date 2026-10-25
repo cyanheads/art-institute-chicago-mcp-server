@@ -7,6 +7,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { markdownImage } from '@cyanheads/mcp-ts-core/utils';
 import { getAicService } from '@/services/aic/aic-service.js';
 import {
   blankAsUnset,
@@ -90,7 +91,8 @@ function exhibitionLines(exhibition: Exhibition): string[] {
   }
   if (facts.length > 0) lines.push(`- ${facts.join(' · ')}`);
   if (exhibition.web_url) lines.push(`- **Web:** ${printableUrl(exhibition.web_url)}`);
-  if (exhibition.image_url) lines.push(`- **Image:** ${printableUrl(exhibition.image_url)}`);
+  if (exhibition.image_url)
+    lines.push(`- **Image:** ${markdownImage(exhibition.image_url, exhibition.image_url)}`);
   if (exhibition.artist_ids.length > 0) {
     lines.push(`- **Artist ids:** ${exhibition.artist_ids.join(', ')}`);
   }

@@ -13,6 +13,7 @@ import { disposeAicService, initAicService } from './services/aic/aic-service.js
 await createApp({
   name: 'art-institute-chicago-mcp-server',
   title: 'art-institute-chicago-mcp-server',
+  sessionMode: 'stateless',
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   instructions:

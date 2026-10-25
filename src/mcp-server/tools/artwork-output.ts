@@ -6,6 +6,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
+import { markdownImage } from '@cyanheads/mcp-ts-core/utils';
 import { inlineSafe, printableUrl } from '@/services/aic/aic-text.js';
 
 const ArtworkImageSchema = z
@@ -93,8 +94,8 @@ export function yesNo(value: boolean): string {
 
 /** Markdown lines for the primary image: URLs, size, rights, and alt text. */
 function imageLines(image: ArtworkImage): string[] {
-  const urls = [`display ${printableUrl(image.url)}`];
-  if (image.url_large) urls.push(`large ${printableUrl(image.url_large)}`);
+  const urls = [`display ${markdownImage(image.url, image.url)}`];
+  if (image.url_large) urls.push(`large ${markdownImage(image.url_large, image.url_large)}`);
   urls.push(`IIIF info ${printableUrl(image.iiif_info_url)}`);
   const size: string[] = [];
   if (image.width !== undefined) size.push(`width ${image.width} px`);
