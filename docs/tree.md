@@ -1,6 +1,6 @@
 # art-institute-chicago-mcp-server - Directory Structure
 
-Generated on: 2026-10-13 16:23:47
+Generated on: 2026-10-25 09:50:32
 
 ```text
 art-institute-chicago-mcp-server/
@@ -168,7 +168,8 @@ art-institute-chicago-mcp-server/
 │   │   ├── aic-service-kit.ts
 │   │   ├── aic-tool-kit.ts
 │   │   ├── aic-upstream.ts
-│   │   └── audio-heaviest.json
+│   │   ├── audio-heaviest.json
+│   │   └── markdown.ts
 │   ├── fuzz/
 │   ├── integration/
 │   ├── prompts/

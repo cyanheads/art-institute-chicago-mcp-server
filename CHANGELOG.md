@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-10-25
+
+Catalog text renders literally in Markdown, image fields render as images, and HTTP defaults to stateless when MCP_SESSION_MODE is unset.
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-10-13 · ⚠️ Breaking
 
 Collection relationships, Getty ULAN identifiers, and bounded reads with exact continuation.
