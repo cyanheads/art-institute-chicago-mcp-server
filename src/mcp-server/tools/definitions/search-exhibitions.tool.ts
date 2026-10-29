@@ -111,7 +111,7 @@ function exhibitionLines(exhibition: Exhibition): string[] {
 export const searchExhibitions = tool('artic_search_exhibitions', {
   title: 'Search exhibitions',
   description:
-    'Search Art Institute of Chicago exhibitions by text, date, artwork_id, or artist_id. Relationship filters cover recorded museum links; an absent link does not prove an artwork or artist never appeared in a show. Results carry dates, gallery, summary, web page, and listed artworks. Pass artwork ids to artic_get_artworks for full records.',
+    'Search Art Institute of Chicago exhibitions by text, date, artwork_id, or artist_id. Relationship filters cover recorded museum links; an absent link does not prove an artwork or artist never appeared in a show. For the full exhibition record of one artwork, read the exhibition_history section of artic_get_artworks. Results carry dates, gallery, summary, web page, and listed artworks. Pass artwork ids to artic_get_artworks for full records.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     artwork_id: blankAsUnset(z.number().int().positive().optional()).describe(

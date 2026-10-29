@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/art-institute-chicago-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/art-institute-chicago-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/art-institute-chicago-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/art-institute-chicago-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/art-institute-chicago-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/art-institute-chicago-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -49,6 +49,14 @@ The Art Institute of Chicago's collection: about 133,000 artworks, plus artists,
 | `artic://artworks/{id}` | One artwork record as JSON, with the API license text and description attribution |
 
 `artic_get_artworks` returns the same record for clients that don't surface resources.
+
+### Skills
+
+| Skill | Description |
+|:---|:---|
+| `art-institute-chicago-guide` | Gates and workflows the tool descriptions don't carry: finding works by an artist or culture, a work's exhibition history, counts past the 1,000-match window, provenance research, audio-guide stops versus linked media, accent-exact filter values, and reuse terms per output |
+
+The server serves it over MCP as `skill://art-institute-chicago-guide/SKILL.md`; it also ships in `skills/` in the npm package and Docker image.
 
 ## Capability reference
 
@@ -150,137 +158,34 @@ This server is an independent project and is not affiliated with or endorsed by 
 
 ## Getting started
 
-### Public Hosted Instance
-
-A public instance is available at `https://art-institute-chicago.caseyjhand.com/mcp` — no installation required. It serves Streamable HTTP; each client takes its own config shape.
-
-For Claude Code:
+Connect to the hosted instance, no install:
 
 ```sh
 claude mcp add --transport http art-institute-chicago-mcp-server https://art-institute-chicago.caseyjhand.com/mcp
 ```
 
-For Cline (`cline_mcp_settings.json`):
-
-```json
-{
-  "mcpServers": {
-    "art-institute-chicago-mcp-server": {
-      "type": "streamableHttp",
-      "url": "https://art-institute-chicago.caseyjhand.com/mcp"
-    }
-  }
-}
-```
-
-For Cursor (`mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "art-institute-chicago-mcp-server": {
-      "url": "https://art-institute-chicago.caseyjhand.com/mcp"
-    }
-  }
-}
-```
-
-Claude Desktop adds remote servers under Settings → Connectors.
-
 Every caller of the hosted instance shares one `api.artic.edu` request budget of 50 requests a minute. For sustained use, run your own instance.
 
-### Self-Hosted / Local
+Or run it locally:
 
-Add the following to your MCP client configuration file. No API key is needed; `AIC_CONTACT` tells the museum how to reach you (see [Configuration](#configuration)).
-
-```json
-{
-  "mcpServers": {
-    "art-institute-chicago-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/art-institute-chicago-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info",
-        "AIC_CONTACT": "you@example.com"
-      }
-    }
-  }
-}
+```sh
+claude mcp add art-institute-chicago-mcp-server -- npx -y @cyanheads/art-institute-chicago-mcp-server
 ```
 
-Or with npx (no Bun required):
+For other clients, add this to the MCP config file:
 
 ```json
 {
   "mcpServers": {
     "art-institute-chicago-mcp-server": {
-      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@cyanheads/art-institute-chicago-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info",
-        "AIC_CONTACT": "you@example.com"
-      }
+      "args": ["-y", "@cyanheads/art-institute-chicago-mcp-server"]
     }
   }
 }
 ```
 
-Or with Docker:
-
-```json
-{
-  "mcpServers": {
-    "art-institute-chicago-mcp-server": {
-      "type": "stdio",
-      "command": "docker",
-      "args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "-e", "AIC_CONTACT=you@example.com", "ghcr.io/cyanheads/art-institute-chicago-mcp-server:latest"]
-    }
-  }
-}
-```
-
-For Streamable HTTP, set the transport and start the server:
-
-```sh
-MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
-# Server listens at http://localhost:3010/mcp
-```
-
-### Prerequisites
-
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
-- No API key or account. The Art Institute API asks clients to identify themselves with a contact; set `AIC_CONTACT` to an email or URL.
-
-### Installation
-
-1. **Clone the repository:**
-
-```sh
-git clone https://github.com/cyanheads/art-institute-chicago-mcp-server.git
-```
-
-2. **Navigate into the directory:**
-
-```sh
-cd art-institute-chicago-mcp-server
-```
-
-3. **Install dependencies:**
-
-```sh
-bun install
-```
-
-4. **Configure environment:**
-
-```sh
-cp .env.example .env
-# edit .env and set AIC_CONTACT
-```
+No API key or account is needed. The Art Institute API asks clients to identify themselves: set `AIC_CONTACT` to an email or URL the museum can reach (see [Configuration](#configuration)). For Docker or a source build, see [Running the server](#running-the-server).
 
 ## Configuration
 
@@ -303,23 +208,43 @@ See [`.env.example`](./.env.example) for every server setting and the common fra
 
 ### Local development
 
-- **Build and run the production version**:
+Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+
+- **Clone and install:**
+
+  ```sh
+  git clone https://github.com/cyanheads/art-institute-chicago-mcp-server.git
+  cd art-institute-chicago-mcp-server && bun install
+  cp .env.example .env   # set AIC_CONTACT
+  ```
+
+- **Build and run:**
 
   ```sh
   # One-time build
   bun run rebuild
 
   # Run the built server
-  bun run start:http
-  # or
   bun run start:stdio
+  # or
+  bun run start:http
   ```
 
-- **Run checks and tests**:
+- **Run checks and tests:**
+
   ```sh
-  bun run devcheck  # Lints, formats, type-checks, and more
-  bun run test      # Runs the test suite
+  bun run devcheck   # Lint, format, typecheck, security
+  bun run test       # Vitest test suite
+  bun run lint:mcp   # Validate MCP definitions against spec
   ```
+
+### Docker
+
+```sh
+docker run --rm -e AIC_CONTACT=you@example.com -p 3010:3010 ghcr.io/cyanheads/art-institute-chicago-mcp-server:latest
+```
+
+The image defaults to HTTP transport, stateless session mode, and logs to `/var/log/art-institute-chicago-mcp-server`. To run it over stdio from an MCP client, use `"command": "docker"` with `"args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "-e", "AIC_CONTACT=you@example.com", "ghcr.io/cyanheads/art-institute-chicago-mcp-server:latest"]`. To build locally, `docker build -t art-institute-chicago-mcp-server .`; OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
 
 ## Project structure
 
@@ -330,6 +255,7 @@ See [`.env.example`](./.env.example) for every server setting and the common fra
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`) and the artwork output schema they share. |
 | `src/mcp-server/resources` | The `artic://artworks/{id}` resource. |
 | `src/services/aic` | Art Institute API client: pacing, retries, response cache, HTML-to-text, IIIF URL construction, and the artwork and artist record builders. |
+| `skills/` | The published `art-institute-chicago-guide` Agent Skill, served over MCP. |
 | `tests/` | Unit and integration tests, mirroring the `src/` structure. |
 
 ## Development guide

@@ -1,6 +1,6 @@
 # art-institute-chicago-mcp-server - Directory Structure
 
-Generated on: 2026-10-25 09:50:32
+Generated on: 2026-10-29 01:59:46
 
 ```text
 art-institute-chicago-mcp-server/
@@ -37,6 +37,8 @@ art-institute-chicago-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -134,6 +136,9 @@ art-institute-chicago-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── art-institute-chicago-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -175,6 +180,8 @@ art-institute-chicago-mcp-server/
 │   ├── prompts/
 │   ├── resources/
 │   │   └── artwork.resource.test.ts
+│   ├── scripts/
+│   │   └── bundle-agent-docs.test.ts
 │   ├── services/
 │   │   ├── aic-service.test.ts
 │   │   ├── aic-text.test.ts
@@ -204,7 +211,9 @@ art-institute-chicago-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
