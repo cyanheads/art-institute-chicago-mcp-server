@@ -134,7 +134,8 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
     if (values.length === 0) {
       let notice = `No ${input.vocabulary} values were returned; retry artic_lookup_vocabulary, or search artic_search_artworks with query text instead.`;
       if (input.contains) {
-        notice = `No ${input.vocabulary} value contains "${input.contains}". Call artic_lookup_vocabulary without contains to see the most common values.`;
+        // A notice is authored Markdown that structuredContent carries as-is, so caller text stays out of it.
+        notice = `No ${input.vocabulary} value contains the given text. Call artic_lookup_vocabulary without contains to see the most common values.`;
       } else if (input.public_domain_only) {
         notice = `No ${input.vocabulary} values were returned for public-domain works; call artic_lookup_vocabulary again without public_domain_only to count every artwork.`;
       }

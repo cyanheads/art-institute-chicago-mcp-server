@@ -34,6 +34,7 @@ import {
   UPSTREAM_FAILURES,
 } from '../fixtures/aic-tool-kit.js';
 import { aggregationEnvelope, envelope } from '../fixtures/aic-upstream.js';
+import { markdownText } from '../fixtures/markdown.js';
 
 type VocabularyRun = {
   cap: number;
@@ -266,15 +267,30 @@ describe('artic_lookup_vocabulary output and enrichment', () => {
     expect(out).not.toHaveProperty('notice');
   });
 
-  it('names the contains text and the unfiltered call when nothing matches', async () => {
+  it('points at the unfiltered call when nothing matches the contains text', async () => {
     installAicService(scriptedFetch(jsonResponder(aggregationEnvelope('v', []))));
     const out = structuredOf<VocabularyRun>(
       await runToolContract(lookupVocabulary, { vocabulary: 'style', contains: 'zzz' }),
     );
     expect(out.values).toEqual([]);
     expect(out.notice).toBe(
-      'No style value contains "zzz". Call artic_lookup_vocabulary without contains to see the most common values.',
+      'No style value contains the given text. Call artic_lookup_vocabulary without contains to see the most common values.',
     );
+  });
+
+  it('keeps caller text out of the notice, so neither surface carries escapes or markup', async () => {
+    installAicService(scriptedFetch(jsonResponder(aggregationEnvelope('v', []))));
+    const contains = '*bold* [x](y) `code`';
+    const result = await runToolContract(lookupVocabulary, { vocabulary: 'style', contains });
+    const notice = structuredOf<VocabularyRun>(result).notice;
+    expect(notice).not.toContain('\\');
+    expect(notice).not.toContain('bold');
+    // The enrichment trailer, notice included, is a content block after format()'s.
+    const rendered = result.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('');
+    expect(markdownText(rendered)).toContain('No style value contains the given text.');
+    expect(markdownText(rendered)).not.toContain('bold');
   });
 
   it('points at the public-domain restriction when it is the likely cause of an empty list', async () => {
