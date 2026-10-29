@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-10-28
+
+Publishes the art-institute-chicago-guide Agent Skill over MCP as skill://art-institute-chicago-guide/SKILL.md, points exhibition lookups at an artwork's exhibition_history, and moves to mcp-ts-core 0.13.18, which fixes a per-request HTTP memory leak under Bun.
+
 ## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-10-25
 
 Catalog text renders literally in Markdown, image fields render as images, and HTTP defaults to stateless when MCP_SESSION_MODE is unset.

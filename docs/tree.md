@@ -1,6 +1,6 @@
 # art-institute-chicago-mcp-server - Directory Structure
 
-Generated on: 2026-10-29 01:59:46
+Generated on: 2026-10-29 02:15:22
 
 ```text
 art-institute-chicago-mcp-server/
@@ -26,6 +26,7 @@ art-institute-chicago-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   └── design.md

@@ -6,7 +6,7 @@
     "url": "https://github.com/cyanheads/art-institute-chicago-mcp-server",
     "source": "github"
   },
-  "version": "0.2.1",
+  "version": "0.3.0",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/art-institute-chicago-mcp-server",
       "runtimeHint": "npx",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "environmentVariables": [
         {
           "name": "AIC_CONTACT",
@@ -51,7 +51,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/art-institute-chicago-mcp-server",
       "runtimeHint": "npx",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "environmentVariables": [
         {
           "name": "MCP_TRANSPORT_TYPE",
