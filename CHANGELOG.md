@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-11-03
+
+Raises every search cap to the API's 100-row maximum and artic_get_artworks to 100 ids, adds acquisition fiscal years with acquired filters and sorts and four more facets, and fixes stop words emptying searches, exhibitions and works with missing dates dropping out, and HTML or URLs in artwork text.
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-10-28
 
 Publishes the art-institute-chicago-guide Agent Skill over MCP as skill://art-institute-chicago-guide/SKILL.md, points exhibition lookups at an artwork's exhibition_history, and moves to mcp-ts-core 0.13.18, which fixes a per-request HTTP memory leak under Bun.
