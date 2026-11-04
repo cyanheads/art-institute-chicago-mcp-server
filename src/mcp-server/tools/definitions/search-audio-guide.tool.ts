@@ -11,6 +11,7 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getAicService } from '@/services/aic/aic-service.js';
 import {
   blankAsUnset,
+  PAGE_MAX,
   pageInfo,
   printableUrl,
   quoteBlock,
@@ -34,13 +35,13 @@ export const searchAudioGuide = tool('artic_search_audio_guide', {
       .min(1)
       .max(200)
       .describe(
-        "Text matched against stop titles and transcripts; every word must match. An artwork's title or the artist's surname works well.",
+        "Text matched against stop titles and transcripts; every word must match, except common English words such as the and of, which are ignored. An artwork's title or the artist's surname works well.",
       ),
     page: blankAsUnset(z.number().int().min(1).max(1000).default(1)).describe(
       'Page to return (1-based); page times the applied limit may not exceed 1,000.',
     ),
     limit: blankAsUnset(z.number().int().min(1).max(1000).default(2)).describe(
-      'Requested stops per page (1-1,000); at most two whole stops are returned.',
+      `Requested stops per page (1-1,000); at most ${PAGE_MAX} are returned, each with its whole transcript.`,
     ),
   }),
   output: z.object({
@@ -142,7 +143,7 @@ export const searchAudioGuide = tool('artic_search_audio_guide', {
 
   async handler(input, ctx) {
     const requestedLimit = input.limit;
-    input = { ...input, limit: Math.min(input.limit, 2) };
+    input = { ...input, limit: Math.min(input.limit, PAGE_MAX) };
     ctx.enrich.total(0);
     ctx.enrich({ truncated: false, shown: 0, cap: input.limit });
 

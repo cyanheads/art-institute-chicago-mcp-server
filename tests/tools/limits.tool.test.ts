@@ -81,10 +81,10 @@ describe('bounded oversized reads', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
   it.each([
-    [searchArtworks, 12, 'artworks', artworkRecord, {}],
-    [searchArtists, 25, 'artists', agentRecord, { query: 'a' }],
-    [searchExhibitions, 25, 'exhibitions', exhibitionRecord, {}],
-    [searchAudioGuide, 2, 'stops', mobileSoundRecord, { query: 'a' }],
+    [searchArtworks, 100, 'artworks', artworkRecord, {}],
+    [searchArtists, 100, 'artists', agentRecord, { query: 'a' }],
+    [searchExhibitions, 100, 'exhibitions', exhibitionRecord, {}],
+    [searchAudioGuide, 100, 'stops', mobileSoundRecord, { query: 'a' }],
   ] as const)(
     'keeps adjacent, final, and past-end pages exact for %s',
     async (tool, cap, key, row, input) => {
@@ -144,10 +144,10 @@ describe('bounded oversized reads', () => {
     },
   );
   it.each([
-    [searchArtworks, 12, {}],
-    [searchArtists, 25, { query: 'a' }],
-    [searchExhibitions, 25, {}],
-    [searchAudioGuide, 2, { query: 'a' }],
+    [searchArtworks, 100, {}],
+    [searchArtists, 100, { query: 'a' }],
+    [searchExhibitions, 100, {}],
+    [searchAudioGuide, 100, { query: 'a' }],
   ])(
     'uses the applied size for last reachable pages and rejects beyond the window for %s',
     async (tool, cap, input) => {
@@ -163,13 +163,19 @@ describe('bounded oversized reads', () => {
       expect(fetch).toHaveBeenCalledTimes(1);
     },
   );
-  it('returns two complete heaviest captured transcripts within the full MCP wire budget', async () => {
-    const data = [audioHeaviest.data, { ...audioHeaviest.data, id: 999990 }];
+  it('returns a full page of 100 heaviest captured transcripts whole at the applied cap', async () => {
+    const data = Array.from({ length: 100 }, (_, index) => ({
+      ...audioHeaviest.data,
+      id: 999_900 + index,
+    }));
     const fetch = installAicService(
       scriptedFetch(jsonResponder({ ...audioHeaviest, data, pagination: { total: 1067 } })),
     );
     const result = await run(searchAudioGuide as never, { query: 'art', limit: 1000 });
     const out = structuredOf<Output>(result);
+    expect(out).toMatchObject({ cap: 100, shown: 100, next_page: 2 });
+    expect(out.notice).toContain('Applied limit 100 to requested limit 1000');
+    surfaces(result, 'Applied limit 100 to requested limit 1000');
     // This captured fixture contains only paragraph/break tags and quote entities.
     const transcript = audioHeaviest.data.transcript
       .trim()
@@ -189,7 +195,7 @@ describe('bounded oversized reads', () => {
     expect(result.content[0]).toEqual({
       type: 'text',
       text: [
-        '# Audio-guide stops (2 on this page)',
+        '# Audio-guide stops (100 on this page)',
         '**Page:** 1 · **More matches:** yes · **Next page:** 2',
         ...data.flatMap((stop) => [
           '',
@@ -206,8 +212,7 @@ describe('bounded oversized reads', () => {
         '**Source citation:** Audio guide content © Art Institute of Chicago and third parties, https://www.artic.edu/terms',
       ].join('\n'),
     });
-    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(100000);
-    expect(searchBodyOf(urlOfCall(fetch))).toMatchObject({ limit: 2 });
+    expect(searchBodyOf(urlOfCall(fetch))).toMatchObject({ limit: 100 });
   });
   it.each([getArtworks, searchArtists])(
     'accepts raw entry and string ceilings, then continues the exact remainder',
@@ -227,7 +232,7 @@ describe('bounded oversized reads', () => {
       while (remaining.length > 0) {
         const result = await run(tool as never, { ids: remaining });
         const out = structuredOf<Output>(result);
-        const cap = tool === getArtworks ? 10 : 25;
+        const cap = 100;
         expect(out.missing_ids).toEqual(remaining.slice(0, cap));
         expect(out.deferred_ids).toEqual(remaining.slice(cap));
         surfaces(result, `**Missing ids:** ${remaining.slice(0, cap).join(', ')}`);
@@ -243,10 +248,10 @@ describe('bounded oversized reads', () => {
     },
   );
   it.each([
-    [searchArtworks, 12, {}],
-    [searchArtists, 25, { query: 'a' }],
-    [searchExhibitions, 25, {}],
-    [searchAudioGuide, 2, { query: 'a' }],
+    [searchArtworks, 100, {}],
+    [searchArtists, 100, { query: 'a' }],
+    [searchExhibitions, 100, {}],
+    [searchAudioGuide, 100, { query: 'a' }],
   ])('clamps %s for exact second-page requests and discloses the cap', async (tool, cap, input) => {
     const fetch = serveEmpty();
     const result = await run(tool as never, { ...input, limit: 1000, page: 2 });
@@ -256,26 +261,30 @@ describe('bounded oversized reads', () => {
     expect(out.notice).toContain(`Applied limit ${cap}`);
     surfaces(result, `Applied limit ${cap}`);
   });
-  it('uses the vocabulary cap and useful guidance at its ceiling', async () => {
+  it('serves the vocabulary input maximum unclamped, with useful guidance at its ceiling', async () => {
+    const buckets = Array.from({ length: 1000 }, (_, index) => ({
+      key: `subject ${index + 1}`,
+      doc_count: 2000 - index,
+    }));
     const fetch = installAicService(
       scriptedFetch(
-        jsonResponder({
-          data: [],
-          aggregations: { v: { buckets: [{ key: 'ink', doc_count: 2 }], sum_other_doc_count: 1 } },
-        }),
+        jsonResponder({ data: [], aggregations: { v: { buckets, sum_other_doc_count: 1 } } }),
       ),
     );
-    const result = await run(lookupVocabulary as never, { vocabulary: 'material', limit: 1000 });
-    const out = structuredOf<Output>(result);
-    expect(out.cap).toBe(100);
-    expect(searchBodyOf(urlOfCall(fetch))).toMatchObject({ aggs: { v: { terms: { size: 100 } } } });
-    expect(out.notice).toContain('narrow with contains');
-    expect(out.notice).not.toContain('raise limit');
+    const result = await run(lookupVocabulary as never, { vocabulary: 'subject', limit: 1000 });
+    const out = structuredOf<Output & { values: unknown[] }>(result);
+    expect(out).toMatchObject({ cap: 1000, shown: 1000, truncated: true });
+    expect(out.values).toHaveLength(1000);
+    expect(searchBodyOf(urlOfCall(fetch))).toMatchObject({
+      aggs: { v: { terms: { size: 1000 } } },
+    });
+    expect(out.notice).toBe('More values exist: narrow with contains.');
     surfaces(result, 'narrow with contains');
+    surfaces(result, '- subject 1000 (1001 artworks)');
   });
   it.each([
-    [getArtworks, 10],
-    [searchArtists, 25],
+    [getArtworks, 100],
+    [searchArtists, 100],
   ])('defers valid IDs when the attempted head is entirely missing', async (tool, cap) => {
     const fetch = serveEmpty();
     const ids = Array.from({ length: cap + 2 }, (_, index) => index + 1);
@@ -323,41 +332,47 @@ describe('bounded oversized reads', () => {
       expect(fetch).not.toHaveBeenCalled();
     },
   );
-  it('places response-budget deferrals before unattempted artwork IDs', async () => {
+  it('returns every attempted artwork record whole and defers only unattempted IDs', async () => {
     installAicService(
       scriptedFetch(
         jsonResponder(
           searchEnvelope(
-            Array.from({ length: 10 }, (_, i) =>
+            Array.from({ length: 100 }, (_, i) =>
               artworkRecord(i + 1, { description: 'x'.repeat(45000) }),
             ),
-            10,
+            100,
           ),
         ),
       ),
     );
     const result = await run(getArtworks, {
-      ids: Array.from({ length: 12 }, (_, i) => i + 1),
+      ids: Array.from({ length: 102 }, (_, i) => i + 1),
       include_related_media: false,
     });
-    expect(structuredOf<Output>(result).deferred_ids).toEqual(
-      Array.from({ length: 11 }, (_, i) => i + 2),
+    const out = structuredOf<{ artworks: { description?: string }[]; deferred_ids: number[] }>(
+      result,
     );
+    expect(out.artworks).toHaveLength(100);
+    expect(out.artworks.every((artwork) => artwork.description?.length === 45000)).toBe(true);
+    expect(out.deferred_ids).toEqual([101, 102]);
+    surfaces(result, '**Deferred ids:** 101, 102');
   });
-  it('keeps a maximum-size ID remainder within the complete response budget', async () => {
+  it('carries a maximum-size ID remainder whole on both surfaces', async () => {
     const ids = Array.from({ length: 1000 }, (_, i) => Number.MAX_SAFE_INTEGER - i);
     installAicService(
       scriptedFetch(
         jsonResponder(
           searchEnvelope(
-            ids.slice(0, 10).map((id) => artworkRecord(id, { description: 'x'.repeat(19000) })),
-            10,
+            ids.slice(0, 100).map((id) => artworkRecord(id, { description: 'x'.repeat(19000) })),
+            100,
           ),
         ),
       ),
     );
     const result = await run(getArtworks, { ids, include_related_media: false });
-    expect(structuredOf<Output>(result).deferred_ids).toHaveLength(999);
-    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(100000);
+    const out = structuredOf<Output>(result);
+    expect(out.artworks).toHaveLength(100);
+    expect(out.deferred_ids).toEqual(ids.slice(100));
+    surfaces(result, `**Deferred ids:** ${ids.slice(100).join(', ')}`);
   });
 });

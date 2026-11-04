@@ -16,10 +16,10 @@
 The server wraps the Art Institute of Chicago public API (`https://api.artic.edu/api/v1`): keyless, read-only, Elasticsearch-backed. `docs/design.md` is the spec — tool contracts, the request boundary, resilience settings, numbered design decisions, and the verified API reference. Read the relevant section before changing a definition or the service.
 
 - **One service, one host.** `AicService` (`src/services/aic/aic-service.ts`) makes every upstream call: a process-wide pacer (`AIC_REQUESTS_PER_MINUTE`, default 50, under the published 60/min anonymous limit), `withRetry` inside a 20 s deadline per request, an in-process LRU cache keyed by request URL, a 5 MiB body ceiling, and the `AIC-User-Agent` header built from `AIC_CONTACT`. Image URLs are constructed in `aic-text.ts`, never fetched.
-- **Request boundary.** Plain `fetch`, not `fetchWithTimeout`: the API reports paging errors as 403 JSON, search-backend rejections as 400 text, and firewall blocks as a non-JSON 403, and each maps to its own reason (`page_beyond_window`, `upstream_rejected_query`, `request_blocked`). Only a 429 is `rate_limited`. A search whose GET query string would pass 2,048 bytes, the firewall's limit, goes out as `POST <path>` with the same JSON body and is cached under its GET URL; the listing-by-ids routes stay GET.
-- **Search window.** Requested limits reach 1,000; applied caps are artworks 12, artist query/exhibitions 25, audio 2 (default 2), vocabulary 100. Page calculations and upstream calls use the applied cap. Every search checks `page × applied_limit ≤ 1000`; clamping and continuation are disclosed on both surfaces.
+- **Request boundary.** Plain `fetch`, not `fetchWithTimeout`: the API reports paging errors as 403 JSON, search-backend rejections as 400 text, and firewall blocks as a non-JSON 403, and each maps to its own reason (`page_beyond_window`, `upstream_rejected_query`, `request_blocked`). Only a 429 is `rate_limited`. A search whose GET query string would pass 2,048 bytes, the firewall's limit, goes out as `POST <path>` with the same JSON body and is cached under its GET URL. The listing-by-ids routes stay GET: an id list whose query would pass the limit goes out as consecutive GETs that each fit, sent in turn within one request's deadline and merged in request order.
+- **Search window.** Requested limits reach 1,000; applied caps are 100 rows on every search tool (the API's page maximum, which artist ids mode shares) and 1,000 values for vocabulary. Defaults are 10 rows (audio 2, vocabulary 25). The caller's `limit` and `ids` are the only size control; nothing trims a response by bytes. Page calculations and upstream calls use the applied cap. Every search checks `page × applied_limit ≤ 1000`; clamping and continuation are disclosed on both surfaces.
 - **Licensing is per surface.** Artwork metadata, agents, exhibitions, vocabulary terms, and `/sounds` assets are CC0; artwork `description` is CC BY 4.0 (`description_attribution`); images are reusable only when `is_public_domain`; audio-guide content is for noncommercial educational and personal use (`license_text` plus `source_citation`). An output that returns licensed text carries its terms.
-- **Upstream text is data.** HTML, including requested exhibition/publication histories, becomes plain text once at the service boundary. Preserve blank-line paragraphs, exact entity case, table boundaries, and safe absolute HTTP(S) citations as plain text; decode href entities once and omit unsafe destinations. Upstream URLs also pass `httpUrl()`, the IIIF base `iiifBaseUrl()`, and image ids `iiifImageId()`. In `format()`, free text goes through `quoteBlock()`, inline slots through `inlineSafe()`, and URLs through `printableUrl()`; `structuredContent` keeps normalized strings without rendering escapes.
+- **Upstream text is data.** HTML, including requested exhibition/publication histories, becomes plain text once at the service boundary. Preserve blank-line paragraphs, exact entity case, table boundaries, and safe absolute HTTP(S) citations as plain text; decode href entities once and omit unsafe destinations. A literal `<scheme://…>` span is a URL, not a tag: it renders `(url)` through the same screen. Record `provenance`, `on_loan`, and `inscriptions` convert too (inscriptions keep single newlines). Upstream URLs also pass `httpUrl()`, the IIIF base `iiifBaseUrl()`, and image ids `iiifImageId()`. In `format()`, free text goes through `quoteBlock()`, inline slots through `inlineSafe()`, and URLs through `printableUrl()`; `structuredContent` keeps normalized strings without rendering escapes.
 - **Relationship and authority ids.** Exhibition `artwork_id`/`artist_id` filters AND exact recorded links with text/date conditions; missing links do not establish historical exclusion. Artist `ulan_id` is an optional Getty authority identifier, never a museum relationship id. Artist facets aggregate every `artist_ids` credit and pair labels by raw source index before validation.
 - **Secondary calls degrade.** When the second request fails in `artic_get_artworks` (related media) or `artic_search_artists` (artwork counts), the primary records return with a notice. Cancellation still rethrows.
 
@@ -74,6 +74,9 @@ import {
   VOCABULARY_FILTERS,
 } from '@/services/aic/aic-text.js';
 
+/** Most values one call returns: the input maximum. The terms aggregation takes it as its size directly. */
+const LIMIT_MAX = 1000;
+
 export const lookupVocabulary = tool('artic_lookup_vocabulary', {
   title: 'Look up collection vocabulary',
   description: 'List the values of an Art Institute of Chicago collection vocabulary with how many artworks carry each, …',
@@ -83,7 +86,7 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
     // Every optional input is wrapped: a form client's "" becomes unset, or the default.
     contains: blankAsUnset(z.string().trim().max(60).optional()).describe('Case- and accent-insensitive substring …'),
     public_domain_only: blankAsUnset(z.boolean().default(false)).describe('Count only public-domain artworks.'),
-    limit: blankAsUnset(z.number().int().min(1).max(1000).default(25)).describe('Requested values (1-1,000); at most 100 returned, most common first.'),
+    limit: blankAsUnset(z.number().int().min(1).max(LIMIT_MAX).default(25)).describe('Values to return, most common first (1-1,000). Narrow with contains for more specific values.'),
   }),
   output: z.object({
     vocabulary: z.enum(VOCABULARY_FILTERS).describe('The vocabulary listed.'),
@@ -109,7 +112,6 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
   ],
 
   async handler(input, ctx) {
-    input = { ...input, limit: Math.min(input.limit, 100) }; // Clamp before requests and enrichment.
     ctx.enrich({ truncated: false, shown: 0, cap: input.limit });
     const result = await getAicService().aggregate(
       VOCABULARY_FIELDS[input.vocabulary],
@@ -123,7 +125,7 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
     const values = result.buckets.map((b) => ({ value: b.key, artwork_count: b.doc_count }));
     ctx.enrich({ shown: values.length });
     if (result.sum_other_doc_count > 0) {
-      ctx.enrich.truncated({ shown: values.length, cap: input.limit, guidance: input.limit === 100 ? 'More values exist: narrow with contains.' : 'More values exist: raise limit (up to 100) or narrow with contains.' });
+      ctx.enrich.truncated({ shown: values.length, cap: input.limit, guidance: input.limit === LIMIT_MAX ? 'More values exist: narrow with contains.' : 'More values exist: raise limit (up to 1,000) or narrow with contains.' });
     }
     // … zero-value notice
     return { vocabulary: input.vocabulary, filter_param: input.vocabulary, values };
@@ -151,7 +153,7 @@ Abridged from `src/mcp-server/resources/definitions/artwork.resource.ts`. The re
 ```ts
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { DEFAULT_SECTIONS, jsonBytes, loadArtworkRecords } from '@/services/aic/artwork-records.js';
+import { DEFAULT_SECTIONS, loadArtworkRecords } from '@/services/aic/artwork-records.js';
 
 export const artworkResource = resource('artic://artworks/{id}', {
   name: 'artic-artwork',
@@ -178,7 +180,7 @@ export const artworkResource = resource('artic://artworks/{id}', {
       throw ctx.fail('artwork_not_found', `No artwork exists for id ${params.id}.`);
     }
     const { artworks, license_text, description_attribution, notices } = await loadArtworkRecords(
-      { ids: [id], sections: DEFAULT_SECTIONS, include_related_media: true, wireBytes: jsonBytes },
+      { ids: [id], sections: DEFAULT_SECTIONS, include_related_media: true },
       ctx,
     );
     const [artwork] = artworks;
@@ -332,8 +334,8 @@ src/
   services/
     aic/
       aic-service.ts                    # AicService: request boundary, pacer, retry, cache (init/accessor pattern)
-      aic-text.ts                       # Pure helpers: HTML to text, inlineSafe, URL builders, input preprocessors, paging
-      artwork-records.ts                # artic_get_artworks records: response budget, related media
+      aic-text.ts                       # Pure helpers: HTML to text, inlineSafe, URL builders, input preprocessors, stop-word removal, paging
+      artwork-records.ts                # artic_get_artworks records: the ids= batch fetch (100 ids), related media
       artist-records.ts                 # Artwork counts and sample works for artic_search_artists
       response-cache.ts                 # LRU bounded by entries and bytes
       types.ts                          # Domain types

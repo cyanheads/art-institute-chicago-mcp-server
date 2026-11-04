@@ -43,6 +43,7 @@ import {
   vocabularyFilterClause,
   vocabularyInput,
   WINDOW_NOTICE,
+  withoutStopWords,
 } from '@/services/aic/aic-text.js';
 import { markdownHtml, markdownText } from '../fixtures/markdown.js';
 
@@ -57,6 +58,42 @@ const codePointRows = (...codePoints: number[]) =>
 
 /** ZERO WIDTH SPACE, BOM, WORD JOINER, and tag characters (first, `A`, last). */
 const INVISIBLE = codePointRows(0x200b, 0xfeff, 0x2060, 0xe0000, 0xe0041, 0xe007f);
+
+/** Thread CPU milliseconds `work` takes, which test files running beside it cannot inflate. */
+const cpuMs = (work: () => void) => {
+  const start = process.threadCpuUsage();
+  work();
+  const { user, system } = process.threadCpuUsage(start);
+  return (user + system) / 1000;
+};
+
+/**
+ * Thread CPU per `convert` call at each doubling size from 5k to 320k characters,
+ * the fastest of five samples, each sample converting the same 320k total
+ * characters so the smallest size still measures above the clock's resolution.
+ * The cap applies to that fixed total at every size before the next runs, so a
+ * quadratic scan fails at the first size it overruns, within seconds; a per-call
+ * cap would let it run the whole span first. The full-span ratio stays under 256
+ * (linear is 64, quadratic 4,096).
+ */
+const expectLinearTime = (make: (size: number) => string, convert: (text: string) => unknown) => {
+  const smallest = 5000;
+  const largest = smallest * 64;
+  const times: number[] = [];
+  for (let size = smallest; size <= largest; size *= 2) {
+    const text = make(size);
+    const runs = largest / size;
+    convert(text);
+    const sample = () =>
+      cpuMs(() => {
+        for (let run = 0; run < runs; run++) convert(text);
+      });
+    const ms = Math.min(...Array.from({ length: 5 }, sample));
+    expect(ms, `${runs} × ${size} characters`).toBeLessThan(500);
+    times.push(ms / runs);
+  }
+  expect((times.at(-1) ?? 0) / (times[0] ?? 1)).toBeLessThan(256);
+};
 
 /** A stored style title, precomposed (NFC) as every stored vocabulary value is, and decomposed (NFD). */
 const NFC_TITLE = 'wiener werkstätte';
@@ -346,6 +383,23 @@ describe('upstream value normalizers', () => {
     expect(htmlField(null)).toBeUndefined();
   });
 
+  it('htmlField folds single source line breaks by default', () => {
+    expect(htmlField('Signed lower right\nDated 1974')).toBe('Signed lower right Dated 1974');
+  });
+
+  it('htmlField keeps single source line breaks when asked, converting markup between them', () => {
+    expect(
+      htmlField('Signed lower right: Ivan Albright\n<p>\nDated lower left: 1974', 'keep'),
+    ).toBe('Signed lower right: Ivan Albright\n\nDated lower left: 1974');
+    expect(htmlField('Inscribed: A\n<br>\nInscribed: B\n<br>\nInscribed: C', 'keep')).toBe(
+      'Inscribed: A\n\nInscribed: B\n\nInscribed: C',
+    );
+    expect(htmlField('Signed lower right\nDated 1974', 'keep')).toBe(
+      'Signed lower right\nDated 1974',
+    );
+    expect(htmlField('<p>&nbsp;\n</p>', 'keep')).toBeUndefined();
+  });
+
   it('stringList keeps non-empty strings and tolerates absent or null', () => {
     expect(stringList(['a', '', '  ', 'b', 3, null])).toEqual(['a', 'b']);
     expect(stringList(null)).toEqual([]);
@@ -491,6 +545,51 @@ describe('htmlToText', () => {
       }
     },
   );
+
+  it('keeps an angle-bracket URL as a citation in place of the span', () => {
+    expect(
+      htmlToText(
+        'Gothic Ivories Project, The Courtauld Institute of Arts <http://gothicivories.courtauld.ac.uk/>',
+      ),
+    ).toBe(
+      'Gothic Ivories Project, The Courtauld Institute of Arts (http://gothicivories.courtauld.ac.uk/)',
+    );
+    expect(htmlToText('<p>See <HTTPS://X.TEST/a>.</p><p>Next</p>')).toBe(
+      'See (HTTPS://X.TEST/a).\n\nNext',
+    );
+  });
+
+  it('decodes entities in an angle-bracket URL once', () => {
+    expect(htmlToText('<https://example.org/a?b=1&amp;c=2>')).toBe(
+      '(https://example.org/a?b=1&c=2)',
+    );
+    expect(htmlToText('<https://example.org/a?b=1&amp;amp;c=2>')).toBe(
+      '(https://example.org/a?b=1&amp;c=2)',
+    );
+  });
+
+  it.each([
+    '<javascript:alert(1)>',
+    '<javascript://x.test/%0Aalert(1)>',
+    '<data://text/html,x>',
+    '<ftp://x.test/a>',
+    '<http://>',
+    '<https://x.test/with space>',
+    '<https://x.test/&#10;evil>',
+    '<https://x.test/&lt;b&gt;>',
+    '<https://x.test/&#x202e;path>',
+  ])('leaves no URL for the angle-bracket span %s', (span) => {
+    expect(htmlToText(`Before ${span} after`)).toBe('Before after');
+  });
+
+  it('still reads tags with attributes, namespaced tags, comments, and a bare less-than as before', () => {
+    expect(
+      htmlToText(
+        '<p class="x">One<o:p></o:p></p><a href="https://x.test/a">Two</a><!-- <http://x.test/c> --> a < b',
+      ),
+    ).toBe('One\n\nTwo (https://x.test/a) a < b');
+  });
+
   it('turns paragraph closers into one blank line and trims', () => {
     expect(htmlToText('<p>First.</p><p>Second.</p>')).toBe('First.\n\nSecond.');
   });
@@ -510,6 +609,19 @@ describe('htmlToText', () => {
   it('treats source line breaks as whitespace', () => {
     expect(htmlToText('one\ntwo\r\nthree\rfour')).toBe('one two three four');
     expect(htmlToText('<p>one\n   two</p>')).toBe('one two');
+  });
+
+  it('keeps each single source line break as a newline in keep mode', () => {
+    expect(htmlToText('one\ntwo\r\nthree\rfour', 'keep')).toBe('one\ntwo\nthree\nfour');
+    expect(htmlToText('<p>one  \n   two</p>', 'keep')).toBe('one\ntwo');
+    expect(htmlToText('one\n\ntwo\r\n\r\n\r\nthree', 'keep')).toBe('one\n\ntwo\n\nthree');
+    expect(htmlToText('one\n<br>\ntwo', 'keep')).toBe('one\n\ntwo');
+  });
+
+  it('reads a line break inside a tag as part of the tag in keep mode', () => {
+    expect(htmlToText('<a\nhref="https://x.test/a">Source</a>\n<em\n>Next</em>', 'keep')).toBe(
+      'Source (https://x.test/a)\nNext',
+    );
   });
 
   it('collapses runs of blank lines to one and runs of spaces to one', () => {
@@ -587,13 +699,6 @@ describe('htmlToText', () => {
     const MIB = 1024 * 1024;
     const SAMPLES = 5;
 
-    const cpuMs = (work: () => void) => {
-      const start = process.threadCpuUsage();
-      work();
-      const { user, system } = process.threadCpuUsage(start);
-      return (user + system) / 1000;
-    };
-
     it.each([
       ['a whitespace run with no line break', (size: number) => `a${' '.repeat(size)}b`],
       [
@@ -656,6 +761,31 @@ describe('htmlToText', () => {
       const largeMs = fastest(large);
       expect(largeMs).toBeLessThan(1000);
       expect(largeMs / smallMs).toBeLessThan(256);
+    });
+  });
+
+  /** Linear-time bounds from `expectLinearTime`, at doubling sizes. */
+  describe('time on angle-bracket URL spans and line breaks', () => {
+    const repeatTo = (unit: string, size: number) => unit.repeat(Math.ceil(size / unit.length));
+
+    describe.each(['fold', 'keep'] as const)('with source line breaks in %s mode', (mode) => {
+      it.each([
+        ['long unclosed <http: runs', (n: number) => repeatTo('<http:', n)],
+        [
+          'unclosed <http:// runs ending in a break',
+          (n: number) => `${repeatTo('<http://x ', n)}\ny`,
+        ],
+        ['unclosed <http:// runs between breaks', (n: number) => repeatTo('<http:// \r\n', n)],
+        ['nested openers before a span', (n: number) => `${repeatTo('<http', n)}://x.test/>`],
+        ['closed spans throughout', (n: number) => repeatTo('<https://x.test/?a=1&amp;b=2> ', n)],
+        ['one span the length of the text', (n: number) => `<http://x.test/${'a'.repeat(n)}>`],
+        // Every other shape is Latin-1; this one runs the patterns' two-byte (UTF-16) form.
+        ['UTF-16 closed spans throughout', (n: number) => repeatTo('<https://x.test/’> “q” ', n)],
+        ['one long line ending in a break', (n: number) => `${repeatTo('§1 x', n)}\ny`],
+        ['breaks throughout', (n: number) => repeatTo('  \r\n', n)],
+      ])('converts %s in linear time', (_name, make) => {
+        expectLinearTime(make, (text) => htmlToText(text, mode));
+      });
     });
   });
 });
@@ -1102,6 +1232,144 @@ describe('rankingText', () => {
       expect(text).toBe(text.trim());
       for (const word of text.split(' ')) expect(word).not.toMatch(/^[0-9]/);
     }
+  });
+});
+
+describe('withoutStopWords', () => {
+  /** Elasticsearch's `_english_` stop list. */
+  const ENGLISH_STOP_WORDS = [
+    'a',
+    'an',
+    'and',
+    'are',
+    'as',
+    'at',
+    'be',
+    'but',
+    'by',
+    'for',
+    'if',
+    'in',
+    'into',
+    'is',
+    'it',
+    'no',
+    'not',
+    'of',
+    'on',
+    'or',
+    'such',
+    'that',
+    'the',
+    'their',
+    'then',
+    'there',
+    'these',
+    'they',
+    'this',
+    'to',
+    'was',
+    'will',
+    'with',
+  ];
+
+  it('covers the 33 words of the list', () => {
+    expect(new Set(ENGLISH_STOP_WORDS).size).toBe(33);
+  });
+
+  it.each(ENGLISH_STOP_WORDS)('leaves out %j beside another word', (word) => {
+    expect(withoutStopWords(`monet ${word}`)).toBe('monet');
+    expect(withoutStopWords(`${word.toUpperCase()} monet`)).toBe('monet');
+  });
+
+  it.each([
+    ['A Sunday on La Grande Jatte', 'Sunday La Grande Jatte'],
+    ['The Old Guitarist', 'Old Guitarist'],
+    ['Bathers by a River', 'Bathers River'],
+    ['Monet and Chicago', 'Monet Chicago'],
+    ['the bedroom', 'bedroom'],
+    ['the, Old Guitarist', 'Old Guitarist'],
+    ['Picasso it’s', 'Picasso'],
+    ["Picasso it's", 'Picasso'],
+    ["Picasso IT'S!", 'Picasso'],
+    ['bedroom, the.', 'bedroom,'],
+    ['the | monet', '| monet'],
+    ['the\tbedroom\nof\r\nmonet', 'bedroom\nmonet'],
+  ])('leaves the stop words out of %j', (query, expected) => {
+    expect(withoutStopWords(query)).toBe(expected);
+  });
+
+  it.each([
+    ['"the old guitarist" of the', '"the old guitarist"'],
+    ['of "the old', '"the old'],
+    ['"a" the "b"', '"a" "b"'],
+    ['monet the"water lilies"', 'monet"water lilies"'],
+    ['"water lilies"the monet', '"water lilies"monet'],
+  ])('keeps quoted phrases as typed in %j', (query, expected) => {
+    expect(withoutStopWords(query)).toBe(expected);
+  });
+
+  it.each([
+    'PC-11',
+    'horses',
+    "O'Keeffe",
+    '1942.51',
+    'monet*',
+    'impressionist  prints',
+    '"the old guitarist"',
+    '"the old guitarist',
+    'monet -the',
+    'monet the*',
+    'monet the~1',
+    'monet|the',
+    'monet (the)',
+    'monet +the',
+    `the${chars(0xa0)}monet`,
+    "monet it,'s",
+    'those which I thee',
+    '',
+  ])('sends %j byte for byte, having no stop word to leave out', (query) => {
+    expect(withoutStopWords(query)).toBe(query);
+  });
+
+  it.each(['the', 'The and Of', '  the  ', 'it’s, a'])(
+    'sends %j unchanged when it holds only stop words',
+    (query) => {
+      expect(withoutStopWords(query)).toBe(query);
+    },
+  );
+
+  it.each([
+    ['the -monet', '-monet'],
+    ['(monet) of (manet)', '(monet) (manet)'],
+  ])('leaves the stop words out of %j beside an operator-carrying word', (query, expected) => {
+    expect(withoutStopWords(query)).toBe(expected);
+  });
+
+  it.each(['the | a', 'The | AN | of', 'the -', 'a + the', 'the  |  a  |  of'])(
+    'sends %j unchanged when only operators would remain beside its stop words',
+    (query) => {
+      expect(withoutStopWords(query)).toBe(query);
+    },
+  );
+
+  it.each([
+    ['repeated stop words', (n: number) => 'the '.repeat(Math.ceil(n / 4))],
+    [
+      'one long word ending in punctuation',
+      (n: number) => `${'a'.repeat(n / 2)}${','.repeat(n / 2)}x`,
+    ],
+    ['punctuation runs between letters', (n: number) => 'a,,,,,,x '.repeat(Math.ceil(n / 9))],
+    ['an unterminated phrase', (n: number) => `"${'the '.repeat(Math.ceil(n / 4))}`],
+    ['an operator run between stop words', (n: number) => `the ${'|'.repeat(n)} a`],
+    ['operators and stop words alternating', (n: number) => 'the | '.repeat(Math.ceil(n / 6))],
+    ['many short phrases', (n: number) => '"a" the '.repeat(Math.ceil(n / 8))],
+    // UTF-16, matching the ’s form of the stop-word pattern.
+    ['curly-apostrophe stop words throughout', (n: number) => 'it’s '.repeat(Math.ceil(n / 5))],
+    ['one long line ending in a break', (n: number) => `${'§1 x'.repeat(Math.ceil(n / 4))}\ny`],
+    ['breaks throughout', (n: number) => '  \r\n'.repeat(Math.ceil(n / 4))],
+  ])('runs in linear time on %s', (_name, make) => {
+    expectLinearTime(make, withoutStopWords);
   });
 });
 

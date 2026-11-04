@@ -13,6 +13,7 @@ import {
   idListInput,
   inlineSafe,
   numericIdItem,
+  PAGE_MAX,
   pageInfo,
   quoteBlock,
   SEARCH_WINDOW,
@@ -130,7 +131,7 @@ export const searchArtists = tool('artic_search_artists', {
       z.array(z.number().int().positive()).max(1000).optional(),
       numericIdItem,
     ).describe(
-      'Agent ids as an array or comma-separated string, up to 1,000 supplied entries including blanks and duplicates. Comma strings also have a 100,000-character ceiling. Blanks and duplicates are dropped; fetches the first 25 and returns deferred_ids. Pass query or ids, not both; other filters and page apply to query only.',
+      `Agent ids as an array or comma-separated string, up to 1,000 supplied entries including blanks and duplicates. Comma strings also have a 100,000-character ceiling. Blanks and duplicates are dropped; fetches the first ${PAGE_MAX} and returns deferred_ids. Pass query or ids, not both; other filters and page apply to query only.`,
     ),
     artists_only: blankAsUnset(z.boolean().default(true)).describe(
       'Query mode: only agents the museum records as artists. Set false to include donors, funds, and organizations.',
@@ -145,7 +146,7 @@ export const searchArtists = tool('artic_search_artists', {
       'Query mode: page to return (1-based); page times the applied limit may not exceed 1,000.',
     ),
     limit: blankAsUnset(z.number().int().min(1).max(1000).default(10)).describe(
-      'Query mode: requested agents per page (1-1,000); at most 25 are returned.',
+      `Query mode: requested agents per page (1-1,000); at most ${PAGE_MAX} are returned.`,
     ),
   }),
   output: z.object({
@@ -163,7 +164,7 @@ export const searchArtists = tool('artic_search_artists', {
       .array(z.number())
       .optional()
       .describe(
-        'Unattempted ids beyond the first 25, in request order; pass them as ids to artic_search_artists again. Present in ids mode.',
+        `Unattempted ids beyond the first ${PAGE_MAX}, in request order; pass them as ids to artic_search_artists again. Present in ids mode.`,
       ),
     has_more: z
       .boolean()
@@ -197,7 +198,9 @@ export const searchArtists = tool('artic_search_artists', {
     shown: z.number().describe('Agents returned on this page.'),
     cap: z
       .number()
-      .describe('The limit applied to this page, or the number of ids attempted (up to 25).'),
+      .describe(
+        `The limit applied to this page, or the number of ids attempted (up to ${PAGE_MAX}).`,
+      ),
     notice: z
       .string()
       .optional()
@@ -272,12 +275,12 @@ export const searchArtists = tool('artic_search_artists', {
 
   async handler(input, ctx) {
     const requestedLimit = input.limit;
-    input = { ...input, limit: Math.min(input.limit, 25) };
+    input = { ...input, limit: Math.min(input.limit, PAGE_MAX) };
     ctx.enrich.total(0);
     ctx.enrich({
       truncated: false,
       shown: 0,
-      cap: input.ids?.length ? Math.min(input.ids.length, 25) : input.limit,
+      cap: input.ids?.length ? Math.min(input.ids.length, PAGE_MAX) : input.limit,
     });
 
     const { query } = input;
@@ -287,8 +290,8 @@ export const searchArtists = tool('artic_search_artists', {
     }
 
     if (ids) {
-      const attemptedIds = ids.slice(0, 25);
-      const deferredIds = ids.slice(25);
+      const attemptedIds = ids.slice(0, PAGE_MAX);
+      const deferredIds = ids.slice(PAGE_MAX);
       const batch = await getAicService().getAgents(attemptedIds, ctx);
       const { artists, degraded } = await attachWorkStats(batch.agents, ctx);
       ctx.enrich.total(artists.length);
@@ -306,7 +309,7 @@ export const searchArtists = tool('artic_search_artists', {
       if (degraded) fragments.push(STATS_DEGRADED);
       if (deferredIds.length > 0) {
         fragments.push(
-          'The first 25 ids were attempted; call artic_search_artists again with deferred_ids as ids for the rest.',
+          `The first ${PAGE_MAX} ids were attempted; call artic_search_artists again with deferred_ids as ids for the rest.`,
         );
         ctx.enrich.truncated({
           shown: artists.length,

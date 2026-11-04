@@ -71,12 +71,14 @@ interface SearchRun {
 type FetchFake = ReturnType<typeof scriptedFetch>;
 
 const FIELDS =
-  'id,title,artist_display,artist_id,artist_title,date_display,date_start,date_end,medium_display,artwork_type_title,department_title,place_of_origin,is_public_domain,is_on_view,gallery_title,image_id,thumbnail';
+  'id,title,main_reference_number,fiscal_year,artist_display,artist_id,artist_title,date_display,date_start,date_end,medium_display,artwork_type_title,department_title,place_of_origin,is_public_domain,is_on_view,gallery_title,image_id,thumbnail';
 
 const PAGE_BOUND_RECOVERY =
   'Only the first 1,000 matches of a search are reachable. Narrow artic_search_artworks with filters such as department, artwork_type, or year_from, using values from artic_lookup_vocabulary.';
 const YEAR_RANGE_RECOVERY =
-  'Set year_from at or below year_to; use negative years for BCE, for example year_from -500.';
+  'Set year_from at or below year_to and acquired_from at or below acquired_to; use negative years for BCE, for example year_from -500.';
+const ACQUIRED_EXCLUSION =
+  'Works with no recorded acquisition fiscal year are excluded; drop acquired_from/acquired_to to include them.';
 
 /**
  * A stored style title, precomposed (NFC) as every stored vocabulary value is,
@@ -139,19 +141,98 @@ describe('artic_search_artworks request', () => {
     expect(out.sort_applied).toBe('relevance');
   });
 
+  it('leaves stop words out of the must clause and keeps them in q', async () => {
+    const fetchFake = emptyResults();
+    await search({ query: 'A Sunday on La Grande Jatte' });
+    expect(bodyOf(fetchFake)).toMatchObject({
+      q: 'A Sunday on La Grande Jatte',
+      query: {
+        bool: {
+          must: [
+            { simple_query_string: { query: 'Sunday La Grande Jatte', default_operator: 'and' } },
+          ],
+        },
+      },
+    });
+  });
+
   it.each([
     ['date_asc', 'asc'],
     ['date_desc', 'desc'],
-  ] as const)('sorts by start year for %s and drops q', async (sort, order) => {
+  ] as const)(
+    'sorts by start year for %s with missing years last, screening only placeholder years, and drops q',
+    async (sort, order) => {
+      const fetchFake = emptyResults();
+      const out = structuredOf<SearchRun>(await search({ query: 'water', sort, has_image: true }));
+      const body = bodyOf(fetchFake);
+      expect(body).not.toHaveProperty('q');
+      expect(body.sort).toEqual([{ date_start: { order, missing: '_last' } }]);
+      expect(body.query).toEqual({
+        bool: {
+          must: [{ simple_query_string: { query: 'water', default_operator: 'and' } }],
+          filter: [{ exists: { field: 'image_id' } }],
+          must_not: [
+            { range: { date_start: { lt: -8000 } } },
+            { range: { date_start: { gt: 2100 } } },
+          ],
+        },
+      });
+      expect(out.sort_applied).toBe(sort);
+    },
+  );
+
+  it('lists a date-sorted work with no start year, without years on either surface', async () => {
+    serve(
+      searchEnvelope(
+        [
+          artworkRecord(108798, {
+            date_display: 'Ming Dynasty 1368–1644',
+            date_start: null,
+            date_end: null,
+          }),
+        ],
+        1,
+      ),
+    );
+    const result = await search({ query: 'Huntsman Horse Dogs', sort: 'date_desc' });
+    const out = structuredOf<SearchRun>(result);
+    expect(out).toMatchObject({ totalCount: 1, shown: 1, sort_applied: 'date_desc' });
+    const [row] = out.artworks;
+    expect(row).toMatchObject({ id: 108798, date_display: 'Ming Dynasty 1368–1644' });
+    expect(row).not.toHaveProperty('date_start');
+    expect(row).not.toHaveProperty('date_end');
+    const text = textOf(result);
+    expect(text).toContain('- **Date:** Ming Dynasty 1368–1644\n');
+    expect(text).not.toMatch(/start \d|end \d/);
+  });
+
+  it.each([
+    ['acquired_desc', 'desc'],
+    ['acquired_asc', 'asc'],
+  ] as const)(
+    'sorts by acquisition fiscal year for %s with unrecorded years last, keeping the total',
+    async (sort, order) => {
+      const fetchFake = serve(searchEnvelope(rows(2), 133_165));
+      const result = await search({ sort, limit: 2 });
+      const out = structuredOf<SearchRun>(result);
+      const body = bodyOf(fetchFake);
+      expect(body).not.toHaveProperty('q');
+      expect(body).not.toHaveProperty('query');
+      expect(body.sort).toEqual([{ fiscal_year: { order, missing: '_last' } }]);
+      expect(out).toMatchObject({ totalCount: 133_165, sort_applied: sort });
+      expect(textOf(result)).toContain(`**Sort applied:** ${sort}`);
+    },
+  );
+
+  it('ranges acquired_from and acquired_to on fiscal_year, ANDed with the other filters', async () => {
     const fetchFake = emptyResults();
-    const out = structuredOf<SearchRun>(await search({ query: 'water', sort }));
-    const body = bodyOf(fetchFake);
-    expect(body).not.toHaveProperty('q');
-    expect(body.sort).toEqual([{ date_start: { order } }]);
-    expect(filtersOf(fetchFake)).toContainEqual({
-      range: { date_start: { gte: -8000, lte: 2100 } },
-    });
-    expect(out.sort_applied).toBe(sort);
+    await search({ query: 'portrait', year_to: 1945, acquired_from: 1933, acquired_to: 1950 });
+    expect(filtersOf(fetchFake)).toEqual([
+      { range: { date_start: { lte: 1945 } } },
+      { range: { date_start: { gte: -8000 } } },
+      { range: { date_end: { lte: 2100 } } },
+      { range: { fiscal_year: { gte: 1933, lte: 1950 } } },
+    ]);
   });
 
   it('builds the same request from blank optional inputs as from none', async () => {
@@ -174,6 +255,8 @@ describe('artic_search_artworks request', () => {
         'gallery',
         'year_from',
         'year_to',
+        'acquired_from',
+        'acquired_to',
         'facets',
         'sort',
       ].map((name, index) => [name, index % 2 === 0 ? '' : '   ']),
@@ -566,15 +649,49 @@ describe('artic_search_artworks request', () => {
     });
   });
 
-  it('accepts all seven facets and omits aggs when none are requested', async () => {
+  it.each([
+    ['an array', ['gallery', 'material', 'technique', 'theme']],
+    ['a comma string', ' gallery,material , technique,theme,gallery '],
+  ])(
+    'requests the gallery, material, technique, and theme facets from %s',
+    async (_name, facets) => {
+      const fetchFake = emptyResults();
+      const result = await search({ facets, on_view_only: true });
+      expect(result.isError).toBeUndefined();
+      expect(bodyOf(fetchFake).aggs).toEqual({
+        gallery: { terms: { field: 'gallery_title.keyword', size: 15 } },
+        material: { terms: { field: 'material_titles.keyword', size: 15 } },
+        technique: { terms: { field: 'technique_titles.keyword', size: 15 } },
+        theme: { terms: { field: 'theme_titles.keyword', size: 15 } },
+      });
+      expect(filtersOf(fetchFake)).toEqual([{ term: { is_on_view: true } }]);
+    },
+  );
+
+  it('accepts all eleven facets in one call and omits aggs when none are requested', async () => {
     const fetchFake = installAicService(
       scriptedFetch(jsonResponder(searchEnvelope([], 0)), jsonResponder(searchEnvelope([], 0))),
     );
-    await search({
-      facets: 'department,artwork_type,style,subject,classification,place_of_origin,artist',
+    const all = await search({
+      facets:
+        'department,artwork_type,style,subject,classification,material,technique,theme,place_of_origin,gallery,artist',
     });
     await search({ facets: [] });
-    expect(Object.keys(bodyOf(fetchFake, 0).aggs as object)).toHaveLength(7);
+    expect(all.isError).toBeUndefined();
+    expect(Object.keys(bodyOf(fetchFake, 0).aggs as object)).toEqual([
+      'department',
+      'artwork_type',
+      'style',
+      'subject',
+      'classification',
+      'material',
+      'technique',
+      'theme',
+      'place_of_origin',
+      'gallery',
+      'artist',
+    ]);
+    expect(Object.keys(structuredOf<SearchRun>(all).facets ?? {})).toHaveLength(11);
     expect(bodyOf(fetchFake, 1)).not.toHaveProperty('aggs');
   });
 });
@@ -593,6 +710,10 @@ describe('artic_search_artworks validation', () => {
     ['a fractional artist_id', { artist_id: 1.5 }, 'artist_id'],
     ['year_from past 2100', { year_from: 2101 }, 'year_from'],
     ['year_to before -8000', { year_to: -8001 }, 'year_to'],
+    ['acquired_from before 1879', { acquired_from: 1878 }, 'acquired_from'],
+    ['acquired_to past 2100', { acquired_to: 2101 }, 'acquired_to'],
+    ['a fractional acquired_from', { acquired_from: 1933.5 }, 'acquired_from'],
+    ['a numeric-string acquired_to', { acquired_to: '1945' }, 'acquired_to'],
     ['a 201-character query', { query: 'x'.repeat(201) }, 'query'],
     ['a 121-character artist', { artist: 'x'.repeat(121) }, 'artist'],
     ['a 121-character department', { department: 'x'.repeat(121) }, 'department'],
@@ -604,7 +725,10 @@ describe('artic_search_artworks validation', () => {
     const error = errorOf(await search(input));
     expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
     expect(error.data.reason).toBe('invalid_arguments');
-    expect(JSON.stringify(error.data.issues)).toContain(`"${field}"`);
+    // At the field's own path: an unknown key is reported at the root, so it never passes here.
+    expect((error.data.issues as { path: unknown[] }[]).map((issue) => issue.path[0])).toContain(
+      field,
+    );
     expect(fetchFake).not.toHaveBeenCalled();
   });
 
@@ -616,7 +740,11 @@ describe('artic_search_artworks validation', () => {
       'style',
       'subject',
       'classification',
+      'material',
+      'technique',
+      'theme',
       'place_of_origin',
+      'gallery',
       'artist',
       ...Array.from({ length: 40 }, (_, index) => `bogus${index}`),
     ];
@@ -625,8 +753,8 @@ describe('artic_search_artworks validation', () => {
     expect((error.data.issues as unknown[]).length).toBeLessThanOrEqual(2);
   });
 
-  it('accepts the boundary values 0, 12, 1, and 1000', async () => {
-    installAicService(
+  it('accepts the boundary values 0, 100, 1, and 1000', async () => {
+    const fetchFake = installAicService(
       scriptedFetch(
         jsonResponder(searchEnvelope([], 0)),
         jsonResponder(searchEnvelope([], 0)),
@@ -634,14 +762,59 @@ describe('artic_search_artworks validation', () => {
       ),
     );
     expect((await search({ limit: 0 })).isError).toBeUndefined();
-    expect((await search({ limit: 12 })).isError).toBeUndefined();
+    const atCap = await search({ limit: 100 });
+    expect(atCap.isError).toBeUndefined();
+    expect(structuredOf<SearchRun>(atCap).cap).toBe(100);
+    expect(bodyOf(fetchFake, 1)).toMatchObject({ limit: 100 });
     expect((await search({ page: 1000, limit: 1 })).isError).toBeUndefined();
+  });
+
+  it('describes what each sort leaves out and what the acquisition fields mean', () => {
+    const acquiredBounds = { type: 'integer', minimum: 1879, maximum: 2100 };
+    expect(z.toJSONSchema(searchArtworks.input, { io: 'input' })).toMatchObject({
+      properties: {
+        sort: {
+          enum: ['relevance', 'date_asc', 'date_desc', 'acquired_desc', 'acquired_asc'],
+          description: expect.stringMatching(
+            /works without one come last, and records with a placeholder start year \(outside -8000 to 2100\) are left out\..*no recorded fiscal year last/,
+          ),
+        },
+        acquired_from: {
+          ...acquiredBounds,
+          description: expect.stringMatching(/never match.*complete provenance-review set/),
+        },
+        acquired_to: { ...acquiredBounds, description: expect.stringContaining('never match') },
+      },
+    });
+    expect(z.toJSONSchema(searchArtworks.output)).toMatchObject({
+      properties: {
+        artworks: {
+          items: {
+            required: expect.arrayContaining(['main_reference_number']),
+            properties: {
+              acquisition_fiscal_year: {
+                description: expect.stringMatching(
+                  /fiscal year in which the museum acquired the work.*can differ.*absent when unrecorded/,
+                ),
+              },
+            },
+          },
+        },
+      },
+    });
+    expect(z.toJSONSchema(searchArtworks.output)).not.toMatchObject({
+      properties: {
+        artworks: { items: { required: expect.arrayContaining(['acquisition_fiscal_year']) } },
+      },
+    });
   });
 });
 
 describe('artic_search_artworks window and range guards', () => {
   it.each([
     [84, 12],
+    [11, 100],
+    [50, 100],
     [1000, 2],
     [501, 2],
     [101, 10],
@@ -665,6 +838,7 @@ describe('artic_search_artworks window and range guards', () => {
     [1000, 1],
     [500, 2],
     [100, 10],
+    [10, 100],
   ])('allows page %i with limit %i, exactly on the window edge', async (page, limit) => {
     const fetchFake = emptyResults();
     expect((await search({ page, limit })).isError).toBeUndefined();
@@ -680,6 +854,28 @@ describe('artic_search_artworks window and range guards', () => {
     expect(error.data.recovery?.hint).toBe(YEAR_RANGE_RECOVERY);
     expect(error.message).toContain('year_from 2000 is later than year_to 1900');
     expect(fetchFake).not.toHaveBeenCalled();
+  });
+
+  it('fails acquired_from above acquired_to as invalid_year_range before calling upstream', async () => {
+    const fetchFake = emptyResults();
+    const result = await search({ acquired_from: 2000, acquired_to: 1990 });
+    const error = errorOf(result);
+    expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(error.data.reason).toBe('invalid_year_range');
+    expect(error.data.recovery?.hint).toBe(YEAR_RANGE_RECOVERY);
+    expect(error.message).toContain('acquired_from 2000 is later than acquired_to 1990');
+    expect(textOf(result)).toContain(`Recovery: ${YEAR_RANGE_RECOVERY}`);
+    expect(fetchFake).not.toHaveBeenCalled();
+  });
+
+  it('accepts acquired years at 1879 and 2100 and an equal acquired_from and acquired_to', async () => {
+    const fetchFake = installAicService(
+      scriptedFetch(jsonResponder(searchEnvelope([], 0)), jsonResponder(searchEnvelope([], 0))),
+    );
+    expect((await search({ acquired_from: 1879, acquired_to: 2100 })).isError).toBeUndefined();
+    expect((await search({ acquired_from: 1942, acquired_to: 1942 })).isError).toBeUndefined();
+    expect(filtersOf(fetchFake, 0)).toEqual([{ range: { fiscal_year: { gte: 1879, lte: 2100 } } }]);
+    expect(filtersOf(fetchFake, 1)).toEqual([{ range: { fiscal_year: { gte: 1942, lte: 1942 } } }]);
   });
 
   it('reports the window before the year range when both are violated', async () => {
@@ -800,6 +996,28 @@ describe('artic_search_artworks paging', () => {
     expect(out).not.toHaveProperty('next_page');
   });
 
+  it('at limit 100 points page 9 to page 10, which ends the window at match 1,000', async () => {
+    const fetchFake = installAicService(
+      scriptedFetch(
+        jsonResponder(searchEnvelope(rows(100, 801), 5000)),
+        jsonResponder(searchEnvelope(rows(100, 901), 5000)),
+      ),
+    );
+    const ninth = structuredOf<SearchRun>(await search({ page: 9, limit: 100 }));
+    expect(ninth).toMatchObject({ page: 9, has_more: true, next_page: 10, shown: 100, cap: 100 });
+    const tenth = await search({ page: 10, limit: 100 });
+    const out = structuredOf<SearchRun>(tenth);
+    expect(out).toMatchObject({ page: 10, has_more: true, truncated: true, shown: 100, cap: 100 });
+    expect(out.artworks.map((artwork) => artwork.id)).toEqual(
+      Array.from({ length: 100 }, (_, index) => 901 + index),
+    );
+    expect(out).not.toHaveProperty('next_page');
+    expect(out.notice).toBe(WINDOW_NOTICE);
+    expect(contentText(tenth)).toContain(WINDOW_NOTICE);
+    expect(contentText(tenth)).toContain('(id 1000)');
+    expect(bodyOf(fetchFake, 1)).toMatchObject({ page: 10, limit: 100 });
+  });
+
   it('returns counts only for limit 0, reporting that rows exist', async () => {
     serve(searchEnvelope([], 7));
     const out = structuredOf<SearchRun>(await search({ limit: 0, facets: ['department'] }));
@@ -810,7 +1028,7 @@ describe('artic_search_artworks paging', () => {
       truncated: true,
       shown: 0,
       cap: 0,
-      notice: 'Counts only (limit 0); set limit between 1 and 12 to list the matching artworks.',
+      notice: 'Counts only (limit 0); set limit between 1 and 100 to list the matching artworks.',
     });
     expect(out).not.toHaveProperty('next_page');
   });
@@ -932,6 +1150,22 @@ describe('artic_search_artworks zero-hit guidance', () => {
     const out = structuredOf<SearchRun>(await search({ department: 'D', has_image: true }));
     expect(out).not.toHaveProperty('notice');
   });
+
+  it('says acquired filters exclude unrecorded works, on both surfaces, whenever one is set', async () => {
+    serve(searchEnvelope(rows(2), 2));
+    const result = await search({ acquired_from: 2020 });
+    expect(structuredOf<SearchRun>(result).notice).toBe(ACQUIRED_EXCLUSION);
+    expect(contentText(result)).toContain(ACQUIRED_EXCLUSION);
+
+    serve(searchEnvelope(rows(10), 25));
+    expect(structuredOf<SearchRun>(await search({ acquired_to: 1900 })).notice).toBe(
+      `More matches: call again with page 2. ${ACQUIRED_EXCLUSION}`,
+    );
+
+    expect(await zeroHit({ acquired_from: 1933, acquired_to: 1945 })).toBe(
+      `No artworks matched. ${ACQUIRED_EXCLUSION}`,
+    );
+  });
 });
 
 // --- Rows and facets ------------------------------------------------------------------------
@@ -944,6 +1178,7 @@ describe('artic_search_artworks rows', () => {
     expect(row).toEqual({
       id: 7,
       title: 'Synthetic Work 7',
+      main_reference_number: '7.1900',
       artist_display: 'Test Artist\nFrench, 1840-1900',
       artist_id: 900,
       date_display: '1890',
@@ -988,14 +1223,52 @@ describe('artic_search_artworks rows', () => {
     expect(row).toEqual({
       id: 9,
       title: '',
+      main_reference_number: '',
       is_public_domain: false,
       is_on_view: false,
       web_url: 'https://www.artic.edu/artworks/9',
     });
     const text = textOf(result);
     expect(text).toContain('## (untitled) (id 9)');
+    expect(text).toContain('- **Reference number:** not recorded\n');
     expect(text).toContain('**Public domain:** no · **On view:** no');
+    expect(text).not.toContain('Acquisition fiscal year');
     expect(text).not.toMatch(/undefined|null|NaN/);
+  });
+
+  it('carries the accession number and acquisition fiscal year on both surfaces, omitting an unrecorded year', async () => {
+    serve(
+      searchEnvelope(
+        [
+          artworkRecord(111628, {
+            title: 'Nighthawks',
+            main_reference_number: '1942.51',
+            fiscal_year: 1942,
+          }),
+          artworkRecord(117266, { main_reference_number: '1992.89', fiscal_year: 1992 }),
+          artworkRecord(20684, { main_reference_number: '1964.336', fiscal_year: null }),
+        ],
+        3,
+      ),
+    );
+    const result = await search({ query: '1942.51' });
+    const [nighthawks, other, unrecorded] = structuredOf<SearchRun>(result).artworks;
+    expect(nighthawks).toMatchObject({
+      main_reference_number: '1942.51',
+      acquisition_fiscal_year: 1942,
+    });
+    expect(other).toMatchObject({
+      main_reference_number: '1992.89',
+      acquisition_fiscal_year: 1992,
+    });
+    expect(unrecorded).toMatchObject({ main_reference_number: '1964.336' });
+    expect(unrecorded).not.toHaveProperty('acquisition_fiscal_year');
+    const text = textOf(result);
+    expect(text).toContain(
+      '## Nighthawks (id 111628)\n- **Artist:** Test Artist French, 1840-1900 · artist_id 900\n- **Date:** 1890 · start 1890 · end 1890\n- **Reference number:** 1942.51 · **Acquisition fiscal year:** 1942\n',
+    );
+    expect(text).toContain('- **Reference number:** 1992.89 · **Acquisition fiscal year:** 1992\n');
+    expect(text).toContain('- **Reference number:** 1964.336\n');
   });
 
   it('drops placeholder years and keeps the display date', async () => {
@@ -1136,6 +1409,94 @@ describe('artic_search_artworks facets', () => {
     const out = structuredOf<SearchRun>(result);
     expect(out.facets?.subject).toEqual([{ value: HOSTILE_INLINE, count: 2 }]);
   });
+
+  it('returns the requested gallery and theme facet rows on both surfaces and omits the rest', async () => {
+    const fetchFake = serve(
+      searchEnvelope([], 29, {
+        aggregations: {
+          gallery: {
+            buckets: [
+              { key: 'Gallery 243', doc_count: 18 },
+              { key: 'Gallery 240', doc_count: 7 },
+              { key: 'Gallery 201', doc_count: 3 },
+              { key: 'Gallery 225', doc_count: 1 },
+            ],
+            sum_other_doc_count: 0,
+          },
+          theme: {
+            buckets: [
+              { key: 'Essentials', doc_count: 3 },
+              { key: 'Save Ferris', doc_count: 3 },
+            ],
+            sum_other_doc_count: 0,
+          },
+        },
+      }),
+    );
+    const result = await search({
+      artist_id: 35809,
+      on_view_only: true,
+      limit: 0,
+      facets: ['gallery', 'theme'],
+    });
+    const out = structuredOf<SearchRun>(result);
+    expect(out.totalCount).toBe(29);
+    expect(out.facets).toEqual({
+      gallery: [
+        { value: 'Gallery 243', count: 18 },
+        { value: 'Gallery 240', count: 7 },
+        { value: 'Gallery 201', count: 3 },
+        { value: 'Gallery 225', count: 1 },
+      ],
+      theme: [
+        { value: 'Essentials', count: 3 },
+        { value: 'Save Ferris', count: 3 },
+      ],
+    });
+    expect(Object.keys(bodyOf(fetchFake).aggs as object)).toEqual(['gallery', 'theme']);
+    const text = textOf(result);
+    expect(text).toMatch(
+      /### theme\n- Essentials \(3\)\n- Save Ferris \(3\)\n\n### gallery\n- Gallery 243 \(18\)\n- Gallery 240 \(7\)\n- Gallery 201 \(3\)\n- Gallery 225 \(1\)/,
+    );
+    for (const absent of ['material', 'technique', 'department', 'artist']) {
+      expect(text).not.toContain(`### ${absent}`);
+    }
+  });
+
+  it('names all eleven facets in the input schema and describes each new facet output', () => {
+    expect(z.toJSONSchema(searchArtworks.input, { io: 'input' })).toMatchObject({
+      properties: {
+        facets: {
+          description: expect.stringContaining(
+            'department, artwork_type, style, subject, classification, material, technique, theme, place_of_origin, gallery, artist.',
+          ),
+        },
+      },
+    });
+    /** A facet output schema: its scope sentence, and the pass-back rule on each value. */
+    const facetSchema = (name: string, scope: string) => ({
+      description: expect.stringContaining(scope),
+      items: {
+        properties: {
+          value: {
+            description: expect.stringContaining(`pass it back verbatim as the ${name} filter`),
+          },
+        },
+      },
+    });
+    expect(z.toJSONSchema(searchArtworks.output)).toMatchObject({
+      properties: {
+        facets: {
+          properties: {
+            material: facetSchema('material', 'counts overlap'),
+            technique: facetSchema('technique', 'counts overlap'),
+            theme: facetSchema('theme', 'counts overlap'),
+            gallery: facetSchema('gallery', 'Only works on view carry a gallery'),
+          },
+        },
+      },
+    });
+  });
 });
 
 // --- format() --------------------------------------------------------------------------------
@@ -1246,11 +1607,6 @@ describe('artic_search_artworks format', () => {
 // --- Response size ----------------------------------------------------------------------------
 
 describe('artic_search_artworks response size', () => {
-  /** UTF-8 bytes the call puts on the wire: format() text and structuredContent, each as JSON. */
-  const wireBytes = (result: ToolRun) =>
-    Buffer.byteLength(JSON.stringify(textOf(result))) +
-    Buffer.byteLength(JSON.stringify(result.structuredContent));
-
   /** The `limit` maximum the tool advertises in its input JSON Schema. */
   const advertisedLimitMax = (): number => {
     const limit = z.toJSONSchema(searchArtworks.input, { io: 'input' }).properties?.limit;
@@ -1260,13 +1616,11 @@ describe('artic_search_artworks response size', () => {
     return limit.maximum;
   };
 
-  it('keeps a full page of the heaviest catalog rows with every facet under 100,000 bytes', async () => {
-    const limit = 12;
+  it('returns a full page of 100 of the heaviest catalog rows whole, with seven facets', async () => {
     expect(advertisedLimitMax()).toBe(1000);
-    serve(
-      searchEnvelope(heaviestArtworkRows(limit), 5000, {
-        aggregations: longestFacetAggregations(),
-      }),
+    const upstreamRows = heaviestArtworkRows(100);
+    const fetchFake = serve(
+      searchEnvelope(upstreamRows, 5000, { aggregations: longestFacetAggregations() }),
     );
     const result = await search({
       limit: advertisedLimitMax(),
@@ -1281,9 +1635,16 @@ describe('artic_search_artworks response size', () => {
       ],
     });
     const out = structuredOf<SearchRun>(result);
-    expect(out.shown).toBe(limit);
+    expect(out).toMatchObject({ shown: 100, cap: 100, next_page: 2 });
+    expect(out.notice).toContain('Applied limit 100 to requested limit 1000');
+    expect(contentText(result)).toContain('Applied limit 100 to requested limit 1000');
+    expect(bodyOf(fetchFake)).toMatchObject({ limit: 100 });
+    expect(out.artworks.map((artwork) => artwork.artist_display)).toEqual(
+      upstreamRows.map((row) => row.artist_display),
+    );
     expect(Object.values(out.facets ?? {}).every((values) => values.length === 15)).toBe(true);
-    expect(wireBytes(result)).toBeLessThanOrEqual(100_000);
+    const text = textOf(result);
+    for (const row of upstreamRows) expect(text).toContain(`(id ${row.id})`);
   });
 });
 
@@ -1336,7 +1697,7 @@ describe('artic_search_artworks upstream failures', () => {
 });
 
 describe('artic_search_artworks past the 2,048-byte GET limit', () => {
-  /** A 115-character query, five filters, and all seven facets: 2,320 bytes as a GET query string. */
+  /** A 115-character query, five filters, and seven facets: 2,328 bytes as a GET query string. */
   const LONG_SEARCH = {
     query:
       'portrait of a woman seated in a garden with flowers and a small dog beside her in the afternoon light near a river',
@@ -1375,7 +1736,7 @@ describe('artic_search_artworks past the 2,048-byte GET limit', () => {
     for (const artwork of out.artworks) expect(text).toContain(`(id ${artwork.id})`);
     const sent = searchCallOf(fetchFake);
     expect(sent.method).toBe('POST');
-    expect(getBytes(fetchFake)).toBe(2320);
+    expect(getBytes(fetchFake)).toBe(2328);
     expect(sent.body).toMatchObject({ q: LONG_SEARCH.query, limit: 12 });
     expect(Object.keys(sent.body.aggs as object)).toHaveLength(7);
   });

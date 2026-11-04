@@ -35,8 +35,8 @@ The Art Institute of Chicago's collection: about 133,000 artworks, plus artists,
 
 | Tool | Description |
 |:---|:---|
-| `artic_search_artworks` | Search artworks by text and filters, with facet counts and date sorting |
-| `artic_get_artworks` | Fetch full records for up to 10 artworks: description, provenance, histories, image URLs with rights status, related media |
+| `artic_search_artworks` | Search artworks by text and filters, with facet counts and date or acquisition-year sorting |
+| `artic_get_artworks` | Fetch full records for up to 100 artworks: description, provenance, histories, image URLs with rights status, related media |
 | `artic_search_artists` | Find artists, cultures, and organizations by name or id, with available Getty ULAN identifiers, life dates, artwork counts, and sample works |
 | `artic_search_exhibitions` | Search past, current, and upcoming exhibitions by text, date, artwork id, or artist id |
 | `artic_search_audio_guide` | Search audio-guide stops by text: title, MP3 URL, and transcript |
@@ -54,33 +54,33 @@ The Art Institute of Chicago's collection: about 133,000 artworks, plus artists,
 
 | Skill | Description |
 |:---|:---|
-| `art-institute-chicago-guide` | Gates and workflows the tool descriptions don't carry: finding works by an artist or culture, a work's exhibition history, counts past the 1,000-match window, provenance research, audio-guide stops versus linked media, accent-exact filter values, and reuse terms per output |
+| `art-institute-chicago-guide` | Gates and workflows the tool descriptions don't carry: finding works by an artist or culture, a work's exhibition history, counts past the 1,000-match window, provenance research and acquisition years, audio-guide stops versus linked media, accent-exact filter values, and reuse terms per output |
 
 The server serves it over MCP as `skill://art-institute-chicago-guide/SKILL.md`; it also ships in `skills/` in the npm package and Docker image.
 
 ## Capability reference
 
-Searches and vocabulary lookup accept limits up to 1,000, and the response states the cap actually applied: artworks 12, artist query and exhibitions 25, audio guide 2, vocabulary 100. Keep the same requested limit when following `next_page`; page times applied size must stay within 1,000. At the vocabulary cap, narrow with `contains`.
+Searches and vocabulary lookup accept limits up to 1,000, and the response states the cap actually applied: 100 rows for artworks, artists, exhibitions, and the audio guide, and 1,000 values for vocabulary. Defaults are 10 rows (audio guide 2, vocabulary 25). Keep the same requested limit when following `next_page`; page times applied size must stay within 1,000. At the vocabulary cap, narrow with `contains`.
 
 ### `artic_search_artworks` <sub>tool</sub>
 
-- `query` (every word must match; `"exact phrase"`, `-exclude`, and `a | b` work) plus filters `artist`, `artist_id`, `department`, `artwork_type`, `style`, `subject`, `classification`, `material`, `technique`, `theme`, `place_of_origin`, `gallery`, `year_from` / `year_to` (date-span overlap, negative for BCE), `public_domain_only`, `on_view_only`, and `has_image`, combined with AND
-- Up to 12 rows per page (default 10), within the first 1,000 matches; `sort` is `relevance`, `date_asc`, or `date_desc`, and `sort_applied` reports `popularity` when relevance had no query text
-- `facets` adds the top 15 values for up to seven fields (`artist` counts every credited artist and rows carry `artist_id`); `limit: 0` returns counts only
+- `query` (every word must match, except common English words such as the and of, which are ignored; `"exact phrase"`, `-exclude`, and `a | b` work) plus filters `artist`, `artist_id`, `department`, `artwork_type`, `style`, `subject`, `classification`, `material`, `technique`, `theme`, `place_of_origin`, `gallery`, `year_from` / `year_to` (date-span overlap, negative for BCE), `acquired_from` / `acquired_to` (fiscal year of acquisition, inclusive; works with no recorded year never match), `public_domain_only`, `on_view_only`, and `has_image`, combined with AND
+- Up to 100 rows per page (default 10), within the first 1,000 matches; rows carry `main_reference_number` and, when recorded, `acquisition_fiscal_year`. `sort` is `relevance`, `date_asc`, `date_desc`, `acquired_desc` (recent acquisitions first), or `acquired_asc`; works missing the sorted field come last, and `sort_applied` reports `popularity` when relevance had no query text
+- `facets` adds the top 15 values for any of 11 fields (the ten vocabularies and `artist`; `artist` counts every credited artist and rows carry `artist_id`); `limit: 0` returns counts only
 
 ---
 
 ### `artic_get_artworks` <sub>tool</sub>
 
-- `ids` takes up to 1,000 entries (comma strings up to 100,000 characters); blanks and duplicates are dropped and artwork page URLs are read as ids. The first 10 are fetched; `sections` chooses from description and provenance (default), exhibition_history, publication_history, and catalogue
-- Records return in request order. `missing_ids` lists ids the museum doesn't have; `deferred_ids` lists records held back by the response budget plus ids not yet tried, to pass to the same tool again
-- `include_related_media` (default on) loads up to 20 linked lectures and audio stops; `description_attribution` appears whenever CC BY description text is returned
+- `ids` takes up to 1,000 entries (comma strings up to 100,000 characters); blanks and duplicates are dropped and artwork page URLs are read as ids. The first 100 are fetched; `sections` chooses from description and provenance (default), exhibition_history, publication_history, and catalogue, and is the size lever: every section on 100 well-documented works comes to about 1.4 MB
+- Records return whole, in request order. `missing_ids` lists ids the museum doesn't have; `deferred_ids` lists ids past the first 100, to pass to the same tool again
+- `include_related_media` (default on) loads up to 100 linked lectures and audio stops; `description_attribution` appears whenever CC BY description text is returned
 
 ---
 
 ### `artic_search_artists` <sub>tool</sub>
 
-- `query` (all name words must match) or `ids`, not both; ids takes up to 1,000 entries (comma strings up to 100,000 characters) and the first 25 are fetched. Query mode adds `artists_only` (default `true`), `born_from` / `born_to`, and up to 25 agents per page
+- `query` (all name words must match) or `ids`, not both; ids takes up to 1,000 entries (comma strings up to 100,000 characters) and the first 100 are fetched. Query mode adds `artists_only` (default `true`), `born_from` / `born_to`, and up to 100 agents per page
 - Each agent carries `artwork_count`, up to three `sample_works` (the museum's highlights first), life years, and `alt_names`; ids mode reports `missing_ids` and `deferred_ids` to pass as ids in the next call
 - `ulan_id` is the Getty ULAN identifier when the museum records one; coverage is sparse, and it is distinct from the museum `id` used by other tools
 
@@ -88,23 +88,24 @@ Searches and vocabulary lookup accept limits up to 1,000, and the response state
 
 ### `artic_search_exhibitions` <sub>tool</sub>
 
-- `query`, `when` (`current`, `upcoming`, `past`, or the default `any`), `date_from` / `date_to` (`YYYY-MM-DD`, matched by run overlap), and exact `artwork_id` / `artist_id` filters, combined with AND; up to 25 per page within the first 1,000 matches
+- `query`, `when` (`current`, `upcoming`, `past`, or the default `any`), `date_from` / `date_to` (`YYYY-MM-DD`, matched by run overlap), and exact `artwork_id` / `artist_id` filters, combined with AND; up to 100 per page within the first 1,000 matches. `query` ignores common English words such as the and of
 - Relationship filters cover recorded museum links; absent links do not prove an artwork or artist never appeared in a show
 - `sort` is `relevance`, `start_desc`, or `start_asc`, defaulting to relevance with a query and `start_desc` without; `status` is the museum's label and doesn't say whether a show is open (`when` does)
+- A missing date is unrecorded, not a run that did not happen: a show with no closing date is past when marked `Closed`, else current from its opening, and a date window reads it as running on its opening date alone (`Closed`) or on from it; a show with only a closing date ran on that date alone, and one with no dates matches no window
 - Rows carry dates, gallery, summary, web page, image, `artist_ids`, and the `artworks` shown, when the museum lists them
 
 ---
 
 ### `artic_search_audio_guide` <sub>tool</sub>
 
-- `query` is required and matches stop titles and transcripts (every word); up to two whole stops per page (default 2)
+- `query` is required and matches stop titles and transcripts (every word except common English words such as the and of, which are ignored); up to 100 whole stops per page (default 2)
 - Each stop has `title`, `audio_url` (MP3), and `transcript` but no artwork id; every response carries `license_text` and `source_citation` (content is for noncommercial educational and personal use)
 
 ---
 
 ### `artic_lookup_vocabulary` <sub>tool</sub>
 
-- `vocabulary` is one of `department`, `artwork_type`, `style`, `subject`, `classification`, `material`, `technique`, `theme`, `place_of_origin`, or `gallery`; optional `contains` substring (ignoring case and accents, so `applique` finds `appliqué (technique)`), `public_domain_only`, and up to 100 values (default 25)
+- `vocabulary` is one of `department`, `artwork_type`, `style`, `subject`, `classification`, `material`, `technique`, `theme`, `place_of_origin`, or `gallery`; optional `contains` substring (ignoring case and accents, so `applique` finds `appliqué (technique)`), `public_domain_only`, and up to 1,000 values (default 25)
 - Values come back most common first with `artwork_count`, in the exact form the `artic_search_artworks` filter of the same name accepts; `filter_param` names that filter
 
 ---
@@ -122,8 +123,8 @@ Art Institute-specific:
 
 - Keyless access to the Art Institute of Chicago public API (`api.artic.edu/api/v1`); IIIF image URLs are built from each record (843 px for every image, 1686 px and a IIIF manifest for public-domain works), never fetched
 - One shared request pacer under the API's published limit of 60 requests a minute, retries for transient failures inside a 20-second deadline, and an in-process response cache (records 6 hours, searches 15 minutes, vocabularies 24 hours)
-- Text search requires every word to match, so totals are real and a miss reads as zero hits; results keep the museum's relevance order
-- Placeholder years in the museum's data (outside −8000 to 2100) are left out of output, year filters, and date sorts; `date_display` stays the authority
+- Text search requires every word to match, except common English words such as the and of, which are ignored, so totals are real and a miss reads as zero hits; results keep the museum's relevance order
+- Placeholder years in the museum's data (outside −8000 to 2100) are left out of output, year filters, and date sorts; `date_display` stays the authority. Date and acquisition sorts keep works with no value for the sorted field and list them last
 
 Agent-friendly output:
 
@@ -150,9 +151,10 @@ This server is an independent project and is not affiliated with or endorsed by 
 - The API's limit of 60 requests a minute is per egress IP, so every client behind one IP shares it. A call that cannot start within its 20-second budget fails as `rate_limited`.
 - Curatorial text is sparse: about 10% of artworks have a `description`, and in a general sample 94% lack provenance. About 1% of artists have a biography, and there is no nationality field, only `artist_display` prose.
 - About 15 artworks carry placeholder years and about 4,900 carry no dates; neither matches a year filter.
+- About a third of artworks (47,677 of 133,165, 2026-11-03) have no recorded acquisition fiscal year; they never match `acquired_from` / `acquired_to` and sort last by acquisition year.
 - Some vocabulary titles are stored cut at 40 characters in the museum's data (`gelatin silver (developing-out-paper) pr`). Pass values as `artic_lookup_vocabulary` lists them.
 - The API's firewall refuses any request whose text contains markup such as `<script>`; the call fails as `request_blocked`.
-- About 4% of exhibitions list their artworks.
+- About 4% of exhibitions list their artworks. 650 of 6,262 have no recorded closing date (2026-11-03); the date filters read those as described above.
 - Audio-guide stops have no artwork link. Some titles are file names, and some transcripts are in Spanish.
 - Image URLs can stop resolving when the museum unpublishes or replaces an image, and relevance order follows the museum's ranking, which may shift.
 

@@ -206,13 +206,13 @@ export function mobileSoundRecord(id: number, overrides: Record<string, unknown>
   };
 }
 
-// --- Response-size worst case -----------------------------------------------------
+// --- Heaviest-page worst case -----------------------------------------------------
 
 /**
  * The twelve artwork rows that put the most bytes on the `artic_search_artworks`
- * wire, measured over the whole collection (Design Decision 45), heaviest first:
- * the length of each upstream text field, the line count of `artist_display`,
- * and whether the row has an image and is public domain. The text is synthetic.
+ * wire, measured over the whole collection, heaviest first: the length of each
+ * upstream text field, the line count of `artist_display`, and whether the row
+ * has an image and is public domain. The text is synthetic.
  */
 const HEAVIEST_ROWS = [
   [22, 3567, 7, 4, 144, 4, 19, 6, 160, true, true],
@@ -273,7 +273,7 @@ const LONGEST_FACET_VALUES = {
 } as const;
 const LONGEST_ARTIST_NAME = 97;
 
-/** Aggregations for all seven artwork facets, 15 values each, every value as long as the longest the collection holds. */
+/** Aggregations for the artwork facets above plus `artist`, 15 values each, every value as long as the longest the collection holds. */
 export function longestFacetAggregations(): Record<string, unknown> {
   const buckets = <T>(build: (index: number) => T) => ({
     buckets: Array.from({ length: 15 }, (_, index) => build(index)),

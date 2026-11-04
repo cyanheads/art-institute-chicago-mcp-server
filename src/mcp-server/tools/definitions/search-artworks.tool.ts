@@ -1,7 +1,7 @@
 /**
  * @fileoverview `artic_search_artworks` — collection search by text and
  * structured filters, with optional facet counts over the filtered set and
- * date sorting. Rows are compact; full records come from `artic_get_artworks`.
+ * date or acquisition sorting. Rows are compact; full records come from `artic_get_artworks`.
  * @module mcp-server/tools/definitions/search-artworks.tool
  */
 
@@ -13,6 +13,7 @@ import {
   galleryInput,
   inlineSafe,
   listInput,
+  PAGE_MAX,
   pageInfo,
   quoteBlock,
   SEARCH_WINDOW,
@@ -24,22 +25,16 @@ import {
 } from '@/services/aic/aic-text.js';
 import { artworkSummaryShape, summaryLines, titleText, yesNo } from '../artwork-output.js';
 
-const FACETS = [
-  'department',
-  'artwork_type',
-  'style',
-  'subject',
-  'classification',
-  'place_of_origin',
-  'artist',
-] as const;
+/** Every vocabulary filter, in field table order, then artist; each value facet passes back as its filter. */
+const FACETS = [...VOCABULARY_FILTERS, 'artist'] as const;
 
 const SCOPE_FLAGS = ['public_domain_only', 'on_view_only', 'has_image'] as const;
 
-/** Most rows a page returns: a page of the heaviest catalog rows with every facet fits 100,000 wire bytes. */
-const LIMIT_MAX = 12;
+/** The museum's founding year; the earliest recorded acquisition fiscal year is 1890. */
+const ACQUIRED_MIN = 1879;
 
-const facetValues = (filter: string) =>
+/** `scope` says how the counts relate to the matching works, when a work can carry several values or none. */
+const facetValues = (filter: string, scope = '') =>
   z
     .array(
       z
@@ -52,11 +47,13 @@ const facetValues = (filter: string) =>
         .describe('One facet value and its count.'),
     )
     .optional()
-    .describe(`Top ${filter} values over the filtered set, most common first.`);
+    .describe(`Top ${filter} values over the filtered set, most common first.${scope}`);
+
+const OVERLAPPING = ' A work can carry several values, so counts overlap.';
 
 const SearchInput = z.object({
   query: blankAsUnset(z.string().trim().max(200).optional()).describe(
-    'Text matched against titles, artists, descriptions, provenance, and other catalog fields; every word must match. Supports "exact phrase", -exclude, and a | b.',
+    'Text matched against titles, artists, descriptions, provenance, and other catalog fields; every word must match, except common English words such as the and of, which are ignored. Supports "exact phrase", -exclude, and a | b.',
   ),
   artist: blankAsUnset(z.string().trim().max(120).optional()).describe(
     'Artist or culture name matched against every credited artist (all words must match).',
@@ -100,6 +97,12 @@ const SearchInput = z.object({
   year_to: blankAsUnset(z.number().int().min(YEAR_MIN).max(YEAR_MAX).optional()).describe(
     'Latest year; a work matches when its date span overlaps year_from to year_to. Negative for BCE.',
   ),
+  acquired_from: blankAsUnset(z.number().int().min(ACQUIRED_MIN).max(YEAR_MAX).optional()).describe(
+    'Earliest fiscal year in which the museum acquired the work (acquisition_fiscal_year), inclusive. Works with no recorded acquisition year never match, so this filter alone never gives a complete provenance-review set.',
+  ),
+  acquired_to: blankAsUnset(z.number().int().min(ACQUIRED_MIN).max(YEAR_MAX).optional()).describe(
+    'Latest fiscal year in which the museum acquired the work (acquisition_fiscal_year), inclusive. Works with no recorded acquisition year never match.',
+  ),
   public_domain_only: blankAsUnset(z.boolean().default(false)).describe(
     'Only public-domain works, whose images are CC0.',
   ),
@@ -107,17 +110,23 @@ const SearchInput = z.object({
     'Only works on view at the museum now.',
   ),
   has_image: blankAsUnset(z.boolean().default(false)).describe('Only works with an image.'),
-  facets: blankAsUnset(listInput(z.array(z.enum(FACETS)).max(7).optional(), 7)).describe(
-    'Facet counts to compute over the filtered set (top 15 values each): department, artwork_type, style, subject, classification, place_of_origin, artist. An array or a comma-separated string.',
+  facets: blankAsUnset(
+    listInput(z.array(z.enum(FACETS)).max(FACETS.length).optional(), FACETS.length),
+  ).describe(
+    `Facet counts to compute over the filtered set (top 15 values each), any or all of: ${FACETS.join(', ')}. An array or a comma-separated string.`,
   ),
-  sort: blankAsUnset(z.enum(['relevance', 'date_asc', 'date_desc']).default('relevance')).describe(
-    'relevance ranks by query text, or by museum popularity without it; date_asc and date_desc sort by start year.',
+  sort: blankAsUnset(
+    z
+      .enum(['relevance', 'date_asc', 'date_desc', 'acquired_desc', 'acquired_asc'])
+      .default('relevance'),
+  ).describe(
+    'relevance ranks by query text, or by museum popularity without it. date_asc and date_desc sort by start year: works without one come last, and records with a placeholder start year (outside -8000 to 2100) are left out. acquired_desc (recent acquisitions first) and acquired_asc sort by acquisition fiscal year, with works that have no recorded fiscal year last.',
   ),
   page: blankAsUnset(z.number().int().min(1).max(SEARCH_WINDOW).default(1)).describe(
     'Page to return (1-based); page times the applied limit may not exceed 1,000.',
   ),
   limit: blankAsUnset(z.number().int().min(0).max(1000).default(10)).describe(
-    `Requested rows per page (0-1,000); at most ${LIMIT_MAX} are returned. 0 returns only totalCount and facets.`,
+    `Requested rows per page (0-1,000); at most ${PAGE_MAX} are returned. 0 returns only totalCount and facets.`,
   ),
 });
 
@@ -160,7 +169,7 @@ function zeroHitFragments(input: SearchInputValues): string[] {
 export const searchArtworks = tool('artic_search_artworks', {
   title: 'Search artworks',
   description:
-    'Search the Art Institute of Chicago collection by text and structured filters, ranked by relevance or sorted by date. Text matches all words across titles, artists, descriptions, provenance, and other catalog fields. Filters combine with AND. Results reach the first 1,000 matches; narrow with filters for more. Set limit to 0 with facets to get only counts. Use artic_lookup_vocabulary for filter values and artic_get_artworks for full records.',
+    'Search the Art Institute of Chicago collection by text and structured filters, ranked by relevance or sorted by date or acquisition year. Text matches all words across titles, artists, descriptions, provenance, and other catalog fields; common English words such as the and of are ignored. Filters combine with AND. Results reach the first 1,000 matches; narrow with filters for more. Set limit to 0 with facets to get only counts. Use artic_lookup_vocabulary for filter values and artic_get_artworks for full records.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: SearchInput,
   output: z.object({
@@ -171,10 +180,17 @@ export const searchArtworks = tool('artic_search_artworks', {
       .object({
         department: facetValues('department'),
         artwork_type: facetValues('artwork_type'),
-        style: facetValues('style'),
-        subject: facetValues('subject'),
-        classification: facetValues('classification'),
+        style: facetValues('style', OVERLAPPING),
+        subject: facetValues('subject', OVERLAPPING),
+        classification: facetValues('classification', OVERLAPPING),
+        material: facetValues('material', OVERLAPPING),
+        technique: facetValues('technique', OVERLAPPING),
+        theme: facetValues('theme', OVERLAPPING),
         place_of_origin: facetValues('place_of_origin'),
+        gallery: facetValues(
+          'gallery',
+          ' Only works on view carry a gallery, each at most one, so the counts cover on-view works alone.',
+        ),
         artist: z
           .array(
             z
@@ -204,7 +220,7 @@ export const searchArtworks = tool('artic_search_artworks', {
         'Page to request next; absent when nothing remains or the next page would pass the first 1,000 matches.',
       ),
     sort_applied: z
-      .enum(['relevance', 'popularity', 'date_asc', 'date_desc'])
+      .enum(['relevance', 'popularity', 'date_asc', 'date_desc', 'acquired_desc', 'acquired_asc'])
       .describe(
         'Order applied; popularity when relevance was requested without query text (the museum popularity ranking).',
       ),
@@ -235,11 +251,11 @@ export const searchArtworks = tool('artic_search_artworks', {
     {
       reason: 'invalid_year_range',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'year_from is later than year_to.',
+      when: 'year_from is later than year_to, or acquired_from is later than acquired_to.',
       retryable: false,
       severity: 'notice',
       recovery:
-        'Set year_from at or below year_to; use negative years for BCE, for example year_from -500.',
+        'Set year_from at or below year_to and acquired_from at or below acquired_to; use negative years for BCE, for example year_from -500.',
     },
     {
       reason: 'rate_limited',
@@ -272,7 +288,7 @@ export const searchArtworks = tool('artic_search_artworks', {
 
   async handler(input, ctx) {
     const requestedLimit = input.limit;
-    input = { ...input, limit: Math.min(input.limit, LIMIT_MAX) };
+    input = { ...input, limit: Math.min(input.limit, PAGE_MAX) };
     ctx.enrich.total(0);
     ctx.enrich({ truncated: false, shown: 0, cap: input.limit });
 
@@ -292,6 +308,16 @@ export const searchArtworks = tool('artic_search_artworks', {
         `year_from ${input.year_from} is later than year_to ${input.year_to}.`,
       );
     }
+    if (
+      input.acquired_from !== undefined &&
+      input.acquired_to !== undefined &&
+      input.acquired_from > input.acquired_to
+    ) {
+      throw ctx.fail(
+        'invalid_year_range',
+        `acquired_from ${input.acquired_from} is later than acquired_to ${input.acquired_to}.`,
+      );
+    }
 
     const result = await getAicService().searchArtworks(input, ctx);
     const paging = pageInfo(result.total, input.page, input.limit);
@@ -308,7 +334,7 @@ export const searchArtworks = tool('artic_search_artworks', {
       fragments.push(...zeroHitFragments(input));
     } else if (input.limit === 0) {
       fragments.push(
-        `Counts only (limit 0); set limit between 1 and ${LIMIT_MAX} to list the matching artworks.`,
+        `Counts only (limit 0); set limit between 1 and ${PAGE_MAX} to list the matching artworks.`,
       );
     } else if (shown === 0) {
       fragments.push(
@@ -318,6 +344,11 @@ export const searchArtworks = tool('artic_search_artworks', {
       fragments.push(`More matches: call again with page ${paging.next_page}.`);
     } else if (paging.windowExhausted) {
       fragments.push(WINDOW_NOTICE);
+    }
+    if (input.acquired_from !== undefined || input.acquired_to !== undefined) {
+      fragments.push(
+        'Works with no recorded acquisition fiscal year are excluded; drop acquired_from/acquired_to to include them.',
+      );
     }
     const notice = fragments.join(' ');
     if (paging.has_more) ctx.enrich.truncated({ shown, cap: input.limit, guidance: notice });

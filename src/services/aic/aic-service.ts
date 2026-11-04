@@ -46,6 +46,7 @@ import {
   VOCABULARY_FIELDS,
   VOCABULARY_FILTERS,
   vocabularyFilterClause,
+  withoutStopWords,
   YEAR_MAX,
   YEAR_MIN,
 } from './aic-text.js';
@@ -90,6 +91,8 @@ const WINDOW_ERRORS = new Set(['Invalid limit', 'Invalid number of results']);
 const ARTWORK_SEARCH_FIELDS = [
   'id',
   'title',
+  'main_reference_number',
+  'fiscal_year',
   'artist_display',
   'artist_id',
   'artist_title',
@@ -112,6 +115,7 @@ const ARTWORK_DETAIL_FIELDS = [
   'title',
   'alt_titles',
   'main_reference_number',
+  'fiscal_year',
   'artist_display',
   'artist_id',
   'artist_ids',
@@ -187,10 +191,14 @@ export interface AicServiceOptions {
   version: string;
 }
 
-export type ArtworkSort = 'relevance' | 'date_asc' | 'date_desc';
-export type ArtworkSortApplied = 'relevance' | 'popularity' | 'date_asc' | 'date_desc';
+export type ArtworkSort = 'relevance' | 'date_asc' | 'date_desc' | 'acquired_desc' | 'acquired_asc';
+export type ArtworkSortApplied = ArtworkSort | 'popularity';
 
 export interface ArtworkSearchParams {
+  /** Earliest acquisition fiscal year (`fiscal_year`), inclusive. */
+  acquired_from?: number | undefined;
+  /** Latest acquisition fiscal year (`fiscal_year`), inclusive. */
+  acquired_to?: number | undefined;
   artist?: string | undefined;
   artist_id?: number | undefined;
   artwork_type?: string | undefined;
@@ -355,16 +363,12 @@ export class AicService {
   /** Collection search with text, structured filters, optional facet counts, and sorting. */
   async searchArtworks(params: ArtworkSearchParams, ctx: Context): Promise<ArtworkSearchResult> {
     const must = params.query ? [simpleQuery(params.query)] : [];
-    const filter = artworkFilters(params);
-    const dateSort = params.sort !== 'relevance';
-    if (dateSort) filter.push({ range: { date_start: { gte: YEAR_MIN, lte: YEAR_MAX } } });
+    const fieldSort = params.sort === 'relevance' ? undefined : fieldSortClauses(params.sort);
     const facets = params.facets ?? [];
     const body = {
-      ...(dateSort ? {} : rankingParam(params.query)),
-      ...boolQuery(must, filter),
-      ...(dateSort
-        ? { sort: [{ date_start: { order: params.sort === 'date_asc' ? 'asc' : 'desc' } }] }
-        : {}),
+      ...(fieldSort ? {} : rankingParam(params.query)),
+      ...boolQuery(must, artworkFilters(params), fieldSort?.mustNot),
+      ...(fieldSort ? { sort: fieldSort.sort } : {}),
       page: params.page,
       limit: params.limit,
       fields: ARTWORK_SEARCH_FIELDS,
@@ -373,7 +377,7 @@ export class AicService {
     const envelope = await this.#search<RawArtwork>('/artworks/search', body, TTL_MS.search, ctx);
     const iiifUrl = iiifBase(envelope);
     let sortApplied: ArtworkSortApplied = params.sort;
-    if (!dateSort) sortApplied = params.query ? 'relevance' : 'popularity';
+    if (!fieldSort) sortApplied = params.query ? 'relevance' : 'popularity';
     return {
       artworks: records(envelope).map((raw) => toArtworkSummary(raw, iiifUrl)),
       ...(facets.length > 0 ? { facets: parseFacets(envelope.aggregations, facets) } : {}),
@@ -383,11 +387,7 @@ export class AicService {
     };
   }
 
-  /**
-   * Full records for up to a page of artwork ids in one `ids=` call. The API
-   * drops unknown ids and ignores request order, so records come back reordered
-   * to `ids` with the misses listed.
-   */
+  /** Full records for up to a page of artwork ids, in request order with the misses listed. */
   async getArtworks(
     ids: readonly number[],
     sections: readonly ArtworkSection[],
@@ -399,33 +399,27 @@ export class AicService {
         .filter((section) => sections.includes(section))
         .flatMap((section) => SECTION_FIELDS[section]),
     ].join(',');
-    const envelope = await this.#request<RawArtwork>(
-      '/artworks',
-      { ids: ids.join(','), fields },
-      TTL_MS.record,
-      ctx,
-    );
-    const iiifUrl = iiifBase(envelope);
-    const byId = new Map(records(envelope).map((raw) => [raw.id, raw]));
-    const entries: ArtworkBatchEntry[] = [];
-    const missingIds: number[] = [];
-    for (const id of ids) {
-      const raw = byId.get(id);
-      if (raw)
-        entries.push({
-          detail: toArtworkDetail(raw, iiifUrl),
-          sound_ids: stringList(raw.sound_ids),
-        });
-      else missingIds.push(id);
-    }
-    return { entries, license_text: licenseText(envelope), missing_ids: missingIds };
+    const batch = await this.#getByIds<RawArtwork>('/artworks', ids, fields, ctx);
+    const iiifUrl = iiifBase(batch.envelope);
+    return {
+      entries: batch.found.map((raw) => ({
+        detail: toArtworkDetail(raw, iiifUrl),
+        sound_ids: stringList(raw.sound_ids),
+      })),
+      license_text: licenseText(batch.envelope),
+      missing_ids: batch.missing_ids,
+    };
   }
 
-  /** `/sounds` multimedia assets by uuid, reordered to request order; unknown uuids are dropped. */
+  /**
+   * `/sounds` multimedia assets for up to 100 uuids (the search page maximum), reordered to
+   * request order; unknown uuids are dropped. A `terms` search on `id` rather than the `ids=`
+   * listing: the firewall's GET limit stops `ids=` at 51 uuids, and a search posts past it.
+   */
   async getSounds(ids: readonly string[], ctx: Context): Promise<SoundBatchResult> {
-    const envelope = await this.#request<RawSound>(
-      '/sounds',
-      { ids: ids.join(','), fields: SOUND_FIELDS },
+    const envelope = await this.#search<RawSound>(
+      '/sounds/search',
+      { ...boolQuery([], [{ terms: { id: ids } }]), limit: ids.length, fields: SOUND_FIELDS },
       TTL_MS.record,
       ctx,
     );
@@ -466,23 +460,14 @@ export class AicService {
     };
   }
 
-  /** Agents by id, reordered to request order; unknown ids are listed as missing. */
+  /** Agents by id, in request order; unknown ids are listed as missing. */
   async getAgents(ids: readonly number[], ctx: Context): Promise<AgentBatchResult> {
-    const envelope = await this.#request<RawAgent>(
-      '/agents',
-      { ids: ids.join(','), fields: AGENT_FIELDS },
-      TTL_MS.record,
-      ctx,
-    );
-    const byId = new Map(records(envelope).map((raw) => [raw.id, raw]));
-    const agents: Agent[] = [];
-    const missingIds: number[] = [];
-    for (const id of ids) {
-      const raw = byId.get(id);
-      if (raw) agents.push(toAgent(raw));
-      else missingIds.push(id);
-    }
-    return { agents, license_text: licenseText(envelope), missing_ids: missingIds };
+    const batch = await this.#getByIds<RawAgent>('/agents', ids, AGENT_FIELDS, ctx);
+    return {
+      agents: batch.found.map(toAgent),
+      license_text: licenseText(batch.envelope),
+      missing_ids: batch.missing_ids,
+    };
   }
 
   /**
@@ -536,8 +521,8 @@ export class AicService {
     const relevance = params.sort === 'relevance' && params.query !== undefined;
     const must = params.query ? [simpleQuery(params.query)] : [];
     const filter: unknown[] = [...whenFilters(params.when)];
-    if (params.date_from) filter.push({ range: { aic_end_at: { gte: params.date_from } } });
-    if (params.date_to) filter.push({ range: { aic_start_at: { lte: params.date_to } } });
+    if (params.date_from) filter.push(runEndsFrom(params.date_from));
+    if (params.date_to) filter.push(runStartsBy(params.date_to));
     if (params.artwork_id !== undefined) filter.push({ term: { artwork_ids: params.artwork_id } });
     if (params.artist_id !== undefined) filter.push({ term: { artist_ids: params.artist_id } });
     const sortApplied: ExhibitionSort = relevance
@@ -652,21 +637,69 @@ export class AicService {
     const json = JSON.stringify(body, (_key, value: unknown) =>
       typeof value === 'string' ? value.normalize('NFC') : value,
     );
-    return this.#request<T>(path, { params: json }, ttlMs, ctx, json);
+    return this.#request<T>(path, { params: json }, ttlMs, ctx, { postBody: json });
   }
 
   /**
-   * `GET <path>?<params>`, cached under that URL whichever way it is sent. The
-   * listing-by-ids routes call it directly with `ids` and `fields`; a search
-   * passes `postBody`, sent as `POST <path>` instead when the GET query string
-   * would be too long.
+   * `GET <path>?ids=<csv>&fields=<fields>`, the listing-by-ids routes. The API
+   * drops unknown ids and ignores request order, so `found` comes back in `ids`
+   * order with the misses listed. Ids whose query fits the firewall's GET limit
+   * go out as that one request; longer lists go out as consecutive chunks that
+   * each fit, one after another, sharing the deadline one request gets. A failed
+   * chunk fails the call. The first chunk's envelope carries the license text
+   * and IIIF base, which every chunk shares.
+   */
+  async #getByIds<T extends { id: number }>(
+    path: string,
+    ids: readonly number[],
+    fields: string,
+    ctx: Context,
+  ): Promise<{ envelope: RawEnvelope<T>; found: T[]; missing_ids: number[] }> {
+    const startedAt = Date.now();
+    const [first, ...rest] = idChunks(ids, fields);
+    const envelope = await this.#request<T>(
+      path,
+      { ids: first.join(','), fields },
+      TTL_MS.record,
+      ctx,
+    );
+    const byId = new Map(records(envelope).map((raw) => [raw.id, raw]));
+    for (const chunk of rest) {
+      const deadlineMs = Math.max(0, this.#retry.deadlineMs - (Date.now() - startedAt));
+      const next = await this.#request<T>(
+        path,
+        { ids: chunk.join(','), fields },
+        TTL_MS.record,
+        ctx,
+        { deadlineMs },
+      );
+      for (const raw of records(next)) byId.set(raw.id, raw);
+    }
+    const found: T[] = [];
+    const missingIds: number[] = [];
+    for (const id of ids) {
+      const raw = byId.get(id);
+      if (raw) found.push(raw);
+      else missingIds.push(id);
+    }
+    return { envelope, found, missing_ids: missingIds };
+  }
+
+  /**
+   * `GET <path>?<params>`, cached under that URL whichever way it is sent. A
+   * search passes `postBody`, sent as `POST <path>` instead when the GET query
+   * string would be too long; a later chunk of an ids listing passes
+   * `deadlineMs`, what remains of the deadline its first chunk started.
    */
   async #request<T>(
     path: string,
     params: Record<string, string>,
     ttlMs: number,
     ctx: Context,
-    postBody?: string,
+    {
+      deadlineMs = this.#retry.deadlineMs,
+      postBody,
+    }: { deadlineMs?: number; postBody?: string } = {},
   ): Promise<RawEnvelope<T>> {
     const url = new URL(`${API_BASE_URL}${path}`);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
@@ -681,8 +714,8 @@ export class AicService {
 
     const headers = { Accept: 'application/json', 'AIC-User-Agent': this.#userAgent };
     const fetched =
-      postBody === undefined || url.search.length - 1 <= MAX_GET_QUERY_BYTES
-        ? await this.#fetchResilient(href, { headers }, path, ctx)
+      postBody === undefined || queryBytes(params) <= MAX_GET_QUERY_BYTES
+        ? await this.#fetchResilient(href, { headers }, path, deadlineMs, ctx)
         : await this.#fetchResilient(
             `${API_BASE_URL}${path}`,
             {
@@ -691,6 +724,7 @@ export class AicService {
               headers: { ...headers, 'Content-Type': 'application/json' },
             },
             path,
+            deadlineMs,
             ctx,
           );
     this.#cache.set(href, fetched.text, fetched.bytes, ttlMs);
@@ -706,6 +740,7 @@ export class AicService {
     target: string,
     init: RequestInit,
     path: string,
+    deadlineMs: number,
     ctx: Context,
   ): Promise<FetchedBody> {
     try {
@@ -722,7 +757,7 @@ export class AicService {
           maxRetries: this.#retry.maxRetries,
           baseDelayMs: this.#retry.baseDelayMs,
           maxDelayMs: 15_000,
-          deadlineMs: this.#retry.deadlineMs,
+          deadlineMs,
         },
       );
     } catch (error) {
@@ -778,6 +813,33 @@ export class AicService {
 }
 
 // --- Request helpers -----------------------------------------------------------
+
+/** Bytes of the GET query string `params` encode to, without the `?` (percent-encoded, so ASCII). */
+function queryBytes(params: Record<string, string>): number {
+  return new URLSearchParams(params).toString().length;
+}
+
+/**
+ * `ids` as consecutive chunks whose `ids=<csv>&fields=<fields>` query each fits
+ * the firewall's GET limit: one chunk when the whole list fits, otherwise each
+ * filled as far as it fits. One id with every artwork section is about 700
+ * bytes, so every chunk holds at least one.
+ */
+function idChunks(ids: readonly number[], fields: string): [number[], ...number[][]] {
+  const fits = (chunk: readonly number[]) =>
+    queryBytes({ ids: chunk.join(','), fields }) <= MAX_GET_QUERY_BYTES;
+  if (fits(ids)) return [[...ids]];
+  let chunk: number[] = [];
+  const chunks: [number[], ...number[][]] = [chunk];
+  for (const id of ids) {
+    if (chunk.length > 0 && !fits([...chunk, id])) {
+      chunk = [];
+      chunks.push(chunk);
+    }
+    chunk.push(id);
+  }
+  return chunks;
+}
 
 function buildPacer(requestsPerMinute: number): Pacer {
   return createPacer({
@@ -926,22 +988,68 @@ function rankingParam(query: string | undefined): { q?: string } {
   return q ? { q } : {};
 }
 
+/**
+ * The `simple_query_string` must clause. Over every field (no `fields`) it
+ * sends the query without its stop words, which the keyword fields would hold
+ * as required terms; named text fields drop them on their own, so a query
+ * with `fields` goes as typed.
+ */
 function simpleQuery(query: string, fields?: readonly string[]): Record<string, unknown> {
   return {
-    simple_query_string: { query, ...(fields ? { fields } : {}), default_operator: 'and' },
+    simple_query_string: {
+      query: fields ? query : withoutStopWords(query),
+      ...(fields ? { fields } : {}),
+      default_operator: 'and',
+    },
   };
 }
 
-/** `{ query: { bool: { must?, filter? } } }`, or nothing when there are no clauses. */
-function boolQuery(must: readonly unknown[], filter: readonly unknown[]): Record<string, unknown> {
-  if (must.length === 0 && filter.length === 0) return {};
+/** `{ query: { bool: { must?, filter?, must_not? } } }`, or nothing when there are no clauses. */
+function boolQuery(
+  must: readonly unknown[],
+  filter: readonly unknown[],
+  mustNot: readonly unknown[] = [],
+): Record<string, unknown> {
+  if (must.length === 0 && filter.length === 0 && mustNot.length === 0) return {};
   return {
     query: {
       bool: {
         ...(must.length > 0 ? { must } : {}),
         ...(filter.length > 0 ? { filter } : {}),
+        ...(mustNot.length > 0 ? { must_not: mustNot } : {}),
       },
     },
+  };
+}
+
+/** The upstream field and direction behind each artwork field sort. */
+const FIELD_SORTS = {
+  date_asc: { field: 'date_start', order: 'asc' },
+  date_desc: { field: 'date_start', order: 'desc' },
+  acquired_desc: { field: 'fiscal_year', order: 'desc' },
+  acquired_asc: { field: 'fiscal_year', order: 'asc' },
+} as const satisfies Record<
+  Exclude<ArtworkSort, 'relevance'>,
+  { field: string; order: 'asc' | 'desc' }
+>;
+
+/**
+ * The sort clause for an artwork field sort, plus what it excludes. Works
+ * missing the field sort last in either order, so sorting never filters. Date
+ * sorts also leave out placeholder start years, which would otherwise lead the
+ * order (Design Decision 18).
+ */
+function fieldSortClauses(sort: Exclude<ArtworkSort, 'relevance'>): {
+  mustNot: unknown[];
+  sort: unknown[];
+} {
+  const { field, order } = FIELD_SORTS[sort];
+  return {
+    sort: [{ [field]: { order, missing: '_last' } }],
+    mustNot:
+      field === 'date_start'
+        ? [{ range: { date_start: { lt: YEAR_MIN } } }, { range: { date_start: { gt: YEAR_MAX } } }]
+        : [],
   };
 }
 
@@ -966,6 +1074,12 @@ function artworkFilters(params: ArtworkSearchParams): unknown[] {
     filter.push({ range: { date_start: { gte: YEAR_MIN } } });
     filter.push({ range: { date_end: { lte: YEAR_MAX } } });
   }
+  if (params.acquired_from !== undefined || params.acquired_to !== undefined) {
+    // Works with no recorded fiscal year never match; the tool's notice says so.
+    filter.push({
+      range: { fiscal_year: definedOnly({ gte: params.acquired_from, lte: params.acquired_to }) },
+    });
+  }
   if (params.public_domain_only) filter.push({ term: { is_public_domain: true } });
   if (params.on_view_only) filter.push({ term: { is_on_view: true } });
   if (params.has_image) filter.push({ exists: { field: 'image_id' } });
@@ -986,20 +1100,68 @@ function facetAggregations(facets: readonly FacetName[]): Record<string, unknown
   );
 }
 
+/**
+ * Exhibition runs. A missing date is unrecorded, never a run that did not happen. Where
+ * `aic_end_at` is missing, `status` decides: no `Closed` record opens or closes after today,
+ * while `Confirmed` also labels shows that closed long ago, so it is read only here. A `Closed`
+ * show with no closing date ran on its opening date alone; one not marked `Closed` runs on from
+ * its opening; a show with only a closing date ran on that date alone. Requests keep `now` date
+ * math so cached URLs stay stable. A bool holding only `should` clauses needs one to match.
+ */
+const HAS_START = { exists: { field: 'aic_start_at' } };
+const HAS_END = { exists: { field: 'aic_end_at' } };
+const CLOSED = { term: { status: 'Closed' } };
+/** No recorded closing date and not marked Closed: the run goes on from its opening. */
+const RUNS_ON = { bool: { filter: [HAS_START], must_not: [HAS_END, CLOSED] } };
+
 function whenFilters(when: ExhibitionWhen): unknown[] {
   switch (when) {
     case 'current':
       return [
         { range: { aic_start_at: { lte: 'now' } } },
-        { range: { aic_end_at: { gte: 'now' } } },
+        { bool: { should: [{ range: { aic_end_at: { gte: 'now' } } }, RUNS_ON] } },
       ];
     case 'upcoming':
       return [{ range: { aic_start_at: { gt: 'now' } } }];
     case 'past':
-      return [{ range: { aic_end_at: { lt: 'now' } } }];
+      return [
+        {
+          bool: {
+            should: [
+              { range: { aic_end_at: { lt: 'now' } } },
+              { bool: { filter: [CLOSED], must_not: [HAS_END] } },
+            ],
+          },
+        },
+      ];
     case 'any':
       return [];
   }
+}
+
+/** The `date_from` side of the overlap window: the run ends on or after `date`. */
+function runEndsFrom(date: string): unknown {
+  return {
+    bool: {
+      should: [
+        { range: { aic_end_at: { gte: date } } },
+        { bool: { filter: [{ range: { aic_start_at: { gte: date } } }], must_not: [HAS_END] } },
+        RUNS_ON,
+      ],
+    },
+  };
+}
+
+/** The `date_to` side of the overlap window: the run starts on or before `date`. */
+function runStartsBy(date: string): unknown {
+  return {
+    bool: {
+      should: [
+        { range: { aic_start_at: { lte: date } } },
+        { bool: { filter: [{ range: { aic_end_at: { lte: date } } }], must_not: [HAS_START] } },
+      ],
+    },
+  };
 }
 
 // --- Envelope readers ----------------------------------------------------------
@@ -1029,7 +1191,9 @@ function toArtworkSummary(raw: RawArtwork, iiifUrl: string): ArtworkSummary {
   return {
     id: raw.id,
     title: htmlField(raw.title) ?? '',
+    main_reference_number: nonEmpty(raw.main_reference_number) ?? '',
     ...definedOnly({
+      acquisition_fiscal_year: plausibleYear(raw.fiscal_year),
       artist_display: nonEmpty(raw.artist_display),
       artist_id: Number.isInteger(raw.artist_id) ? (raw.artist_id as number) : undefined,
       date_display: nonEmpty(raw.date_display),
@@ -1070,23 +1234,22 @@ function toArtworkDetail(raw: RawArtwork, iiifUrl: string): ArtworkDetail {
       alt_titles: altTitles.length > 0 ? altTitles : undefined,
       date_qualifier: nonEmpty(raw.date_qualifier_title),
       dimensions: nonEmpty(raw.dimensions),
-      inscriptions: nonEmpty(raw.inscriptions),
+      inscriptions: htmlField(raw.inscriptions, 'keep'),
       credit_line: nonEmpty(raw.credit_line),
       copyright_notice: nonEmpty(raw.copyright_notice),
       edition: nonEmpty(raw.edition),
       classification: nonEmpty(raw.classification_title),
       style: nonEmpty(raw.style_title),
-      on_loan: nonEmpty(raw.on_loan_display),
+      on_loan: htmlField(raw.on_loan_display),
       manifest_url: summary.is_public_domain ? manifestUrl(raw.id) : undefined,
       alt_images: altImages.length > 0 ? altImages : undefined,
       description: htmlField(raw.description),
       short_description: htmlField(raw.short_description),
-      provenance: nonEmpty(raw.provenance_text),
+      provenance: htmlField(raw.provenance_text),
       exhibition_history: htmlField(raw.exhibition_history),
       publication_history: htmlField(raw.publication_history),
       catalogue: htmlField(raw.catalogue_display),
     }),
-    main_reference_number: nonEmpty(raw.main_reference_number) ?? '',
     artist_ids: integerList(raw.artist_ids),
     styles: stringList(raw.style_titles),
     subjects: stringList(raw.subject_titles),

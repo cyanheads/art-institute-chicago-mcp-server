@@ -1,7 +1,8 @@
 /**
  * @fileoverview Tests for `AicService` through its constructor seams: status
  * classification, retry and deadline, pacer shed mapping, the byte ceiling,
- * cache TTLs per kind, request construction, `ids=` reordering, and
+ * cache TTLs per kind, request construction, `ids=` reordering and splitting
+ * under the firewall's GET limit, and
  * normalization of sparse, placeholder, and markup-bearing upstream records.
  * @module tests/services/aic-service.test
  */
@@ -14,14 +15,21 @@ import {
   API_ORIGIN,
   artworkParams,
   behindFirewall,
+  byIdsResponder,
   createTestService,
+  EXHIBITION_WHEN_FILTERS,
   envelopeOfBytes,
+  exhibitionFromClause,
+  exhibitionToClause,
   GET_QUERY_LIMIT,
   hangingResponder,
+  idsOf,
+  idsOfWidth,
   jsonResponder,
   networkErrorResponder,
   queryParam,
   queryStringBytes,
+  type Responder,
   rejection,
   rejectionOf,
   routedFetch,
@@ -588,6 +596,27 @@ describe('AicService ranking text', () => {
     },
   );
 
+  it.each(endpoints)(
+    '%s leaves stop words out of an every-field must clause only, ranking on the query as typed',
+    async (name, _path, call, rest) => {
+      const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+      const query = 'Bruegel the Elder';
+      await call(service, query);
+      const must = name === 'searchAgents' ? query : 'Bruegel Elder';
+      expect(searchBodyOf(urlOfCall(fetch))).toEqual({ q: query, ...rest(must) });
+    },
+  );
+
+  it.each(endpoints)(
+    '%s sends a must clause of only stop words and operators as typed',
+    async (_name, _path, call, rest) => {
+      const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+      const query = 'the | a';
+      await call(service, query);
+      expect(searchBodyOf(urlOfCall(fetch)).query).toEqual(rest(query).query);
+    },
+  );
+
   it('keeps q off date-sorted artwork and start-sorted exhibition searches', async () => {
     const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
     await service.searchArtworks(artworkParams({ query: '"water lilies"', sort: 'date_asc' }), ctx);
@@ -682,10 +711,13 @@ describe('AicService GET query-string limit', () => {
     query: {
       bool: {
         must: [{ simple_query_string: { query, default_operator: 'and' } }],
-        filter: [{ range: { date_start: { gte: -8000, lte: 2100 } } }],
+        must_not: [
+          { range: { date_start: { lt: -8000 } } },
+          { range: { date_start: { gt: 2100 } } },
+        ],
       },
     },
-    sort: [{ date_start: { order: 'asc' } }],
+    sort: [{ date_start: { order: 'asc', missing: '_last' } }],
     page: 1,
     limit: 10,
     fields: expect.any(String),
@@ -789,17 +821,156 @@ describe('AicService GET query-string limit', () => {
     expect(queryParam(url ?? '', 'ids')).toBe('1,2,3,4,5,6,7,8,9,10');
   });
 
-  it('never posts a listing-by-ids request, even past the limit', async () => {
+  it('never posts a listing-by-ids request: past the limit it splits into GETs that each fit', async () => {
     const { service, fetch } = createTestService(scriptedFetch(jsonResponder(envelope([]))));
-    const ids = Array.from(
-      { length: 60 },
-      (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+    const ids = Array.from({ length: 300 }, (_, index) => 1_000_000 + index);
+    const result = await service.getAgents(ids, ctx);
+    expect(fetch.mock.calls.length).toBeGreaterThan(1);
+    for (const [url, init] of fetch.mock.calls) {
+      expect(queryStringBytes(url)).toBeLessThanOrEqual(GET_QUERY_LIMIT);
+      expect(init.method).toBeUndefined();
+      expect(init.body).toBeUndefined();
+    }
+    expect(fetch.mock.calls.flatMap(([url]) => idsOf(url))).toEqual(ids);
+    expect(result.missing_ids).toEqual(ids);
+  });
+});
+
+// --- Listing by ids under the GET limit ------------------------------------------------------
+
+describe('AicService listing by ids under the GET limit', () => {
+  const ctx = makeCtx();
+  const ALL_SECTIONS = [
+    'description',
+    'provenance',
+    'exhibition_history',
+    'publication_history',
+    'catalogue',
+  ] as const;
+  const idsSent = (fetch: ReturnType<typeof scriptedFetch>) =>
+    fetch.mock.calls.map(([url]) => idsOf(url));
+
+  /**
+   * `count` distinct 10- and 11-digit ids whose `ids=` query with every section
+   * comes to exactly `bytes`, measured against the service's own one-id request.
+   */
+  async function idsOfQueryBytes(count: number, bytes: number): Promise<number[]> {
+    const probe = createTestService(scriptedFetch(jsonResponder(envelope([]))));
+    await probe.service.getArtworks([1], ALL_SECTIONS, ctx);
+    const fixed = queryStringBytes(urlOfCall(probe.fetch)) - 1;
+    const wide = bytes - fixed - 3 * (count - 1) - 10 * count;
+    if (wide < 0 || wide > count) throw new Error(`No ${count} ids make ${bytes} bytes`);
+    return Array.from({ length: count }, (_, i) => (i < wide ? 10 ** 10 : 10 ** 9) + i);
+  }
+
+  it('fetches 100 eleven-digit ids with every section in GETs that fit, all reported missing', async () => {
+    const ids = idsOfWidth(11);
+    const { service, fetch } = createTestService(
+      scriptedFetch(behindFirewall(jsonResponder(envelope([])))),
     );
-    await service.getSounds(ids, ctx);
-    const [url, init] = fetch.mock.calls[0] ?? [];
-    expect(queryStringBytes(url ?? '')).toBeGreaterThan(GET_QUERY_LIMIT);
-    expect(init?.method).toBeUndefined();
-    expect(init?.body).toBeUndefined();
+    const result = await service.getArtworks(ids, ALL_SECTIONS, ctx);
+    expect(result.entries).toEqual([]);
+    expect(result.missing_ids).toEqual(ids);
+    for (const [url, init] of fetch.mock.calls) {
+      expect(new URL(url).pathname).toBe('/api/v1/artworks');
+      expect(queryStringBytes(url)).toBeLessThanOrEqual(GET_QUERY_LIMIT);
+      expect(init.method).toBeUndefined();
+    }
+    expect(idsSent(fetch).flat()).toEqual(ids);
+  });
+
+  it('sends 100 six-digit ids with every section as one GET', async () => {
+    const ids = idsOfWidth(6);
+    const { service, fetch } = createTestService(scriptedFetch(jsonResponder(envelope([]))));
+    await service.getArtworks(ids, ALL_SECTIONS, ctx);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(queryStringBytes(urlOfCall(fetch))).toBe(1_573);
+    expect(idsSent(fetch)).toEqual([ids]);
+  });
+
+  it.each([
+    [GET_QUERY_LIMIT, [100]],
+    [GET_QUERY_LIMIT + 1, [99, 1]],
+  ])('sends 100 ids making %i bytes as GETs of %j ids', async (bytes, sizes) => {
+    const ids = await idsOfQueryBytes(100, bytes);
+    const { service, fetch } = createTestService(scriptedFetch(jsonResponder(envelope([]))));
+    await service.getArtworks(ids, ALL_SECTIONS, ctx);
+    expect(idsSent(fetch).map((chunk) => chunk.length)).toEqual(sizes);
+    expect(idsSent(fetch).flat()).toEqual(ids);
+    if (sizes.length === 1) expect(queryStringBytes(urlOfCall(fetch))).toBe(GET_QUERY_LIMIT);
+  });
+
+  it('fills a GET to exactly 2,048 bytes before the next id starts another', async () => {
+    const full = await idsOfQueryBytes(99, GET_QUERY_LIMIT);
+    const { service, fetch } = createTestService(scriptedFetch(jsonResponder(envelope([]))));
+    await service.getArtworks([...full, 7], ALL_SECTIONS, ctx);
+    expect(idsSent(fetch)).toEqual([full, [7]]);
+    expect(queryStringBytes(urlOfCall(fetch, 0))).toBe(GET_QUERY_LIMIT);
+  });
+
+  it('merges the GETs in request order, placing records from the second after the first', async () => {
+    const ids = idsOfWidth(16);
+    const { service, fetch } = createTestService(
+      scriptedFetch(byIdsResponder((id) => (id % 2 === 0 ? artworkRecord(id) : undefined))),
+    );
+    const result = await service.getArtworks(ids, ALL_SECTIONS, ctx);
+    const [first = [], second = []] = idsSent(fetch);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect([...first, ...second]).toEqual(ids);
+    expect(result.entries.map((entry) => entry.detail.id)).toEqual(
+      ids.filter((id) => id % 2 === 0),
+    );
+    expect(result.entries.at(-1)?.detail.id).toBe(second.at(-1));
+    expect(result.missing_ids).toEqual(ids.filter((id) => id % 2 === 1));
+    expect(result.license_text).toBe(ARTWORK_LICENSE);
+  });
+
+  it('fails the call when the second GET is blocked, without retrying it', async () => {
+    const { service, fetch } = createTestService(
+      scriptedFetch(
+        jsonResponder(envelope([])),
+        textResponder(EDGE_BLOCK_HTML, 403, { 'content-type': 'text/html' }),
+      ),
+    );
+    const error = await rejection(service.getArtworks(idsOfWidth(16), ALL_SECTIONS, ctx));
+    expect(error.code).toBe(JsonRpcErrorCode.Forbidden);
+    expect(error.data).toMatchObject({ reason: 'request_blocked', retryable: false });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('gives the second GET only what remains of the one deadline', async () => {
+    vi.useFakeTimers();
+    const slowFirst: Responder = (url, init) =>
+      new Promise((resolve) => {
+        setTimeout(() => resolve(jsonResponder(envelope([]))(url, init)), 3_000);
+      });
+    const { service, fetch } = createTestService(scriptedFetch(slowFirst, hangingResponder), {
+      retry: { baseDelayMs: 0, deadlineMs: 5_000 },
+    });
+    let settled = false;
+    const pending = rejection(service.getArtworks(idsOfWidth(16), ALL_SECTIONS, ctx)).finally(
+      () => {
+        settled = true;
+      },
+    );
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const error = await pending;
+    expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+    expect(error.data).toMatchObject({ reason: 'retry_deadline_exceeded', deadlineMs: 2_000 });
+  });
+
+  it('serves a repeated split listing from the cache', async () => {
+    const { service, fetch } = createTestService(
+      scriptedFetch(byIdsResponder((id) => artworkRecord(id))),
+    );
+    const first = await service.getArtworks(idsOfWidth(16), ALL_SECTIONS, ctx);
+    const second = await service.getArtworks(idsOfWidth(16), ALL_SECTIONS, ctx);
+    expect(second).toEqual(first);
+    expect(first.entries).toHaveLength(100);
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -1402,7 +1573,7 @@ describe('AicService.searchArtworks', () => {
     expect(body).toEqual({
       page: 1,
       limit: 10,
-      fields: expect.stringContaining('id,title,artist_display'),
+      fields: expect.stringContaining('id,title,main_reference_number,fiscal_year,artist_display'),
     });
     expect(result.sort_applied).toBe('popularity');
   });
@@ -1410,7 +1581,7 @@ describe('AicService.searchArtworks', () => {
   it('requests exactly the documented field allowlist', async () => {
     const { body } = await run({});
     expect(body.fields).toBe(
-      'id,title,artist_display,artist_id,artist_title,date_display,date_start,date_end,medium_display,artwork_type_title,department_title,place_of_origin,is_public_domain,is_on_view,gallery_title,image_id,thumbnail',
+      'id,title,main_reference_number,fiscal_year,artist_display,artist_id,artist_title,date_display,date_start,date_end,medium_display,artwork_type_title,department_title,place_of_origin,is_public_domain,is_on_view,gallery_title,image_id,thumbnail',
     );
   });
 
@@ -1490,22 +1661,132 @@ describe('AicService.searchArtworks', () => {
     expect(filter[0]).toEqual({ range: { date_end: { gte: 0 } } });
   });
 
+  /** The date sorts' placeholder-year screen: it removes those records and keeps works with no start year. */
+  const PLACEHOLDER_START_SCREEN = [
+    { range: { date_start: { lt: -8000 } } },
+    { range: { date_start: { gt: 2100 } } },
+  ];
+
   it.each([
     ['date_asc', 'asc'],
     ['date_desc', 'desc'],
   ] as const)(
-    'sorts %s by date_start, drops q, and bounds placeholder years',
+    'sorts %s by date_start with missing years last, drops q, and screens placeholder years with must_not',
     async (sort, order) => {
       const { body, result } = await run({ sort, query: 'harbor' });
       expect(body).not.toHaveProperty('q');
-      expect(body.sort).toEqual([{ date_start: { order } }]);
+      expect(body.sort).toEqual([{ date_start: { order, missing: '_last' } }]);
       expect(body.query).toEqual({
         bool: {
           must: [{ simple_query_string: { query: 'harbor', default_operator: 'and' } }],
-          filter: [{ range: { date_start: { gte: -8000, lte: 2100 } } }],
+          must_not: PLACEHOLDER_START_SCREEN,
         },
       });
       expect(result.sort_applied).toBe(sort);
+    },
+  );
+
+  it.each(['date_asc', 'date_desc'] as const)(
+    'screens placeholder years for %s with no query, keeping every filter in bool.filter',
+    async (sort) => {
+      const bare = await run({ sort });
+      expect(bare.body).not.toHaveProperty('q');
+      expect(bare.body.query).toEqual({ bool: { must_not: PLACEHOLDER_START_SCREEN } });
+
+      const filtered = await run({ sort, department: 'Prints and Drawings', year_from: 1800 });
+      expect(filtered.body.query).toEqual({
+        bool: {
+          filter: [
+            {
+              term: {
+                'department_title.keyword': {
+                  value: 'Prints and Drawings',
+                  case_insensitive: true,
+                },
+              },
+            },
+            { range: { date_end: { gte: 1800 } } },
+            { range: { date_start: { gte: -8000 } } },
+            { range: { date_end: { lte: 2100 } } },
+          ],
+          must_not: PLACEHOLDER_START_SCREEN,
+        },
+      });
+    },
+  );
+
+  it('sends neither a sort nor the placeholder screen for relevance or popularity', async () => {
+    for (const query of [undefined, 'harbor']) {
+      const { body } = await run({ query, department: 'Prints and Drawings' });
+      expect(body).not.toHaveProperty('sort');
+      expect(JSON.stringify(body)).not.toContain('must_not');
+    }
+  });
+
+  it.each([
+    [{ acquired_from: 2020 }, { gte: 2020 }],
+    [{ acquired_to: 1900 }, { lte: 1900 }],
+    [
+      { acquired_from: 1933, acquired_to: 1945 },
+      { gte: 1933, lte: 1945 },
+    ],
+  ])('ranges fiscal_year for %j', async (acquired, bounds) => {
+    const { body } = await run(acquired);
+    expect(body.query).toEqual({ bool: { filter: [{ range: { fiscal_year: bounds } }] } });
+  });
+
+  it('ANDs the fiscal_year range with the query, the year span, and every other filter', async () => {
+    const { body } = await run({
+      query: 'portrait',
+      department: 'Prints and Drawings',
+      year_to: 1945,
+      acquired_from: 1933,
+      public_domain_only: true,
+    });
+    expect(body.query).toEqual({
+      bool: {
+        must: [{ simple_query_string: { query: 'portrait', default_operator: 'and' } }],
+        filter: [
+          {
+            term: {
+              'department_title.keyword': { value: 'Prints and Drawings', case_insensitive: true },
+            },
+          },
+          { range: { date_start: { lte: 1945 } } },
+          { range: { date_start: { gte: -8000 } } },
+          { range: { date_end: { lte: 2100 } } },
+          { range: { fiscal_year: { gte: 1933 } } },
+          { term: { is_public_domain: true } },
+        ],
+      },
+    });
+  });
+
+  it.each([
+    ['acquired_desc', 'desc'],
+    ['acquired_asc', 'asc'],
+  ] as const)(
+    'sorts %s by fiscal_year with unrecorded years last, filtering nothing and dropping q',
+    async (sort, order) => {
+      const bare = await run({ sort });
+      expect(bare.body).toEqual({
+        sort: [{ fiscal_year: { order, missing: '_last' } }],
+        page: 1,
+        limit: 10,
+        fields: expect.any(String),
+      });
+      expect(bare.result.sort_applied).toBe(sort);
+
+      const queried = await run({ sort, query: 'harbor', acquired_to: 1950 });
+      expect(queried.body).not.toHaveProperty('q');
+      expect(queried.body.sort).toEqual([{ fiscal_year: { order, missing: '_last' } }]);
+      expect(queried.body.query).toEqual({
+        bool: {
+          must: [{ simple_query_string: { query: 'harbor', default_operator: 'and' } }],
+          filter: [{ range: { fiscal_year: { lte: 1950 } } }],
+        },
+      });
+      expect(queried.result.sort_applied).toBe(sort);
     },
   );
 
@@ -1520,6 +1801,43 @@ describe('AicService.searchArtworks', () => {
       place_of_origin: { terms: { field: 'place_of_origin.keyword', size: 15 } },
     });
   });
+
+  it.each([
+    ['gallery', 'gallery_title.keyword'],
+    ['material', 'material_titles.keyword'],
+    ['technique', 'technique_titles.keyword'],
+    ['theme', 'theme_titles.keyword'],
+  ] as const)(
+    'aggregates the %s facet as a top-15 terms count on %s, ANDed with the filters',
+    async (facet, field) => {
+      const { body, result } = await run(
+        { artist_id: 35809, on_view_only: true, limit: 0, facets: [facet] },
+        jsonResponder(
+          searchEnvelope([], 29, {
+            aggregations: {
+              [facet]: {
+                buckets: [
+                  { key: 'Value A', doc_count: 18 },
+                  { key: 'Value B', doc_count: 7 },
+                ],
+                sum_other_doc_count: 0,
+              },
+            },
+          }),
+        ),
+      );
+      expect(body.aggs).toEqual({ [facet]: { terms: { field, size: 15 } } });
+      expect(body.query).toEqual({
+        bool: { filter: [{ term: { artist_ids: 35809 } }, { term: { is_on_view: true } }] },
+      });
+      expect(result.facets).toEqual({
+        [facet]: [
+          { value: 'Value A', count: 18 },
+          { value: 'Value B', count: 7 },
+        ],
+      });
+    },
+  );
 
   it('sends no aggs for an empty facet list and returns no facets key', async () => {
     const { body, result } = await run({ facets: [] });
@@ -1694,11 +2012,13 @@ describe('AicService.searchArtworks', () => {
 
     it('maps a full record', async () => {
       const artwork = await one(
-        artworkRecord(7, { gallery_title: 'Gallery 240', is_on_view: true }),
+        artworkRecord(7, { gallery_title: 'Gallery 240', is_on_view: true, fiscal_year: 1901 }),
       );
       expect(artwork).toEqual({
         id: 7,
         title: 'Synthetic Work 7',
+        main_reference_number: '7.1900',
+        acquisition_fiscal_year: 1901,
         artist_display: 'Test Artist\nFrench, 1840-1900',
         artist_id: 900,
         date_display: '1890',
@@ -1729,10 +2049,33 @@ describe('AicService.searchArtworks', () => {
       expect(artwork).toEqual({
         id: 9,
         title: '',
+        main_reference_number: '',
         is_public_domain: false,
         is_on_view: false,
         web_url: 'https://www.artic.edu/artworks/9',
       });
+    });
+
+    it.each([
+      [1942, 1942],
+      [2027, 2027],
+      [null, undefined],
+      ['1942', undefined],
+      [1942.5, undefined],
+    ])('reads fiscal_year %j as acquisition_fiscal_year %j', async (fiscal_year, expected) => {
+      const artwork = await one(artworkRecord(111628, { fiscal_year }));
+      if (expected === undefined) expect(artwork).not.toHaveProperty('acquisition_fiscal_year');
+      else expect(artwork?.acquisition_fiscal_year).toBe(expected);
+    });
+
+    it.each([
+      ['1942.51', '1942.51'],
+      ['', ''],
+      ['   ', ''],
+      [null, ''],
+    ])('keeps main_reference_number %j as %j', async (main_reference_number, expected) => {
+      const artwork = await one(artworkRecord(111628, { main_reference_number }));
+      expect(artwork?.main_reference_number).toBe(expected);
     });
 
     it('treats null and empty strings as absent', async () => {
@@ -1865,6 +2208,8 @@ describe('AicService.getArtworks', () => {
         'artist_ids',
         'thumbnail',
         'on_loan_display',
+        'main_reference_number',
+        'fiscal_year',
       ]),
     );
     expect(fields).not.toContain('description');
@@ -1985,11 +2330,13 @@ describe('AicService.getArtworks', () => {
           exhibition_history: 'Show A, 1950',
           publication_history: 'Book A, 1960',
           catalogue_display: '<p>Cat. no. 5</p>',
+          fiscal_year: 1964,
         }),
       );
       expect(result).toMatchObject({
         id: 1,
         main_reference_number: '1.1900',
+        acquisition_fiscal_year: 1964,
         alt_titles: ['Alt One', 'Alt Two'],
         date_qualifier: 'circa',
         inscriptions: 'Signed lower right',
@@ -2021,6 +2368,84 @@ describe('AicService.getArtworks', () => {
       });
       expect(result).not.toHaveProperty('copyright_notice');
       expect(result).not.toHaveProperty('sound_ids');
+    });
+
+    it('converts markup in provenance, on_loan, and inscriptions to plain text', async () => {
+      const result = await detail(
+        artworkRecord(83905, {
+          provenance_text:
+            'Ivan Albright, from 1941 to 1955; partially exchanged for <a href="https://www.artic.edu/artworks/9535"><em>Heavy the Oar to Him Who Is Tired, Heavy the Coat, Heavy the Sea</em></a> (then 1949.961, now 1959.12), and sold to the Art Institute of Chicago, 1955.',
+          on_loan_display:
+            "<p>On loan to Musée d'art moderne de la ville de Paris in Paris for <i>Kerry James Marshall</i></p>",
+          inscriptions: 'Signed lower right: Ivan Albright\n<p>\nDated lower left: 1974',
+        }),
+      );
+      expect(result).toMatchObject({
+        provenance:
+          'Ivan Albright, from 1941 to 1955; partially exchanged for Heavy the Oar to Him Who Is Tired, Heavy the Coat, Heavy the Sea (https://www.artic.edu/artworks/9535) (then 1949.961, now 1959.12), and sold to the Art Institute of Chicago, 1955.',
+        on_loan:
+          "On loan to Musée d'art moderne de la ville de Paris in Paris for Kerry James Marshall",
+        inscriptions: 'Signed lower right: Ivan Albright\n\nDated lower left: 1974',
+      });
+    });
+
+    it('keeps single line breaks in inscriptions and folds them in provenance and on_loan', async () => {
+      const result = await detail(
+        artworkRecord(1, {
+          inscriptions: 'Signed lower right\nDated 1974',
+          provenance_text: 'Owner A, 1900;\nOwner B, 1950;\n\nOwner C, 1990.',
+          on_loan_display: 'On loan\nto a synthetic museum',
+        }),
+      );
+      expect(result).toMatchObject({
+        inscriptions: 'Signed lower right\nDated 1974',
+        provenance: 'Owner A, 1900; Owner B, 1950;\n\nOwner C, 1990.',
+        on_loan: 'On loan to a synthetic museum',
+      });
+    });
+
+    it('keeps a provenance anchor with an unsafe or malformed href as visible text only', async () => {
+      const result = await detail(
+        artworkRecord(1, {
+          provenance_text:
+            'Sold to <a href="javascript:alert(1)">Dealer A</a>; then <a href="https://x.test/&#10;b">Dealer B</a>.',
+        }),
+      );
+      expect(result?.provenance).toBe('Sold to Dealer A; then Dealer B.');
+    });
+
+    it('drops provenance, on_loan, and inscriptions that are only markup', async () => {
+      const result = await detail(
+        artworkRecord(1, {
+          provenance_text: '<p></p>',
+          on_loan_display: '<p> </p>',
+          inscriptions: '<br>',
+        }),
+      );
+      expect(result).not.toHaveProperty('provenance');
+      expect(result).not.toHaveProperty('on_loan');
+      expect(result).not.toHaveProperty('inscriptions');
+    });
+
+    it('keeps plain-text fields exactly as received, line breaks and entity-like text included', async () => {
+      const result = await detail(
+        artworkRecord(1, {
+          artist_display: 'Test Artist\nFrench, 1840-1900',
+          dimensions: '10 × 20 cm\n(4 &amp; 8 in.)',
+          credit_line: 'Gift of A &amp; B <em>Fund</em>',
+          medium_display: 'Oil on canvas\nwith gilt',
+          style_titles: ['Art &amp; Craft'],
+          subject_titles: ['a <b> tag'],
+        }),
+      );
+      expect(result).toMatchObject({
+        artist_display: 'Test Artist\nFrench, 1840-1900',
+        dimensions: '10 × 20 cm\n(4 &amp; 8 in.)',
+        credit_line: 'Gift of A &amp; B <em>Fund</em>',
+        medium: 'Oil on canvas\nwith gilt',
+        styles: ['Art &amp; Craft'],
+        subjects: ['a <b> tag'],
+      });
     });
 
     it('returns empty arrays and no optional keys for a record with only an id', async () => {
@@ -2089,13 +2514,35 @@ describe('AicService.getArtworks', () => {
 describe('AicService.getSounds', () => {
   const ctx = makeCtx();
 
-  it('requests the uuids in order with the sound fields', async () => {
+  it('searches for the uuids by an id terms filter, sized to the list, with the sound fields', async () => {
     const { service, fetch } = createTestService(scriptedFetch(jsonResponder(envelope([]))));
     await service.getSounds([soundUuid(2), soundUuid(1)], ctx);
-    const url = urlOfCall(fetch);
-    expect(new URL(url).pathname).toBe('/api/v1/sounds');
-    expect(queryParam(url, 'ids')).toBe(`${soundUuid(2)},${soundUuid(1)}`);
-    expect(queryParam(url, 'fields')).toBe('id,title,type,content');
+    const sent = searchCallOf(fetch);
+    expect(new URL(sent.url).pathname).toBe('/api/v1/sounds/search');
+    expect(sent.method).toBe('GET');
+    expect(sent.body).toEqual({
+      query: { bool: { filter: [{ terms: { id: [soundUuid(2), soundUuid(1)] } }] } },
+      limit: 2,
+      fields: 'id,title,type,content',
+    });
+  });
+
+  it('posts 100 uuids past the GET limit the ids= listing stops at, and returns every asset in request order', async () => {
+    const ids = Array.from({ length: 100 }, (_, index) => soundUuid(index + 1));
+    const { service, fetch } = createTestService(
+      scriptedFetch(
+        behindFirewall(jsonResponder(envelope([...ids].reverse().map((id) => soundRecord(id))))),
+      ),
+    );
+    const result = await service.getSounds(ids, ctx);
+    expect(result.sounds.map((sound) => sound.id)).toEqual(ids);
+    const sent = searchCallOf(fetch);
+    expect(sent.method).toBe('POST');
+    expect(sent.body).toMatchObject({
+      query: { bool: { filter: [{ terms: { id: ids } }] } },
+      limit: 100,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it('reorders to request order and drops unknown uuids without reporting them', async () => {
@@ -2320,6 +2767,15 @@ describe('AicService agents', () => {
       expect(queryParam(urlOfCall(fetch), 'ids')).toBe('1,2,3');
       expect(new URL(urlOfCall(fetch)).pathname).toBe('/api/v1/agents');
     });
+
+    it('sends the widest ids the tools accept, 100 of 16 digits, as one GET under the limit', async () => {
+      const ids = Array.from({ length: 100 }, (_, index) => Number.MAX_SAFE_INTEGER - index);
+      const { service, fetch } = createTestService(scriptedFetch(jsonResponder(envelope([]))));
+      await service.getAgents(ids, ctx);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(queryStringBytes(urlOfCall(fetch))).toBe(2_026);
+      expect(idsOf(urlOfCall(fetch))).toEqual(ids);
+    });
   });
 
   describe('artistWorkStats', () => {
@@ -2429,42 +2885,180 @@ describe('AicService.searchExhibitions', () => {
       { sort: 'start_desc', when: 'any', limit: 10, page: 1, ...params },
       ctx,
     );
-    return { result, body: searchBodyOf(urlOfCall(test.fetch)), url: urlOfCall(test.fetch) };
+    return { result, body: searchCallOf(test.fetch).body, url: urlOfCall(test.fetch) };
   };
   const filterOf = (body: Record<string, unknown>) =>
     (body.query as { bool: { filter?: unknown[] } } | undefined)?.bool.filter;
 
   it.each([
     ['any', undefined],
-    [
-      'current',
-      [{ range: { aic_start_at: { lte: 'now' } } }, { range: { aic_end_at: { gte: 'now' } } }],
-    ],
-    ['upcoming', [{ range: { aic_start_at: { gt: 'now' } } }]],
-    ['past', [{ range: { aic_end_at: { lt: 'now' } } }]],
+    ['current', EXHIBITION_WHEN_FILTERS.current],
+    ['upcoming', EXHIBITION_WHEN_FILTERS.upcoming],
+    ['past', EXHIBITION_WHEN_FILTERS.past],
   ] as const)(
     'maps when=%s with Elasticsearch date math, never a server timestamp',
     async (when, filter) => {
       const { body, url } = await run({ when });
       expect(new URL(url).pathname).toBe('/api/v1/exhibitions/search');
       expect(filterOf(body)).toEqual(filter);
+      expect(url).not.toMatch(/\d{4}-\d\d-\d\d/);
     },
   );
 
   it('builds an overlap window from date_from and date_to', async () => {
     const { body } = await run({ date_from: '2020-01-01', date_to: '2020-12-31' });
     expect(filterOf(body)).toEqual([
-      { range: { aic_end_at: { gte: '2020-01-01' } } },
-      { range: { aic_start_at: { lte: '2020-12-31' } } },
+      exhibitionFromClause('2020-01-01'),
+      exhibitionToClause('2020-12-31'),
     ]);
   });
 
   it('combines when and a date window', async () => {
     const { body } = await run({ when: 'past', date_from: '2010-01-01' });
     expect(filterOf(body)).toEqual([
-      { range: { aic_end_at: { lt: 'now' } } },
-      { range: { aic_end_at: { gte: '2010-01-01' } } },
+      ...EXHIBITION_WHEN_FILTERS.past,
+      exhibitionFromClause('2010-01-01'),
     ]);
+  });
+
+  describe('run clauses over records with missing dates', () => {
+    const NOW = Date.parse('2026-11-03T18:00:00Z');
+    /** Record shapes the museum holds, under the ids of real records of each shape. */
+    const RUNS = [
+      exhibitionRecord(1, {
+        aic_start_at: '1951-01-02T00:00:00-06:00',
+        aic_end_at: '1951-03-01T00:00:00-06:00',
+      }),
+      exhibitionRecord(3697, { aic_start_at: '1951-01-24T00:00:00-06:00', aic_end_at: null }),
+      exhibitionRecord(2353, { aic_start_at: '2018-03-20T00:00:00-05:00', aic_end_at: null }),
+      exhibitionRecord(8965, {
+        status: 'Confirmed',
+        aic_start_at: '2012-11-11T00:00:00-06:00',
+        aic_end_at: null,
+      }),
+      exhibitionRecord(10331, {
+        status: 'Confirmed',
+        aic_start_at: '2025-07-11T00:00:00-05:00',
+        aic_end_at: null,
+      }),
+      exhibitionRecord(8966, {
+        status: 'Confirmed',
+        aic_start_at: null,
+        aic_end_at: '2018-04-09T00:00:00-05:00',
+      }),
+      exhibitionRecord(3276, { aic_start_at: null, aic_end_at: null }),
+      exhibitionRecord(8967, { status: 'Confirmed', aic_start_at: null, aic_end_at: null }),
+      // Confirmed, yet closed by its dates: dates decide wherever a closing date is recorded.
+      exhibitionRecord(2, {
+        status: 'Confirmed',
+        aic_start_at: '1993-10-05T00:00:00-05:00',
+        aic_end_at: '1994-01-09T00:00:00-06:00',
+      }),
+      exhibitionRecord(3, {
+        status: 'Confirmed',
+        aic_start_at: '2026-10-01T00:00:00-05:00',
+        aic_end_at: '2027-01-10T00:00:00-06:00',
+      }),
+      exhibitionRecord(4, {
+        status: 'Confirmed',
+        aic_start_at: '2027-02-01T00:00:00-06:00',
+        aic_end_at: '2027-05-01T00:00:00-05:00',
+      }),
+    ];
+    const DATED = [1, 3697, 2353, 8965, 10331, 8966, 2, 3, 4];
+
+    /**
+     * Evaluates the Elasticsearch clause subset the exhibition filters send against one record:
+     * `bool` (a should-only bool needs one match), `exists`, `term`, and `range` over dates with
+     * `now`. Any other shape throws, so a clause the evaluator cannot read never passes.
+     */
+    const matches = (clause: unknown, record: Record<string, unknown>): boolean => {
+      const entries = Object.entries(clause as Record<string, Record<string, unknown>>);
+      const [kind, spec] = entries[0] ?? [];
+      if (entries.length !== 1 || spec === undefined) throw new Error(JSON.stringify(clause));
+      if (kind === 'bool') {
+        const { filter = [], must_not = [], should, ...rest } = spec as Record<string, unknown[]>;
+        if (Object.keys(rest).length > 0 || (should && filter.length + must_not.length > 0)) {
+          throw new Error(`Unsupported bool ${JSON.stringify(clause)}`);
+        }
+        if (should) return should.some((inner) => matches(inner, record));
+        return (
+          filter.every((inner) => matches(inner, record)) &&
+          !must_not.some((inner) => matches(inner, record))
+        );
+      }
+      if (kind === 'exists') return record[String(spec.field)] != null;
+      const [field, operand] = Object.entries(spec)[0] ?? [];
+      if (field === undefined) throw new Error(JSON.stringify(clause));
+      if (kind === 'term') return record[field] === operand;
+      if (kind !== 'range') throw new Error(`Unsupported clause ${JSON.stringify(clause)}`);
+      const value = record[field];
+      if (typeof value !== 'string') return false;
+      const at = Date.parse(value);
+      return Object.entries(operand as Record<string, string>).every(([op, bound]) => {
+        if (bound !== 'now' && !/^\d{4}-\d\d-\d\d$/.test(bound)) throw new Error(bound);
+        const limit = bound === 'now' ? NOW : Date.parse(bound);
+        if (op === 'gte') return at >= limit;
+        if (op === 'gt') return at > limit;
+        if (op === 'lte') return at <= limit;
+        if (op === 'lt') return at < limit;
+        throw new Error(`Unsupported range operator ${op}`);
+      });
+    };
+    const idsMatching = async (params: Parameters<typeof run>[0]) => {
+      const filter = filterOf((await run(params)).body) ?? [];
+      return RUNS.filter((record) => filter.every((clause) => matches(clause, record))).map(
+        ({ id }) => id,
+      );
+    };
+    const year = (y: number) => ({ date_from: `${y}-01-01`, date_to: `${y}-12-31` });
+
+    it.each([
+      ['when any', { when: 'any' }, RUNS.map(({ id }) => id)],
+      [
+        'when current: on now, or no closing date and not Closed',
+        { when: 'current' },
+        [8965, 10331, 3],
+      ],
+      [
+        'when past: closed by date, or no closing date and Closed',
+        { when: 'past' },
+        [1, 3697, 2353, 8966, 3276, 2],
+      ],
+      ['when upcoming: opens after now', { when: 'upcoming' }, [4]],
+      ['the 1951 window: a Closed show matches on its opening date', year(1951), [1, 3697]],
+      ['the 1951 window with when past', { ...year(1951), when: 'past' }, [1, 3697]],
+      ['the 1952 window', year(1952), []],
+      ['the 1994 window: dates decide over a Confirmed status', year(1994), [2]],
+      ['the 2018 window: opening only, open-ended, closing only', year(2018), [2353, 8965, 8966]],
+      ['the 2019 window', year(2019), [8965]],
+      ['the 2011 window, before an open-ended run opens', year(2011), []],
+      ['the 2013 window, inside an open-ended run', year(2013), [8965]],
+      [
+        'a window on today, the same set as when current',
+        { date_from: '2026-11-03', date_to: '2026-11-03' },
+        [8965, 10331, 3],
+      ],
+      ['date_from 2030-01-01 alone', { date_from: '2030-01-01' }, [8965, 10331]],
+      ['date_from 1800-01-01 alone: every dated show', { date_from: '1800-01-01' }, DATED],
+      ['date_to 1800-01-01 alone', { date_to: '1800-01-01' }, []],
+      [
+        'date_to 2018-12-31 alone: a closing date alone counts',
+        { date_to: '2018-12-31' },
+        [1, 3697, 2353, 8965, 8966, 2],
+      ],
+      ['date_to 2100-01-01 alone: every dated show', { date_to: '2100-01-01' }, DATED],
+    ] as const)('matches %s', async (_name, params, ids) => {
+      expect(await idsMatching(params)).toEqual(ids);
+    });
+
+    it('keeps current, past, and upcoming disjoint, leaving only the undated non-Closed show out', async () => {
+      const sets = await Promise.all(
+        (['current', 'past', 'upcoming'] as const).map((when) => idsMatching({ when })),
+      );
+      const counts = RUNS.map(({ id }) => sets.filter((ids) => ids.includes(id)).length);
+      expect(counts).toEqual(RUNS.map(({ id }) => (id === 8967 ? 0 : 1)));
+    });
   });
 
   it('ANDs exact exhibition relationship filters with text and date overlap', async () => {
@@ -2478,9 +3072,9 @@ describe('AicService.searchExhibitions', () => {
       sort: 'relevance',
     });
     expect(filterOf(body)).toEqual([
-      { range: { aic_end_at: { lt: 'now' } } },
-      { range: { aic_end_at: { gte: '2020-01-01' } } },
-      { range: { aic_start_at: { lte: '2020-12-31' } } },
+      ...EXHIBITION_WHEN_FILTERS.past,
+      exhibitionFromClause('2020-01-01'),
+      exhibitionToClause('2020-12-31'),
       { term: { artwork_ids: 16568 } },
       { term: { artist_ids: 35809 } },
     ]);
@@ -2803,7 +3397,7 @@ describe('AicService across routes', () => {
   it('serves different resources from the same instance and cache', async () => {
     const fetch = routedFetch({
       '/api/v1/artworks': jsonResponder(envelope([artworkRecord(1)])),
-      '/api/v1/sounds': jsonResponder(envelope([soundRecord(soundUuid(1))])),
+      '/api/v1/sounds/search': jsonResponder(envelope([soundRecord(soundUuid(1))])),
     });
     const { service } = createTestService(fetch);
     const ctx = makeCtx();

@@ -1,7 +1,8 @@
 /**
  * @fileoverview Tests for the `artic_get_artworks` tool driven through a real
  * `AicService` over a fake `fetch`: id and section normalization, the batch
- * request, request-order reassembly and missing ids, the response budget,
+ * request and its split under the firewall's GET limit, request-order
+ * reassembly and missing ids, the 100-id cap,
  * related-media fan-out (cap, degradation, cancellation), upstream failure
  * classes on the primary call, and `format()` safety.
  * @module tests/tools/get-artworks.tool.test
@@ -18,13 +19,19 @@ import { getArtworks } from '@/mcp-server/tools/definitions/get-artworks.tool.js
 import { type AicServiceOptions, disposeAicService } from '@/services/aic/aic-service.js';
 import { DESCRIPTION_ATTRIBUTION } from '@/services/aic/artwork-records.js';
 import {
+  behindFirewall,
+  GET_QUERY_LIMIT,
   hangingResponder,
+  idsOfWidth,
   jsonResponder,
   networkErrorResponder,
   queryParam,
+  queryStringBytes,
   type Responder,
   routedFetch,
+  SOUNDS,
   scriptedFetch,
+  soundSearchOf,
   textResponder,
   urlOfCall,
 } from '../fixtures/aic-service-kit.js';
@@ -70,10 +77,9 @@ interface GetRun {
 type FetchFake = ReturnType<typeof routedFetch>;
 
 const ARTWORKS = '/api/v1/artworks';
-const SOUNDS = '/api/v1/sounds';
 
 const DETAIL_FIELDS =
-  'id,title,alt_titles,main_reference_number,artist_display,artist_id,artist_ids,date_display,date_start,date_end,date_qualifier_title,place_of_origin,medium_display,dimensions,inscriptions,credit_line,copyright_notice,edition,artwork_type_title,department_title,classification_title,style_title,style_titles,subject_titles,material_titles,technique_titles,theme_titles,is_public_domain,is_on_view,gallery_title,on_loan_display,image_id,alt_image_ids,thumbnail,sound_ids';
+  'id,title,alt_titles,main_reference_number,fiscal_year,artist_display,artist_id,artist_ids,date_display,date_start,date_end,date_qualifier_title,place_of_origin,medium_display,dimensions,inscriptions,credit_line,copyright_notice,edition,artwork_type_title,department_title,classification_title,style_title,style_titles,subject_titles,material_titles,technique_titles,theme_titles,is_public_domain,is_on_view,gallery_title,on_loan_display,image_id,alt_image_ids,thumbnail,sound_ids';
 
 /** `HOSTILE_INLINE_RENDERED` for a field the service passes through the HTML-to-text step, which removes the tag. */
 const HOSTILE_CONVERTED_RENDERED =
@@ -88,7 +94,7 @@ afterEach(() => {
 });
 
 /**
- * Installs a service routing `/artworks` to `artworks` and `/sounds` to
+ * Installs a service routing `/artworks` to `artworks` and `/sounds/search` to
  * `sounds`. A call to an unrouted path fails the fetch, so tests also assert
  * `paths()` to prove which routes were hit.
  */
@@ -190,11 +196,12 @@ describe('artic_get_artworks ids', () => {
     expect(fetchFake).not.toHaveBeenCalled();
   });
 
-  it('accepts exactly 10 ids', async () => {
-    serve([]);
-    expect(
-      (await get({ ids: Array.from({ length: 10 }, (_, i) => i + 1) })).isError,
-    ).toBeUndefined();
+  it('attempts exactly 100 ids, deferring none', async () => {
+    const ids = Array.from({ length: 100 }, (_, i) => i + 1);
+    const fetchFake = serve([]);
+    const out = structuredOf<GetRun>(await get({ ids }));
+    expect(out).toMatchObject({ missing_ids: ids, deferred_ids: [] });
+    expect(queryParam(callTo(fetchFake, '/artworks'), 'ids')).toBe(ids.join(','));
   });
 
   it.each([
@@ -422,7 +429,33 @@ describe('artic_get_artworks results', () => {
     const text = textOf(result);
     expect(text).toContain('## (untitled) (id 5)');
     expect(text).toContain('**Reference number:** not recorded');
+    expect(text).not.toContain('Acquisition fiscal year');
     expect(text).not.toMatch(/undefined|null|NaN/);
+  });
+
+  it('carries the acquisition fiscal year and prints the reference number once per record', async () => {
+    serve([
+      artworkRecord(111628, { main_reference_number: '1942.51', fiscal_year: 1942 }),
+      artworkRecord(286335, { main_reference_number: '2026.12', fiscal_year: 2027 }),
+      artworkRecord(20684, { main_reference_number: '1964.336', fiscal_year: null }),
+    ]);
+    const result = await get({ ids: [111628, 286335, 20684], include_related_media: false });
+    const [nighthawks, recent, unrecorded] = structuredOf<GetRun>(result).artworks;
+    expect(nighthawks).toMatchObject({
+      main_reference_number: '1942.51',
+      acquisition_fiscal_year: 1942,
+    });
+    expect(recent).toMatchObject({
+      main_reference_number: '2026.12',
+      acquisition_fiscal_year: 2027,
+    });
+    expect(unrecorded).toMatchObject({ main_reference_number: '1964.336' });
+    expect(unrecorded).not.toHaveProperty('acquisition_fiscal_year');
+    const text = textOf(result);
+    expect(text.match(/\*\*Reference number:\*\*/g)).toHaveLength(3);
+    expect(text).toContain('- **Reference number:** 1942.51 · **Acquisition fiscal year:** 1942\n');
+    expect(text).toContain('- **Reference number:** 2026.12 · **Acquisition fiscal year:** 2027\n');
+    expect(text).toContain('- **Reference number:** 1964.336\n');
   });
 
   it('omits placeholder years but keeps the display date', async () => {
@@ -536,6 +569,65 @@ describe('artic_get_artworks results', () => {
     expect(JSON.stringify(result)).not.toContain('x.test');
   });
 
+  it('keeps an angle-bracket URL in a history as a citation on both surfaces', async () => {
+    serve([
+      artworkRecord(25332, {
+        publication_history:
+          'Book A.\n\nGothic Ivories Project, The Courtauld Institute of Arts <http://gothicivories.courtauld.ac.uk/>',
+      }),
+    ]);
+    const result = await get({
+      ids: [25332],
+      sections: ['publication_history'],
+      include_related_media: false,
+    });
+    const cited =
+      'Gothic Ivories Project, The Courtauld Institute of Arts (http://gothicivories.courtauld.ac.uk/)';
+    expect(structuredOf<GetRun>(result).artworks[0]?.publication_history).toBe(
+      `Book A.\n\n${cited}`,
+    );
+    expect(textOf(result)).toContain(`### Publication history\n> Book A.\n>\n> ${cited}`);
+  });
+
+  it('converts provenance, on_loan, and inscriptions markup on both surfaces', async () => {
+    serve([
+      artworkRecord(83905, {
+        provenance_text:
+          'Ivan Albright, from 1941 to 1955; partially exchanged for <a href="https://www.artic.edu/artworks/9535"><em>Heavy the Oar to Him Who Is Tired, Heavy the Coat, Heavy the Sea</em></a> (then 1949.961, now 1959.12), and sold to the Art Institute of Chicago, 1955.',
+      }),
+      artworkRecord(137125, {
+        on_loan_display:
+          "<p>On loan to Musée d'art moderne de la ville de Paris in Paris for <i>Kerry James Marshall</i></p>",
+      }),
+      artworkRecord(93802, {
+        inscriptions: 'Signed lower right: Ivan Albright\n<p>\nDated lower left: 1974',
+      }),
+      artworkRecord(1, { inscriptions: 'Signed lower right\nDated 1974' }),
+    ]);
+    const result = await get({
+      ids: [83905, 137125, 93802, 1],
+      sections: ['provenance'],
+      include_related_media: false,
+    });
+    const provenance =
+      'Ivan Albright, from 1941 to 1955; partially exchanged for Heavy the Oar to Him Who Is Tired, Heavy the Coat, Heavy the Sea (https://www.artic.edu/artworks/9535) (then 1949.961, now 1959.12), and sold to the Art Institute of Chicago, 1955.';
+    const onLoan =
+      "On loan to Musée d'art moderne de la ville de Paris in Paris for Kerry James Marshall";
+    const [albright, marshall, dated, untagged] = structuredOf<GetRun>(result).artworks;
+    expect(albright?.provenance).toBe(provenance);
+    expect(marshall?.on_loan).toBe(onLoan);
+    expect(dated?.inscriptions).toBe('Signed lower right: Ivan Albright\n\nDated lower left: 1974');
+    expect(untagged?.inscriptions).toBe('Signed lower right\nDated 1974');
+    const text = textOf(result);
+    expect(text).toContain(`### Provenance\n> ${provenance}`);
+    expect(text).toContain(`- **On loan:** ${onLoan}`);
+    expect(text).toContain(
+      '### Inscriptions\n> Signed lower right: Ivan Albright\n>\n> Dated lower left: 1974',
+    );
+    expect(text).toContain('### Inscriptions\n> Signed lower right\n> Dated 1974');
+    expect(text).not.toMatch(/<\/?(?:a|em|i|p)\b/);
+  });
+
   it('attributes a record that carries only a short description', async () => {
     serve([artworkRecord(1, { short_description: 'Only short.' })]);
     const out = structuredOf<GetRun>(await get({ ids: [1] }));
@@ -550,120 +642,127 @@ describe('artic_get_artworks results', () => {
   });
 });
 
-describe('artic_get_artworks response budget', () => {
+describe('artic_get_artworks 100-id cap', () => {
   const big = (id: number, chars: number) =>
     artworkRecord(id, { provenance_text: 'p'.repeat(chars) });
+  const range = (count: number, from = 1) => Array.from({ length: count }, (_, i) => from + i);
+  const UNATTEMPTED =
+    'The first 100 ids were attempted; call artic_get_artworks again with deferred_ids for the rest.';
+  const ALL_SECTIONS = [
+    'description',
+    'provenance',
+    'exhibition_history',
+    'publication_history',
+    'catalogue',
+  ];
 
-  /** UTF-8 bytes the call puts on the wire: format() text and structuredContent, each as JSON. */
-  const wireBytes = (result: Awaited<ReturnType<typeof get>>) =>
-    Buffer.byteLength(JSON.stringify(textOf(result))) +
-    Buffer.byteLength(JSON.stringify(result.structuredContent));
-
-  it('counts the format() markdown as well as the structured record', async () => {
-    serve([big(1, 30_000), big(2, 30_000)]);
-    const out = structuredOf<GetRun>(
-      await get({ ids: [1, 2], sections: ['provenance'], include_related_media: false }),
-    );
-    expect(out.artworks.map((artwork) => artwork.id)).toEqual([1]);
-    expect(out.deferred_ids).toEqual([2]);
-  });
-
-  it('keeps a ten-id response with related media under 100,000 bytes on the wire', async () => {
-    serve(
-      Array.from({ length: 10 }, (_, i) => ({
-        ...big(i + 1, 19_000),
-        description: `<p>${'d'.repeat(1_000)}</p>`,
-        sound_ids: [soundUuid(2 * i + 1), soundUuid(2 * i + 2)],
-      })),
-      Array.from({ length: 20 }, (_, i) =>
-        soundRecord(soundUuid(i + 1), { title: `A long related media title ${'t'.repeat(40)}` }),
+  it('returns 100 found records with every section and their media whole, in request order', async () => {
+    const ids = range(100, 100_001);
+    const text = (char: string) => char.repeat(2_000);
+    const fetchFake = serve(
+      [...ids].reverse().map((id, i) =>
+        artworkRecord(id, {
+          description: `<p>${text('d')}</p>`,
+          short_description: text('s'),
+          provenance_text: text('p'),
+          exhibition_history: text('e'),
+          publication_history: text('u'),
+          catalogue_display: `<p>${text('c')}</p>`,
+          sound_ids: [soundUuid(i + 1)],
+        }),
       ),
+      soundsFor(1, 100),
     );
-    const result = await get({ ids: Array.from({ length: 10 }, (_, i) => i + 1) });
+    const result = await get({
+      ids,
+      sections: [
+        'description',
+        'provenance',
+        'exhibition_history',
+        'publication_history',
+        'catalogue',
+      ],
+    });
     const out = structuredOf<GetRun>(result);
-    expect(out.deferred_ids.length).toBeGreaterThan(0);
-    expect(wireBytes(result)).toBeLessThanOrEqual(100_000);
+    expect(out.artworks.map((artwork) => artwork.id)).toEqual(ids);
+    expect(
+      out.artworks.every((artwork) => fieldOf<string>(artwork, 'provenance').length === 2_000),
+    ).toBe(true);
+    expect(
+      out.artworks.every((artwork) => fieldOf<unknown[]>(artwork, 'related_media').length === 1),
+    ).toBe(true);
+    expect(out).toMatchObject({ missing_ids: [], deferred_ids: [] });
+    expect(out).not.toHaveProperty('notice');
+    expect(queryParam(callTo(fetchFake, '/artworks'), 'ids')).toBe(ids.join(','));
+    const text100 = textOf(result);
+    expect(text100).toContain('# Artworks (100 records)');
+    expect(text100).toContain('**Deferred ids:** none');
+    for (const id of ids) expect(text100).toContain(`(id ${id})`);
   });
 
-  it.each(Array.from({ length: 13 }, (_, i) => 600 + 50 * i))(
-    'keeps the whole result under 100,000 bytes at the worst case: ten ids, every section, 20 long-titled media items (%i-character sections)',
-    async (chars) => {
-      const ids = Array.from({ length: 10 }, (_, i) => 100_001 + i);
-      const text = (char: string) => char.repeat(chars);
-      serve(
-        ids.slice(0, 9).map((id, i) =>
-          artworkRecord(id, {
-            description: `<p>${text('d')}</p>`,
-            short_description: text('s'),
-            provenance_text: text('p'),
-            exhibition_history: text('e'),
-            publication_history: text('u'),
-            catalogue_display: `<p>${text('c')}</p>`,
-            sound_ids: [soundUuid(3 * i + 1), soundUuid(3 * i + 2), soundUuid(3 * i + 3)],
-          }),
-        ),
-        Array.from({ length: 27 }, (_, i) =>
-          soundRecord(soundUuid(i + 1), { title: `Audio Lecture: ${'l'.repeat(385)}` }),
-        ),
-      );
-      const result = await get({
-        ids,
-        sections: [
-          'description',
-          'provenance',
-          'exhibition_history',
-          'publication_history',
-          'catalogue',
-        ],
-      });
-      const out = structuredOf<GetRun>(result);
-      expect(out.missing_ids).toEqual([100_010]);
-      expect(out.deferred_ids.length).toBeGreaterThan(0);
-      expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(100_000);
-    },
-  );
-
-  it('defers records once their wire bytes would pass the budget', async () => {
-    serve([big(1, 19_000), big(2, 19_000), big(3, 19_000)]);
+  it('defers ids past the 100th in request order and says how to continue', async () => {
+    const fetchFake = serve(records(range(100)));
     const result = await get({
-      ids: [1, 2, 3],
-      sections: ['provenance'],
+      ids: [...range(100), 250, 101],
       include_related_media: false,
     });
     const out = structuredOf<GetRun>(result);
-    expect(out.artworks.map((artwork) => artwork.id)).toEqual([1, 2]);
-    expect(out.deferred_ids).toEqual([3]);
-    expect(out.notice).toBe(
-      'The response budget was reached; call artic_get_artworks again with ids 3 (or fewer sections) for the rest.',
-    );
-    expect(textOf(result)).toContain('**Deferred ids:** 3');
+    expect(out.artworks).toHaveLength(100);
+    expect(out.deferred_ids).toEqual([250, 101]);
+    expect(out.missing_ids).toEqual([]);
+    expect(out.notice).toBe(UNATTEMPTED);
+    expect(queryParam(callTo(fetchFake, '/artworks'), 'ids')).toBe(range(100).join(','));
+    expect(textOf(result)).toContain('**Deferred ids:** 250, 101');
   });
 
-  it('always keeps the first record, however large, and defers the rest in order', async () => {
+  it('returns a very large record whole beside the others', async () => {
     serve([big(1, 250_000), big(2, 10), big(3, 10)]);
     const out = structuredOf<GetRun>(
       await get({ ids: [1, 2, 3], sections: ['provenance'], include_related_media: false }),
     );
-    expect(out.artworks.map((artwork) => artwork.id)).toEqual([1]);
-    expect(out.deferred_ids).toEqual([2, 3]);
-    expect(out.notice).toContain('ids 2, 3');
-  });
-
-  it('defers nothing when the records fit', async () => {
-    serve([big(1, 19_000), big(2, 19_000)]);
-    const out = structuredOf<GetRun>(
-      await get({ ids: [1, 2], sections: ['provenance'], include_related_media: false }),
-    );
+    expect(out.artworks.map((artwork) => artwork.id)).toEqual([1, 2, 3]);
+    expect(fieldOf<string>(out.artworks[0], 'provenance')).toHaveLength(250_000);
     expect(out.deferred_ids).toEqual([]);
+    expect(out).not.toHaveProperty('notice');
   });
 
-  it('joins the missing-id and deferral notices', async () => {
-    serve([big(1, 250_000), big(2, 10)]);
-    const out = structuredOf<GetRun>(
-      await get({ ids: [1, 9, 2], sections: ['provenance'], include_related_media: false }),
+  it('attempts 100 eleven-digit ids with every section in requests the firewall passes, all missing on both surfaces', async () => {
+    const ids = idsOfWidth(11);
+    const notice = 'None of the attempted ids exist. Find ids with artic_search_artworks.';
+    const fetchFake = serve(behindFirewall(jsonResponder(envelope([]))));
+    const result = await get({ ids, sections: ALL_SECTIONS });
+    const out = structuredOf<GetRun>(result);
+    expect(out).toMatchObject({ artworks: [], missing_ids: ids, deferred_ids: [], notice });
+    expect(textOf(result)).toContain(`**Missing ids:** ${ids.join(', ')}`);
+    expect(
+      result.content.some((block) => block.type === 'text' && block.text.includes(notice)),
+    ).toBe(true);
+    expect(paths(fetchFake)).toEqual(['/artworks', '/artworks']);
+    for (const [url] of fetchFake.mock.calls) {
+      expect(queryStringBytes(url)).toBeLessThanOrEqual(GET_QUERY_LIMIT);
+    }
+  });
+
+  it('sends 100 six-digit ids with every section as the one request it always was', async () => {
+    const ids = idsOfWidth(6);
+    const fetchFake = serve([]);
+    await get({ ids, sections: ALL_SECTIONS });
+    const fields = `${DETAIL_FIELDS},description,short_description,provenance_text,exhibition_history,publication_history,catalogue_display`;
+    expect(paths(fetchFake)).toEqual(['/artworks']);
+    expect(urlOfCall(fetchFake)).toBe(
+      `https://api.artic.edu/api/v1/artworks?ids=${ids.join('%2C')}&fields=${fields.replaceAll(',', '%2C')}`,
     );
+  });
+
+  it('joins the missing-id and unattempted-id notices', async () => {
+    serve(records(range(99)));
+    const out = structuredOf<GetRun>(
+      await get({ ids: [...range(99), 400, 401], include_related_media: false }),
+    );
+    expect(out.missing_ids).toEqual([400]);
+    expect(out.deferred_ids).toEqual([401]);
     expect(out.notice).toBe(
-      'No artwork exists for id 9; find ids with artic_search_artworks. The response budget was reached; call artic_get_artworks again with ids 2 (or fewer sections) for the rest.',
+      `No artwork exists for id 400; find ids with artic_search_artworks. ${UNATTEMPTED}`,
     );
   });
 });
@@ -686,9 +785,11 @@ describe('artic_get_artworks related media', () => {
       ],
     );
     const out = structuredOf<GetRun>(await get({ ids: [1, 2, 3] }));
-    expect(paths(fetchFake)).toEqual(['/artworks', '/sounds']);
-    expect(queryParam(callTo(fetchFake, '/sounds'), 'ids')).toBe(`${u1},${u2},${u3}`);
-    expect(queryParam(callTo(fetchFake, '/sounds'), 'fields')).toBe('id,title,type,content');
+    expect(paths(fetchFake)).toEqual(['/artworks', '/sounds/search']);
+    expect(soundSearchOf(fetchFake)).toEqual({
+      ids: [u1, u2, u3],
+      fields: 'id,title,type,content',
+    });
     const [first, second, third] = out.artworks;
     expect(first?.related_media).toEqual([
       { id: u1, title: 'First stop', url: `https://www.artic.edu/assets/${u1}`, type: 'sound' },
@@ -719,41 +820,45 @@ describe('artic_get_artworks related media', () => {
     expect(out.artworks[0]).not.toHaveProperty('related_media');
   });
 
-  it('does not load media for ids that were missing or deferred', async () => {
+  it('does not load media for ids that were missing', async () => {
     const fetchFake = serve([withSounds(1, 1, 1)]);
     await get({ ids: [1, 2] });
-    expect(queryParam(callTo(fetchFake, '/sounds'), 'ids')).toBe(soundUuid(1));
+    expect(soundSearchOf(fetchFake).ids).toEqual([soundUuid(1)]);
   });
 
-  it('caps the load at 20 ids across records and names the record left short', async () => {
+  it('caps the load at 100 ids across records and names the record left short', async () => {
     const fetchFake = serve(
-      [withSounds(1, 10, 1), withSounds(2, 10, 11), withSounds(3, 4, 21)],
-      soundsFor(1, 24),
+      [withSounds(1, 50, 1), withSounds(2, 50, 51), withSounds(3, 4, 101)],
+      soundsFor(1, 104),
     );
-    const out = structuredOf<GetRun>(await get({ ids: [1, 2, 3] }));
-    const requested = (queryParam(callTo(fetchFake, '/sounds'), 'ids') ?? '').split(',');
-    expect(requested).toHaveLength(20);
-    expect(requested[19]).toBe(soundUuid(20));
-    expect(fieldOf<unknown[]>(out.artworks[0], 'related_media').length).toBe(10);
-    expect(fieldOf<unknown[]>(out.artworks[1], 'related_media').length).toBe(10);
+    const result = await get({ ids: [1, 2, 3] });
+    const out = structuredOf<GetRun>(result);
+    const requested = soundSearchOf(fetchFake).ids;
+    expect(requested).toHaveLength(100);
+    expect(requested[99]).toBe(soundUuid(100));
+    expect(fieldOf<unknown[]>(out.artworks[0], 'related_media').length).toBe(50);
+    expect(fieldOf<unknown[]>(out.artworks[1], 'related_media').length).toBe(50);
     expect(out.artworks[2]).not.toHaveProperty('related_media');
-    expect(out.notice).toBe(
-      'Related media is capped at 20 items per call; artwork 3 is missing some or all of its related media. Call artic_get_artworks with fewer ids to load it.',
-    );
+    const capped =
+      'Related media is capped at 100 items per call; artwork 3 is missing some or all of its related media. Call artic_get_artworks with fewer ids to load it.';
+    expect(out.notice).toBe(capped);
+    expect(
+      result.content.some((block) => block.type === 'text' && block.text.includes(capped)),
+    ).toBe(true);
   });
 
   it('keeps the loaded part of a record that straddles the cap', async () => {
-    serve([withSounds(1, 12, 1), withSounds(2, 12, 13)], soundsFor(1, 24));
+    serve([withSounds(1, 60, 1), withSounds(2, 60, 61)], soundsFor(1, 120));
     const out = structuredOf<GetRun>(await get({ ids: [1, 2] }));
-    expect(fieldOf<unknown[]>(out.artworks[0], 'related_media').length).toBe(12);
-    expect(fieldOf<unknown[]>(out.artworks[1], 'related_media').length).toBe(8);
+    expect(fieldOf<unknown[]>(out.artworks[0], 'related_media').length).toBe(60);
+    expect(fieldOf<unknown[]>(out.artworks[1], 'related_media').length).toBe(40);
     expect(out.notice).toContain('artwork 2 is missing some or all');
   });
 
-  it('does not cap exactly 20 ids', async () => {
-    serve([withSounds(1, 20, 1)], soundsFor(1, 20));
+  it('does not cap exactly 100 ids', async () => {
+    serve([withSounds(1, 100, 1)], soundsFor(1, 100));
     const out = structuredOf<GetRun>(await get({ ids: [1] }));
-    expect(fieldOf<unknown[]>(out.artworks[0], 'related_media').length).toBe(20);
+    expect(fieldOf<unknown[]>(out.artworks[0], 'related_media').length).toBe(100);
     expect(out).not.toHaveProperty('notice');
   });
 
@@ -811,7 +916,7 @@ describe('artic_get_artworks related media', () => {
       { ids: [1] },
       { context: { signal: controller.signal } },
     );
-    await vi.waitFor(() => expect(paths(fetchFake)).toEqual(['/artworks', '/sounds']));
+    await vi.waitFor(() => expect(paths(fetchFake)).toEqual(['/artworks', '/sounds/search']));
     controller.abort(new DOMException('cancelled by caller', 'AbortError'));
     const result = await pending;
     expect(errorOf(result).code).toBe(JsonRpcErrorCode.RequestCancelled);
@@ -861,7 +966,7 @@ describe('artic_get_artworks format', () => {
       `display ${IIIF_URL}/${ALT_IMAGE_ID}/full/843,/0/default.jpg`,
     );
     expect(text).toContain('### Description\n> A description.');
-    expect(text).toContain('### Provenance\n> Owner A\n> Owner B');
+    expect(text).toContain('### Provenance\n> Owner A Owner B');
     expect(text).toContain('**Missing ids:** 3');
     expect(text).toContain('**Deferred ids:** none');
     expect(text).toContain(`**Description attribution:** ${DESCRIPTION_ATTRIBUTION}`);
@@ -979,15 +1084,13 @@ describe('artic_get_artworks format', () => {
     for (const label of ['Styles', 'Subjects', 'Materials', 'Techniques', 'Themes']) {
       expect(text).toContain(`- **${label}:** ${HOSTILE_INLINE_RENDERED}`);
     }
-    expect(text).toContain(`- **On loan:** ${HOSTILE_INLINE_RENDERED}`);
+    expect(text).toContain(`- **On loan:** ${HOSTILE_CONVERTED_RENDERED}`);
     expect(text).toContain(
       `- ${HOSTILE_CONVERTED_RENDERED} (${HOSTILE_INLINE_RENDERED}) · [https://www.artic.edu/assets/${soundUuid(1)}](<https://www.artic.edu/assets/${soundUuid(1)}>)`,
     );
 
-    for (const heading of ['Inscriptions', 'Provenance']) {
-      expect(text).toContain(`### ${heading}\n> Line one\n> \\# Injected heading\n>\n> Line three`);
-    }
-    for (const heading of ['Exhibition history', 'Publication history']) {
+    expect(text).toContain('### Inscriptions\n> Line one\n> \\# Injected heading\n>\n> Line three');
+    for (const heading of ['Provenance', 'Exhibition history', 'Publication history']) {
       expect(text).toContain(`### ${heading}\n> Line one # Injected heading\n>\n> Line three`);
     }
     expect(text).toContain('> First\n> \\# Injected description\n> Third');
@@ -1001,8 +1104,8 @@ describe('artic_get_artworks format', () => {
     expect(record?.title).toBe('Study\n# Injected title <x> [y]');
     expect(record?.artist_display).toBe(HOSTILE_INLINE);
     expect(record?.dimensions).toBe(HOSTILE_INLINE);
-    expect(record?.inscriptions).toBe(freeText);
-    expect(record?.provenance).toBe(freeText);
+    expect(record?.inscriptions).toBe('Line one\n# Injected heading\n\nLine three\u0007‮');
+    expect(record?.provenance).toBe('Line one # Injected heading\n\nLine three\u0007‮');
   });
 
   it('renders link, image, and decoded HTML in quoted free text as inert text', async () => {

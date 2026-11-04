@@ -112,6 +112,19 @@ describe('artic_search_audio_guide request', () => {
     });
   });
 
+  it('leaves stop words out of the must clause and keeps them in q', async () => {
+    const fetchFake = emptyResults();
+    await listen({ query: 'the bedroom' });
+    expect(bodyOf(fetchFake)).toMatchObject({
+      q: 'the bedroom',
+      query: {
+        bool: {
+          must: [{ simple_query_string: { query: 'bedroom', default_operator: 'and' } }],
+        },
+      },
+    });
+  });
+
   it('trims the query before building the request', async () => {
     const fetchFake = emptyResults();
     await listen({ query: '   seurat  ' });
@@ -122,9 +135,22 @@ describe('artic_search_audio_guide request', () => {
   });
 
   it('passes page and limit upstream', async () => {
-    const fetchFake = serve(envelopeOf(rows(2, 5), 100));
+    const fetchFake = serve(envelopeOf(rows(20, 41), 100));
     await listen({ query: 'a', page: 3, limit: 20 });
-    expect(bodyOf(fetchFake)).toMatchObject({ page: 3, limit: 2 });
+    expect(bodyOf(fetchFake)).toMatchObject({ page: 3, limit: 20 });
+  });
+
+  it('returns every stop of a small match set in one call at limit 10', async () => {
+    const fetchFake = serve(envelopeOf(rows(9), 9));
+    const result = await listen({ query: 'nighthawks', limit: 10 });
+    const out = structuredOf<AudioRun>(result);
+    expect(out).toMatchObject({ shown: 9, cap: 10, has_more: false, totalCount: 9 });
+    expect(out).not.toHaveProperty('next_page');
+    expect(out).not.toHaveProperty('notice');
+    expect(fetchFake).toHaveBeenCalledTimes(1);
+    expect(bodyOf(fetchFake)).toMatchObject({ page: 1, limit: 10 });
+    const text = textOf(result);
+    for (const stop of out.stops) expect(text).toContain(`(id ${String(stop.id)})`);
   });
 
   it('keeps query operators and punctuation as typed in the must clause, and ranks without the quotes', async () => {
@@ -190,7 +216,8 @@ describe('artic_search_audio_guide input validation', () => {
   it.each([
     ['a query of exactly 200 characters', { query: 'x'.repeat(200) }],
     ['limit 20', { query: 'a', limit: 20 }],
-    ['page 500 at limit 20, applied as two stops', { query: 'a', page: 500, limit: 20 }],
+    ['page 50 at limit 20, which ends on match 1,000', { query: 'a', page: 50, limit: 20 }],
+    ['page 10 at limit 1000, applied as 100 stops', { query: 'a', page: 10, limit: 1000 }],
     ['page 1000 at limit 1, which ends on match 1,000', { query: 'a', page: 1000, limit: 1 }],
   ])('accepts %s', async (_name, input) => {
     emptyResults();
@@ -215,6 +242,8 @@ describe('artic_search_audio_guide window guard', () => {
     ['page 501 at limit 20', { page: 501, limit: 20 }],
     ['page 501 at limit 10', { page: 501, limit: 10 }],
     ['page 1000 at limit 6', { page: 1000, limit: 6 }],
+    ['page 51 at limit 20', { page: 51, limit: 20 }],
+    ['page 11 at limit 1000, applied as 100 stops', { page: 11, limit: 1000 }],
   ])('fails page_beyond_window for %s before any upstream call', async (_name, paging) => {
     const fetchFake = emptyResults();
     const result = await listen({ query: 'a', ...paging });
@@ -273,7 +302,10 @@ describe('artic_search_audio_guide paging and enrichment', () => {
   it('reports the applied limit as the cap on the zero-result page', async () => {
     emptyResults();
     const out = structuredOf<AudioRun>(await listen({ query: 'nothing', limit: 17 }));
-    expect(out).toMatchObject({ cap: 2, shown: 0, totalCount: 0 });
+    expect(out).toMatchObject({ cap: 17, shown: 0, totalCount: 0 });
+    emptyResults();
+    const clamped = structuredOf<AudioRun>(await listen({ query: 'nothing', limit: 1000 }));
+    expect(clamped).toMatchObject({ cap: 100, shown: 0, totalCount: 0 });
   });
 
   it('returns the under-cap page with the total, no next page, and no notice', async () => {
@@ -330,10 +362,10 @@ describe('artic_search_audio_guide paging and enrichment', () => {
     expect(out.notice).toBe('Page 9 is past the last match (12 total); request a lower page.');
   });
 
-  it('offers page 500 at requested limit 20 because the applied size still fits the window', async () => {
-    serve(envelopeOf(rows(2, 997), 5000));
-    const out = structuredOf<AudioRun>(await listen({ query: 'a', page: 499, limit: 20 }));
-    expect(out).toMatchObject({ has_more: true, next_page: 500 });
+  it('offers page 10 at requested limit 1000 because the applied size still fits the window', async () => {
+    serve(envelopeOf(rows(100, 801), 5000));
+    const out = structuredOf<AudioRun>(await listen({ query: 'a', page: 9, limit: 1000 }));
+    expect(out).toMatchObject({ has_more: true, next_page: 10, cap: 100, shown: 100 });
   });
 
   it('skips upstream rows with no integer id and counts only what it returns', async () => {

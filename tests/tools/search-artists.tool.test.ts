@@ -15,12 +15,14 @@ import { searchArtists } from '@/mcp-server/tools/definitions/search-artists.too
 import { disposeAicService } from '@/services/aic/aic-service.js';
 import { WINDOW_NOTICE } from '@/services/aic/aic-text.js';
 import {
+  behindFirewall,
   hangingResponder,
   jsonResponder,
   queryParam,
   type Responder,
   routedFetch,
   searchBodyOf,
+  searchCallOf,
   textResponder,
   urlOfCall,
 } from '../fixtures/aic-service-kit.js';
@@ -240,11 +242,15 @@ describe('artic_search_artists input validation', () => {
     expect(issues[0]).toMatchObject({ code: 'custom', path: ['ids'] });
   });
 
-  it('accepts exactly 25 ids', async () => {
-    const ids = Array.from({ length: 25 }, (_, i) => i + 1);
+  it('attempts exactly 100 ids in one call, deferring none', async () => {
+    const ids = Array.from({ length: 100 }, (_, i) => i + 1);
     const fetchFake = serveIds([]);
     const result = await find({ ids });
-    expect(result.isError).toBeUndefined();
+    expect(structuredOf<ArtistsRun>(result)).toMatchObject({
+      deferred_ids: [],
+      has_more: false,
+      cap: 100,
+    });
     expect(queryParam(callTo(fetchFake, '/agents'), 'ids')).toBe(ids.join(','));
   });
 
@@ -384,6 +390,7 @@ describe('artic_search_artists guards', () => {
   it.each([
     ['page 41 at limit 25', { page: 41, limit: 25 }],
     ['page 51 at limit 20', { page: 51, limit: 20 }],
+    ['page 11 at limit 100', { page: 11, limit: 100 }],
   ])('fails page_beyond_window for %s', async (_name, paging) => {
     const fetchFake = serve({});
     const result = await find({ query: 'a', ...paging });
@@ -759,6 +766,41 @@ describe('artic_search_artists ids mode', () => {
     expect(out.artists).toHaveLength(1);
     expect(out.cap).toBe(1);
     expect(queryParam(callTo(fetchFake, '/agents'), 'ids')).toBe('1');
+  });
+
+  it('attempts the first 100 distinct ids, counts their works in one aggregation, and defers the rest', async () => {
+    const ids = [...Array.from({ length: 100 }, (_, i) => 100_000 + i), 200_000];
+    // Six-digit ids twice over put the stats aggregation past the firewall's GET limit.
+    const fetchFake = serveIds(
+      [...ids.slice(0, 100)].reverse().map((id) => agentRecord(id)),
+      behindFirewall(statsFor(bucket(100_000, 4))),
+    );
+    const result = await find({ ids: [ids[0], ...ids] });
+    const out = structuredOf<ArtistsRun & { deferred_ids: number[] }>(result);
+    expect(out.artists.map((artist) => artist.id)).toEqual(ids.slice(0, 100));
+    expect(out).toMatchObject({
+      missing_ids: [],
+      deferred_ids: [200_000],
+      has_more: true,
+      truncated: true,
+      shown: 100,
+      cap: 100,
+      notice:
+        'The first 100 ids were attempted; call artic_search_artists again with deferred_ids as ids for the rest.',
+    });
+    expect(out.artists[0]).toMatchObject({ artwork_count: 4 });
+    expect(out.artists[99]).toMatchObject({ artwork_count: 0 });
+    expect(queryParam(callTo(fetchFake, AGENTS), 'ids')).toBe(ids.slice(0, 100).join(','));
+    const statsIndex = fetchFake.mock.calls.findIndex(
+      ([url]) => new URL(url).pathname === `/api/v1${ARTWORKS_SEARCH}`,
+    );
+    const stats = searchCallOf(fetchFake, statsIndex).body as {
+      aggs: { by_artist: { terms: { include: number[]; size: number } } };
+    };
+    expect(stats.aggs.by_artist.terms).toMatchObject({ include: ids.slice(0, 100), size: 100 });
+    const text = textOf(result);
+    expect(text).toContain('**Deferred ids:** 200000');
+    expect(text).toContain('(id 100099)');
   });
 });
 

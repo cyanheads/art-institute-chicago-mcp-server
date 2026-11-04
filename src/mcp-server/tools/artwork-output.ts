@@ -38,6 +38,15 @@ const ArtworkImageSchema = z
 export const artworkSummaryShape = {
   id: z.number().describe('Artwork id; pass to artic_get_artworks.'),
   title: z.string().describe('Title as catalogued; empty when the museum lists none.'),
+  main_reference_number: z
+    .string()
+    .describe('Museum reference (accession) number; empty when the museum lists none.'),
+  acquisition_fiscal_year: z
+    .number()
+    .optional()
+    .describe(
+      'The fiscal year in which the museum acquired the work, which can differ by one from the year in main_reference_number; absent when unrecorded.',
+    ),
   artist_display: z
     .string()
     .optional()
@@ -120,6 +129,14 @@ export function summaryLines(artwork: ArtworkSummary): string[] {
   if (artwork.date_start !== undefined) date.push(`start ${artwork.date_start}`);
   if (artwork.date_end !== undefined) date.push(`end ${artwork.date_end}`);
   if (date.length > 0) lines.push(`- **Date:** ${date.join(' · ')}`);
+
+  const reference = [
+    `**Reference number:** ${inlineSafe(artwork.main_reference_number) || 'not recorded'}`,
+  ];
+  if (artwork.acquisition_fiscal_year !== undefined) {
+    reference.push(`**Acquisition fiscal year:** ${artwork.acquisition_fiscal_year}`);
+  }
+  lines.push(`- ${reference.join(' · ')}`);
 
   if (artwork.medium) lines.push(`- **Medium:** ${inlineSafe(artwork.medium)}`);
   if (artwork.artwork_type) lines.push(`- **Type:** ${inlineSafe(artwork.artwork_type)}`);

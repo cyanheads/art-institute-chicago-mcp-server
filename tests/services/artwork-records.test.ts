@@ -1,7 +1,7 @@
 /**
  * @fileoverview Tests for `loadArtworkRecords`: request-order records, missing
- * ids, the wire-byte response budget and deferred ids, the 20-id
- * related-media cap, degradation when `/sounds` fails, cancellation, and the
+ * ids, the 100-id cap and deferred ids, the 100-item related-media cap,
+ * degradation when the `/sounds` search fails, cancellation, and the
  * description attribution.
  * @module tests/services/artwork-records.test.ts
  */
@@ -14,10 +14,10 @@ import { disposeAicService, initAicService } from '@/services/aic/aic-service.js
 import {
   DEFAULT_SECTIONS,
   DESCRIPTION_ATTRIBUTION,
-  jsonBytes,
   loadArtworkRecords,
 } from '@/services/aic/artwork-records.js';
 import {
+  behindFirewall,
   jsonResponder,
   networkErrorResponder,
   queryParam,
@@ -25,6 +25,9 @@ import {
   rejection,
   rejectionOf,
   routedFetch,
+  SOUNDS,
+  searchCallOf,
+  soundSearchesOf,
   TEST_VERSION,
   textResponder,
 } from '../fixtures/aic-service-kit.js';
@@ -40,7 +43,9 @@ import {
 } from '../fixtures/aic-upstream.js';
 
 const ARTWORKS = '/api/v1/artworks';
-const SOUNDS = '/api/v1/sounds';
+
+const UNATTEMPTED_NOTICE =
+  'The first 100 ids were attempted; call artic_get_artworks again with deferred_ids for the rest.';
 
 const degradedNotice =
   'Related media could not be loaded; the artwork records are complete. Call artic_get_artworks again to retry related media.';
@@ -64,15 +69,18 @@ const request = (
   ids,
   include_related_media: true,
   sections: DEFAULT_SECTIONS,
-  wireBytes: jsonBytes,
   ...overrides,
 });
 
-/** Calls recorded for one route, as parsed `ids` lists. */
-const idsRequested = (fetch: ReturnType<typeof routedFetch>, path: string): string[][] =>
+/** `/artworks` calls recorded, as parsed `ids` lists. */
+const artworkIdsRequested = (fetch: ReturnType<typeof routedFetch>): number[][] =>
   fetch.mock.calls
-    .filter(([url]) => new URL(url).pathname === path)
-    .map(([url]) => (queryParam(url, 'ids') ?? '').split(',').filter(Boolean));
+    .filter(([url]) => new URL(url).pathname === ARTWORKS)
+    .map(([url]) => (queryParam(url, 'ids') ?? '').split(',').map(Number));
+
+/** `/sounds` searches recorded, as the uuid lists of their `id` terms filter. */
+const soundIdsRequested = (fetch: ReturnType<typeof routedFetch>): string[][] =>
+  soundSearchesOf(fetch).map(({ ids }) => ids);
 
 afterEach(() => {
   disposeAicService();
@@ -112,7 +120,7 @@ describe('loadArtworkRecords', () => {
         'None of the attempted ids exist. Find ids with artic_search_artworks.',
       ]);
       expect(result).not.toHaveProperty('description_attribution');
-      expect(idsRequested(fetch, SOUNDS)).toEqual([]);
+      expect(soundIdsRequested(fetch)).toEqual([]);
     });
 
     it('passes the requested ids and sections to the upstream call', async () => {
@@ -184,7 +192,7 @@ describe('loadArtworkRecords', () => {
       expect(result).not.toHaveProperty('description_attribution');
     });
 
-    it('is absent when the only description-bearing record was deferred by the budget', async () => {
+    it('is present when a description-bearing record follows a very large one', async () => {
       setup({
         [ARTWORKS]: jsonResponder(
           envelope([
@@ -197,7 +205,25 @@ describe('loadArtworkRecords', () => {
         request([1, 2], { include_related_media: false }),
         createMockContext(),
       );
-      expect(result.deferred_ids).toEqual([2]);
+      expect(result.deferred_ids).toEqual([]);
+      expect(result.description_attribution).toBe(DESCRIPTION_ATTRIBUTION);
+    });
+
+    it('is absent when the only description-bearing id falls past the 100th', async () => {
+      const head = Array.from({ length: 100 }, (_, i) => i + 1);
+      setup({
+        [ARTWORKS]: jsonResponder(
+          envelope([
+            ...head.map((id) => sparseArtworkRecord(id)),
+            artworkRecord(101, { description: '<p>Text.</p>' }),
+          ]),
+        ),
+      });
+      const result = await loadArtworkRecords(
+        request([...head, 101], { include_related_media: false }),
+        createMockContext(),
+      );
+      expect(result.deferred_ids).toEqual([101]);
       expect(result).not.toHaveProperty('description_attribution');
     });
 
@@ -213,89 +239,72 @@ describe('loadArtworkRecords', () => {
     });
   });
 
-  describe('response budget', () => {
+  describe('the 100-id cap', () => {
     const bulky = (id: number, chars: number) =>
       artworkRecord(id, { provenance_text: 'p'.repeat(chars) });
+    const range = (count: number, from = 1) => Array.from({ length: count }, (_, i) => from + i);
 
-    it('keeps everything under the budget', async () => {
+    it('attempts exactly 100 ids in one call, deferring none', async () => {
+      const fetch = setup({
+        [ARTWORKS]: jsonResponder(envelope(range(100).map((id) => artworkRecord(id)))),
+      });
+      const result = await loadArtworkRecords(
+        request(range(100), { include_related_media: false }),
+        createMockContext(),
+      );
+      expect(artworkIdsRequested(fetch)).toEqual([range(100)]);
+      expect(result.artworks.map((a) => a.id)).toEqual(range(100));
+      expect(result.deferred_ids).toEqual([]);
+      expect(result.notices).toEqual([]);
+    });
+
+    it('attempts the first 100 ids and defers the rest in request order', async () => {
+      const fetch = setup({
+        [ARTWORKS]: jsonResponder(envelope(range(100).map((id) => artworkRecord(id)))),
+      });
+      const result = await loadArtworkRecords(
+        request([...range(100), 250, 101], { include_related_media: false }),
+        createMockContext(),
+      );
+      expect(artworkIdsRequested(fetch)).toEqual([range(100)]);
+      expect(result.artworks.map((a) => a.id)).toEqual(range(100));
+      expect(result.missing_ids).toEqual([]);
+      expect(result.deferred_ids).toEqual([250, 101]);
+      expect(result.notices).toEqual([UNATTEMPTED_NOTICE]);
+    });
+
+    it('returns every found record whole, however large, with nothing deferred', async () => {
       setup({
-        [ARTWORKS]: jsonResponder(envelope([bulky(1, 25_000), bulky(2, 25_000), bulky(3, 25_000)])),
+        [ARTWORKS]: jsonResponder(envelope([bulky(3, 10), bulky(1, 300_000), bulky(2, 300_000)])),
       });
       const result = await loadArtworkRecords(
         request([1, 2, 3], { include_related_media: false }),
         createMockContext(),
       );
-      expect(result.artworks).toHaveLength(3);
+      expect(result.artworks.map((a) => [a.id, a.provenance?.length])).toEqual([
+        [1, 300_000],
+        [2, 300_000],
+        [3, 10],
+      ]);
       expect(result.deferred_ids).toEqual([]);
+      expect(result.notices).toEqual([]);
     });
 
-    it('defers the record that would pass 85,000 bytes and those after it, in request order', async () => {
-      setup({
-        [ARTWORKS]: jsonResponder(
-          envelope([bulky(4, 30_000), bulky(2, 30_000), bulky(1, 30_000), bulky(3, 30_000)]),
-        ),
-      });
+    it('reports only attempted ids as missing, never the deferred tail', async () => {
+      setup({ [ARTWORKS]: jsonResponder(envelope(range(99).map((id) => artworkRecord(id)))) });
       const result = await loadArtworkRecords(
-        request([1, 2, 3, 4], { include_related_media: false }),
+        request([...range(100), 101], { include_related_media: false }),
         createMockContext(),
       );
-      expect(result.artworks.map((a) => a.id)).toEqual([1, 2]);
-      expect(result.deferred_ids).toEqual([3, 4]);
+      expect(result.missing_ids).toEqual([100]);
+      expect(result.deferred_ids).toEqual([101]);
       expect(result.notices).toEqual([
-        'The response budget was reached; call artic_get_artworks again with ids 3, 4 (or fewer sections) for the rest.',
+        'No artwork exists for id 100; find ids with artic_search_artworks.',
+        UNATTEMPTED_NOTICE,
       ]);
     });
 
-    it('always keeps the first record, however large', async () => {
-      setup({ [ARTWORKS]: jsonResponder(envelope([bulky(1, 300_000), bulky(2, 10)])) });
-      const result = await loadArtworkRecords(
-        request([1, 2], { include_related_media: false }),
-        createMockContext(),
-      );
-      expect(result.artworks.map((a) => a.id)).toEqual([1]);
-      expect(result.deferred_ids).toEqual([2]);
-    });
-
-    it('does not count missing ids as deferred', async () => {
-      setup({ [ARTWORKS]: jsonResponder(envelope([bulky(1, 300_000), bulky(3, 10)])) });
-      const result = await loadArtworkRecords(
-        request([1, 2, 3], { include_related_media: false }),
-        createMockContext(),
-      );
-      expect(result.missing_ids).toEqual([2]);
-      expect(result.deferred_ids).toEqual([3]);
-      expect(result.notices).toHaveLength(2);
-      expect(result.notices[0]).toContain('No artwork exists for id 2');
-      expect(result.notices[1]).toContain('response budget');
-    });
-
-    it('defers every record after the first that does not fit, even a smaller one', async () => {
-      setup({
-        [ARTWORKS]: jsonResponder(envelope([bulky(1, 40_000), bulky(2, 50_000), bulky(3, 10)])),
-      });
-      const result = await loadArtworkRecords(
-        request([1, 2, 3], { include_related_media: false }),
-        createMockContext(),
-      );
-      expect(result.artworks.map((a) => a.id)).toEqual([1]);
-      expect(result.deferred_ids).toEqual([2, 3]);
-    });
-
-    it("sums the caller's wire measure, not the record's JSON alone", async () => {
-      setup({ [ARTWORKS]: jsonResponder(envelope([bulky(1, 30_000), bulky(2, 30_000)])) });
-      const asJson = await loadArtworkRecords(
-        request([1, 2], { include_related_media: false }),
-        createMockContext(),
-      );
-      expect(asJson.deferred_ids).toEqual([]);
-      const twice = await loadArtworkRecords(
-        request([1, 2], { include_related_media: false, wireBytes: (r) => 2 * jsonBytes(r) }),
-        createMockContext(),
-      );
-      expect(twice.deferred_ids).toEqual([2]);
-    });
-
-    it('does not load related media for deferred records', async () => {
+    it('loads related media for every returned record, however large', async () => {
       const fetch = setup({
         [ARTWORKS]: jsonResponder(
           envelope([
@@ -306,32 +315,10 @@ describe('loadArtworkRecords', () => {
         [SOUNDS]: jsonResponder(envelope([soundRecord(soundUuid(1)), soundRecord(soundUuid(2))])),
       });
       const result = await loadArtworkRecords(request([1, 2]), createMockContext());
-      expect(result.deferred_ids).toEqual([2]);
-      expect(idsRequested(fetch, SOUNDS)).toEqual([[soundUuid(1)]]);
-    });
-
-    it('counts related media against the budget and leaves deferred records out of the cap notice', async () => {
-      const lectures = Array.from({ length: 20 }, (_, i) => soundUuid(i + 1));
-      setup({
-        [ARTWORKS]: jsonResponder(
-          envelope([
-            { ...bulky(1, 40_000), sound_ids: lectures },
-            { ...bulky(2, 40_000), sound_ids: [soundUuid(21)] },
-          ]),
-        ),
-        [SOUNDS]: jsonResponder(
-          envelope(
-            [...lectures, soundUuid(21)].map((id) => soundRecord(id, { title: 'l'.repeat(1_000) })),
-          ),
-        ),
-      });
-      const result = await loadArtworkRecords(request([1, 2]), createMockContext());
-      expect(result.artworks.map((a) => a.id)).toEqual([1]);
-      expect(result.artworks[0]?.related_media).toHaveLength(20);
-      expect(result.deferred_ids).toEqual([2]);
-      expect(result.notices).toEqual([
-        'The response budget was reached; call artic_get_artworks again with ids 2 (or fewer sections) for the rest.',
-      ]);
+      expect(result.deferred_ids).toEqual([]);
+      expect(soundIdsRequested(fetch)).toEqual([[soundUuid(1), soundUuid(2)]]);
+      expect(result.artworks.map((a) => a.related_media?.length)).toEqual([1, 1]);
+      expect(result.notices).toEqual([]);
     });
   });
 
@@ -358,7 +345,7 @@ describe('loadArtworkRecords', () => {
       expect(result.artworks[1]?.related_media?.map((m) => m.title)).toEqual(['Third']);
       expect(result.artworks[2]).not.toHaveProperty('related_media');
       expect(result.notices).toEqual([]);
-      expect(idsRequested(fetch, SOUNDS)).toEqual([[soundUuid(2), soundUuid(1), soundUuid(3)]]);
+      expect(soundIdsRequested(fetch)).toEqual([[soundUuid(2), soundUuid(1), soundUuid(3)]]);
     });
 
     it('shapes each item as id, title, url, and type', async () => {
@@ -396,7 +383,7 @@ describe('loadArtworkRecords', () => {
         ),
       });
       const result = await loadArtworkRecords(request([1, 2]), createMockContext());
-      expect(idsRequested(fetch, SOUNDS)).toEqual([[soundUuid(1), soundUuid(2), soundUuid(3)]]);
+      expect(soundIdsRequested(fetch)).toEqual([[soundUuid(1), soundUuid(2), soundUuid(3)]]);
       expect(result.artworks[0]?.related_media).toHaveLength(2);
       expect(result.artworks[1]?.related_media).toHaveLength(2);
     });
@@ -408,7 +395,7 @@ describe('loadArtworkRecords', () => {
         ),
       });
       const result = await loadArtworkRecords(request([1, 2]), createMockContext());
-      expect(idsRequested(fetch, SOUNDS)).toEqual([]);
+      expect(soundIdsRequested(fetch)).toEqual([]);
       expect(result.notices).toEqual([]);
     });
 
@@ -420,7 +407,7 @@ describe('loadArtworkRecords', () => {
         request([1], { include_related_media: false }),
         createMockContext(),
       );
-      expect(idsRequested(fetch, SOUNDS)).toEqual([]);
+      expect(soundIdsRequested(fetch)).toEqual([]);
       expect(result.artworks[0]).not.toHaveProperty('related_media');
     });
 
@@ -434,15 +421,47 @@ describe('loadArtworkRecords', () => {
       expect(result.notices).toEqual([]);
     });
 
-    describe('the 20-id cap', () => {
+    describe('the 100-item cap', () => {
       const ids = (from: number, count: number) =>
         Array.from({ length: count }, (_, i) => soundUuid(from + i));
       const soundsFor = (all: string[]) =>
         jsonResponder(envelope(all.map((id) => soundRecord(id))));
 
-      it('loads exactly 20 ids when the union is larger, in record order', async () => {
-        const a = ids(1, 15);
-        const b = ids(16, 10);
+      it('loads the 67 sound ids that 100 records link in one posted search', async () => {
+        const union = ids(1, 67);
+        const linked = (index: number) =>
+          [union[index % 67], union[(index + 1) % 67]].filter((id): id is string => !!id);
+        const fetch = setup({
+          [ARTWORKS]: jsonResponder(
+            envelope(
+              Array.from({ length: 100 }, (_, index) =>
+                artworkRecord(index + 1, { sound_ids: linked(index) }),
+              ),
+            ),
+          ),
+          // The ids= listing's GET would pass the firewall's limit at 52 uuids.
+          [SOUNDS]: behindFirewall(soundsFor([...union].reverse())),
+        });
+        const result = await loadArtworkRecords(
+          request(Array.from({ length: 100 }, (_, i) => i + 1)),
+          createMockContext(),
+        );
+        expect(soundIdsRequested(fetch)).toEqual([union]);
+        const soundCall = fetch.mock.calls.findIndex(([url]) => new URL(url).pathname === SOUNDS);
+        expect(searchCallOf(fetch, soundCall)).toMatchObject({
+          method: 'POST',
+          body: { limit: 67 },
+        });
+        expect(result.artworks).toHaveLength(100);
+        for (const [index, artwork] of result.artworks.entries()) {
+          expect(artwork.related_media?.map((media) => media.id)).toEqual(linked(index));
+        }
+        expect(result.notices).toEqual([]);
+      });
+
+      it('loads exactly 100 ids when the union is larger, in record order', async () => {
+        const a = ids(1, 60);
+        const b = ids(61, 50);
         const fetch = setup({
           [ARTWORKS]: jsonResponder(
             envelope([artworkRecord(1, { sound_ids: a }), artworkRecord(2, { sound_ids: b })]),
@@ -450,15 +469,15 @@ describe('loadArtworkRecords', () => {
           [SOUNDS]: soundsFor([...a, ...b]),
         });
         await loadArtworkRecords(request([1, 2]), createMockContext());
-        const [requested] = idsRequested(fetch, SOUNDS);
-        expect(requested).toHaveLength(20);
-        expect(requested).toEqual([...a, ...b.slice(0, 5)]);
+        const [requested] = soundIdsRequested(fetch);
+        expect(requested).toHaveLength(100);
+        expect(requested).toEqual([...a, ...b.slice(0, 40)]);
       });
 
       it('names the records left with partial or no media in a notice', async () => {
-        const a = ids(1, 15);
-        const b = ids(16, 10);
-        const c = ids(26, 3);
+        const a = ids(1, 60);
+        const b = ids(61, 50);
+        const c = ids(111, 3);
         setup({
           [ARTWORKS]: jsonResponder(
             envelope([
@@ -470,17 +489,17 @@ describe('loadArtworkRecords', () => {
           [SOUNDS]: soundsFor([...a, ...b, ...c]),
         });
         const result = await loadArtworkRecords(request([1, 2, 3]), createMockContext());
-        expect(result.artworks[0]?.related_media).toHaveLength(15);
-        expect(result.artworks[1]?.related_media).toHaveLength(5);
+        expect(result.artworks[0]?.related_media).toHaveLength(60);
+        expect(result.artworks[1]?.related_media).toHaveLength(40);
         expect(result.artworks[2]).not.toHaveProperty('related_media');
         expect(result.notices).toEqual([
-          'Related media is capped at 20 items per call; artwork 2, 3 is missing some or all of its related media. Call artic_get_artworks with fewer ids to load it.',
+          'Related media is capped at 100 items per call; artwork 2, 3 is missing some or all of its related media. Call artic_get_artworks with fewer ids to load it.',
         ]);
       });
 
-      it('does not cap or notify at exactly 20 ids', async () => {
-        const a = ids(1, 12);
-        const b = ids(13, 8);
+      it('does not cap or notify at exactly 100 ids', async () => {
+        const a = ids(1, 67);
+        const b = ids(68, 33);
         const fetch = setup({
           [ARTWORKS]: jsonResponder(
             envelope([artworkRecord(1, { sound_ids: a }), artworkRecord(2, { sound_ids: b })]),
@@ -488,42 +507,42 @@ describe('loadArtworkRecords', () => {
           [SOUNDS]: soundsFor([...a, ...b]),
         });
         const result = await loadArtworkRecords(request([1, 2]), createMockContext());
-        expect(idsRequested(fetch, SOUNDS)[0]).toHaveLength(20);
+        expect(soundIdsRequested(fetch)[0]).toHaveLength(100);
         expect(result.notices).toEqual([]);
-        expect(result.artworks[1]?.related_media).toHaveLength(8);
+        expect(result.artworks[1]?.related_media).toHaveLength(33);
       });
 
       it('counts shared ids once toward the cap', async () => {
-        const shared = ids(1, 15);
+        const shared = ids(1, 90);
         const fetch = setup({
           [ARTWORKS]: jsonResponder(
             envelope([
               artworkRecord(1, { sound_ids: shared }),
-              artworkRecord(2, { sound_ids: [...shared, ...ids(16, 5)] }),
+              artworkRecord(2, { sound_ids: [...shared, ...ids(91, 10)] }),
             ]),
           ),
-          [SOUNDS]: soundsFor([...shared, ...ids(16, 5)]),
+          [SOUNDS]: soundsFor([...shared, ...ids(91, 10)]),
         });
         const result = await loadArtworkRecords(request([1, 2]), createMockContext());
-        expect(idsRequested(fetch, SOUNDS)[0]).toHaveLength(20);
+        expect(soundIdsRequested(fetch)[0]).toHaveLength(100);
         expect(result.notices).toEqual([]);
       });
 
       it('adds the cap notice after the other notices', async () => {
-        const many = ids(1, 25);
+        const many = ids(1, 105);
         setup({
           [ARTWORKS]: jsonResponder(
             envelope([
               artworkRecord(1, { sound_ids: many }),
-              artworkRecord(2, { sound_ids: ids(100, 1) }),
+              artworkRecord(2, { sound_ids: ids(500, 1) }),
             ]),
           ),
-          [SOUNDS]: soundsFor([...many, ...ids(100, 1)]),
+          [SOUNDS]: soundsFor([...many, ...ids(500, 1)]),
         });
         const result = await loadArtworkRecords(request([1, 2, 3]), createMockContext());
         expect(result.notices).toHaveLength(2);
         expect(result.notices[0]).toContain('No artwork exists for id 3');
-        expect(result.notices[1]).toContain('capped at 20');
+        expect(result.notices[1]).toContain('capped at 100');
       });
     });
   });

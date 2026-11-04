@@ -14,7 +14,7 @@ import {
   type ArtworkSearchParams,
   type FetchFn,
 } from '@/services/aic/aic-service.js';
-import { EDGE_BLOCK_HTML } from './aic-upstream.js';
+import { EDGE_BLOCK_HTML, envelope } from './aic-upstream.js';
 
 export const API_ORIGIN = 'https://api.artic.edu';
 
@@ -155,6 +155,31 @@ export function queryParam(url: string, name: string): string | null {
   return new URL(url).searchParams.get(name);
 }
 
+/** The ids an `ids=` listing request names, in request order. */
+export function idsOf(url: string): number[] {
+  const ids = queryParam(url, 'ids');
+  if (ids === null) throw new Error(`Request has no ids query: ${url}`);
+  return ids === '' ? [] : ids.split(',').map(Number);
+}
+
+/** `count` distinct ids of exactly `digits` digits, ascending from 10^(digits-1) + 1. */
+export function idsOfWidth(digits: number, count = 100): number[] {
+  return Array.from({ length: count }, (_, index) => 10 ** (digits - 1) + index + 1);
+}
+
+/**
+ * Answers an `ids=` listing as the API does: only the requested records it has
+ * (`make` returns `undefined` for the rest), and not in request order (reversed here).
+ */
+export function byIdsResponder(
+  make: (id: number) => Record<string, unknown> | undefined,
+): Responder {
+  return (url, init) => {
+    const found = idsOf(url).flatMap((id) => make(id) ?? []);
+    return jsonResponder(envelope(found.reverse()))(url, init);
+  };
+}
+
 /** Bytes in a URL's query string, without the `?` (percent-encoding leaves it ASCII). */
 export function queryStringBytes(url: string): number {
   return Math.max(0, new URL(url).search.length - 1);
@@ -190,6 +215,34 @@ export function searchCallOf(fetchFake: Mock<FetchFn>, call = 0): SearchCall {
   }
   if (init.method !== undefined) throw new Error(`Unexpected method ${init.method}: ${url}`);
   return { body: searchBodyOf(url), headers, init, method: 'GET', url };
+}
+
+/** Path of the multimedia search the artwork records load related media through. */
+export const SOUNDS = '/api/v1/sounds/search';
+
+/** One `/sounds/search` request: the uuids of its `id` terms filter and its field list. */
+export interface SoundSearch {
+  fields: string;
+  ids: string[];
+}
+
+/** Every `/sounds/search` request recorded, in call order. */
+export function soundSearchesOf(fetchFake: Mock<FetchFn>): SoundSearch[] {
+  return fetchFake.mock.calls.flatMap(([url], index) => {
+    if (new URL(url).pathname !== SOUNDS) return [];
+    const body = searchCallOf(fetchFake, index).body as {
+      fields: string;
+      query: { bool: { filter: [{ terms: { id: string[] } }] } };
+    };
+    return [{ ids: body.query.bool.filter[0].terms.id, fields: body.fields }];
+  });
+}
+
+/** The first `/sounds/search` request recorded. */
+export function soundSearchOf(fetchFake: Mock<FetchFn>): SoundSearch {
+  const [first] = soundSearchesOf(fetchFake);
+  if (!first) throw new Error('No call to /sounds/search');
+  return first;
 }
 
 /** Awaits a promise that must reject and returns what it rejected with. */
@@ -264,3 +317,52 @@ export function streamingBody(
   };
   return { responder, pulled: () => pulled, cancelled: () => cancelled };
 }
+
+// --- Expected exhibition run clauses, written out as the API receives them ------------------
+
+const HAS_START = { exists: { field: 'aic_start_at' } };
+const HAS_END = { exists: { field: 'aic_end_at' } };
+const CLOSED = { term: { status: 'Closed' } };
+/** No recorded closing date and not marked Closed: the run goes on from its opening. */
+const RUNS_ON = { bool: { filter: [HAS_START], must_not: [HAS_END, CLOSED] } };
+
+/** The `bool.filter` entries each exhibition `when` value sends, with `now` date math. */
+export const EXHIBITION_WHEN_FILTERS = {
+  any: [],
+  current: [
+    { range: { aic_start_at: { lte: 'now' } } },
+    { bool: { should: [{ range: { aic_end_at: { gte: 'now' } } }, RUNS_ON] } },
+  ],
+  upcoming: [{ range: { aic_start_at: { gt: 'now' } } }],
+  past: [
+    {
+      bool: {
+        should: [
+          { range: { aic_end_at: { lt: 'now' } } },
+          { bool: { filter: [CLOSED], must_not: [HAS_END] } },
+        ],
+      },
+    },
+  ],
+} as const;
+
+/** The exhibition `date_from` clause: the run ends on or after `date`. */
+export const exhibitionFromClause = (date: string) => ({
+  bool: {
+    should: [
+      { range: { aic_end_at: { gte: date } } },
+      { bool: { filter: [{ range: { aic_start_at: { gte: date } } }], must_not: [HAS_END] } },
+      RUNS_ON,
+    ],
+  },
+});
+
+/** The exhibition `date_to` clause: the run starts on or before `date`. */
+export const exhibitionToClause = (date: string) => ({
+  bool: {
+    should: [
+      { range: { aic_start_at: { lte: date } } },
+      { bool: { filter: [{ range: { aic_end_at: { lte: date } } }], must_not: [HAS_START] } },
+    ],
+  },
+});

@@ -3,7 +3,7 @@
  * real `AicService` over a fake `fetch`: param validation, the by-id request
  * and its default sections, the record envelope (license, description
  * attribution, notice), unknown ids, related-media degradation and cap, a
- * record over the response budget, upstream failure classes, and the
+ * very large record returned whole, upstream failure classes, and the
  * resource's declared metadata.
  * @module tests/resources/artwork.resource.test
  */
@@ -21,6 +21,8 @@ import {
   type Responder,
   rejectionOf,
   routedFetch,
+  SOUNDS,
+  soundSearchOf,
   textResponder,
   urlOfCall,
 } from '../fixtures/aic-service-kit.js';
@@ -48,10 +50,9 @@ interface ResourceBody {
 type FetchFake = ReturnType<typeof routedFetch>;
 
 const ARTWORKS = '/api/v1/artworks';
-const SOUNDS = '/api/v1/sounds';
 
 const DETAIL_FIELDS =
-  'id,title,alt_titles,main_reference_number,artist_display,artist_id,artist_ids,date_display,date_start,date_end,date_qualifier_title,place_of_origin,medium_display,dimensions,inscriptions,credit_line,copyright_notice,edition,artwork_type_title,department_title,classification_title,style_title,style_titles,subject_titles,material_titles,technique_titles,theme_titles,is_public_domain,is_on_view,gallery_title,on_loan_display,image_id,alt_image_ids,thumbnail,sound_ids';
+  'id,title,alt_titles,main_reference_number,fiscal_year,artist_display,artist_id,artist_ids,date_display,date_start,date_end,date_qualifier_title,place_of_origin,medium_display,dimensions,inscriptions,credit_line,copyright_notice,edition,artwork_type_title,department_title,classification_title,style_title,style_titles,subject_titles,material_titles,technique_titles,theme_titles,is_public_domain,is_on_view,gallery_title,on_loan_display,image_id,alt_image_ids,thumbnail,sound_ids';
 
 const RELATED_MEDIA_DEGRADED =
   'Related media could not be loaded; the artwork records are complete. Call artic_get_artworks again to retry related media.';
@@ -62,7 +63,7 @@ afterEach(() => {
 });
 
 /**
- * Installs a service routing `/artworks` to `artworks` and `/sounds` to
+ * Installs a service routing `/artworks` to `artworks` and `/sounds/search` to
  * `sounds`; a call to an unrouted path fails the fetch.
  */
 function serve(
@@ -232,6 +233,19 @@ describe('artic://artworks/{id} read', () => {
     );
   });
 
+  it('converts provenance markup to plain text with its citation', async () => {
+    serve([
+      artworkRecord(83905, {
+        provenance_text:
+          'Ivan Albright; exchanged for <a href="https://www.artic.edu/artworks/9535"><em>Heavy the Oar</em></a> (then 1949.961), 1955.',
+      }),
+    ]);
+    const body = await read('83905');
+    expect(body.artwork.provenance).toBe(
+      'Ivan Albright; exchanged for Heavy the Oar (https://www.artic.edu/artworks/9535) (then 1949.961), 1955.',
+    );
+  });
+
   it('adds the attribution for a short description alone', async () => {
     serve([artworkRecord(7, { short_description: '<p>Short.</p>' })]);
     expect((await read('7')).description_attribution).toBe(DESCRIPTION_ATTRIBUTION);
@@ -362,8 +376,8 @@ describe('artic://artworks/{id} related media', () => {
     const [u1, u2] = [soundUuid(1), soundUuid(2)] as [string, string];
     const fetchFake = serve([artworkRecord(7, { sound_ids: [u1, u2] })], soundsFor(2));
     const body = await read('7');
-    expect(paths(fetchFake)).toEqual(['/artworks', '/sounds']);
-    expect(queryParam(callTo(fetchFake, '/sounds'), 'ids')).toBe(`${u1},${u2}`);
+    expect(paths(fetchFake)).toEqual(['/artworks', '/sounds/search']);
+    expect(soundSearchOf(fetchFake).ids).toEqual([u1, u2]);
     expect((body.artwork.related_media as { id: string }[]).map((media) => media.id)).toEqual([
       u1,
       u2,
@@ -403,25 +417,25 @@ describe('artic://artworks/{id} related media', () => {
     },
   );
 
-  it('caps related media at 20 sounds and says so', async () => {
-    serve([withSounds(7, 25)], soundsFor(20));
+  it('caps related media at 100 sounds and says so', async () => {
+    serve([withSounds(7, 105)], soundsFor(100));
     const body = await read('7');
-    expect(body.artwork.related_media as unknown[]).toHaveLength(20);
+    expect(body.artwork.related_media as unknown[]).toHaveLength(100);
     expect(body.notice).toBe(
-      'Related media is capped at 20 items per call; artwork 7 is missing some or all of its related media. Call artic_get_artworks with fewer ids to load it.',
+      'Related media is capped at 100 items per call; artwork 7 is missing some or all of its related media. Call artic_get_artworks with fewer ids to load it.',
     );
   });
 
-  it('asks for exactly 20 sound ids when the record links more', async () => {
-    const fetchFake = serve([withSounds(7, 25)], soundsFor(20));
+  it('asks for exactly 100 sound ids when the record links more', async () => {
+    const fetchFake = serve([withSounds(7, 105)], soundsFor(100));
     await read('7');
-    expect(queryParam(callTo(fetchFake, '/sounds'), 'ids')?.split(',')).toHaveLength(20);
+    expect(soundSearchOf(fetchFake).ids).toEqual(soundsFor(100).map((sound) => sound.id));
   });
 
-  it('does not cap a record with exactly 20 sounds', async () => {
-    serve([withSounds(7, 20)], soundsFor(20));
+  it('does not cap a record with exactly 100 sounds', async () => {
+    serve([withSounds(7, 100)], soundsFor(100));
     const body = await read('7');
-    expect(body.artwork.related_media as unknown[]).toHaveLength(20);
+    expect(body.artwork.related_media as unknown[]).toHaveLength(100);
     expect(body).not.toHaveProperty('notice');
   });
 
@@ -429,16 +443,16 @@ describe('artic://artworks/{id} related media', () => {
     const controller = new AbortController();
     const fetchFake = serve([withSounds(7, 1)], hangingResponder);
     const pending = rejectionOf(read('7', controller.signal));
-    await vi.waitFor(() => expect(paths(fetchFake)).toContain('/sounds'));
+    await vi.waitFor(() => expect(paths(fetchFake)).toContain('/sounds/search'));
     controller.abort(new DOMException('cancelled by caller', 'AbortError'));
     expect(await pending).toMatchObject({ name: 'AbortError' });
   });
 });
 
-// --- Response budget -------------------------------------------------------------------------------------------
+// --- Large records -------------------------------------------------------------------------------------------
 
-describe('artic://artworks/{id} response budget', () => {
-  it('returns a single record over the budget whole, with nothing deferred and no notice', async () => {
+describe('artic://artworks/{id} large records', () => {
+  it('returns a very large record whole, with no notice', async () => {
     const provenance = 'p'.repeat(250_000);
     serve([artworkRecord(7, { provenance_text: provenance })]);
     const body = await read('7');
@@ -447,7 +461,7 @@ describe('artic://artworks/{id} response budget', () => {
     expect(JSON.stringify(body).length).toBeGreaterThan(250_000);
   });
 
-  it('returns an over-budget record with its related media and the attribution intact', async () => {
+  it('returns a very large record with its related media and the attribution intact', async () => {
     serve(
       [
         artworkRecord(7, {

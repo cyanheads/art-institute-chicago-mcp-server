@@ -1,7 +1,7 @@
 /**
- * @fileoverview `artic_get_artworks` — full records for up to 10 artworks by
- * id in one upstream call: curatorial text, provenance, histories,
- * categorization, image URLs with rights status, and related multimedia.
+ * @fileoverview `artic_get_artworks` — full records for up to 100 artworks by
+ * id in one call: curatorial text, provenance, histories, categorization,
+ * image URLs with rights status, and related multimedia.
  * @module mcp-server/tools/definitions/get-artworks.tool
  */
 
@@ -17,7 +17,12 @@ import {
   printableUrl,
   quoteBlock,
 } from '@/services/aic/aic-text.js';
-import { DEFAULT_SECTIONS, jsonBytes, loadArtworkRecords } from '@/services/aic/artwork-records.js';
+import {
+  DEFAULT_SECTIONS,
+  loadArtworkRecords,
+  MAX_ARTWORK_IDS,
+  MAX_RELATED_MEDIA,
+} from '@/services/aic/artwork-records.js';
 import { artworkSummaryShape, summaryLines, titleText } from '../artwork-output.js';
 
 const SECTIONS = [
@@ -32,9 +37,6 @@ const ArtworkRecordSchema = z
   .object({
     ...artworkSummaryShape,
     alt_titles: z.array(z.string()).optional().describe('Other titles the work is known by.'),
-    main_reference_number: z
-      .string()
-      .describe('Museum reference (accession) number; empty when the museum lists none.'),
     artist_ids: z
       .array(z.number())
       .describe('Ids of every credited artist; pass one as artist_id to artic_search_artworks.'),
@@ -135,9 +137,6 @@ function textSection(heading: string, text: string | undefined): string[] {
 
 function recordLines(artwork: ArtworkRecord): string[] {
   const lines = [`## ${titleText(artwork.title)} (id ${artwork.id})`, ...summaryLines(artwork)];
-  lines.push(
-    `- **Reference number:** ${inlineSafe(artwork.main_reference_number) || 'not recorded'}`,
-  );
   lines.push(...listLine('Alternate titles', artwork.alt_titles ?? []));
   if (artwork.artist_ids.length > 0) {
     lines.push(`- **Artist ids:** ${artwork.artist_ids.join(', ')}`);
@@ -192,12 +191,11 @@ function recordLines(artwork: ArtworkRecord): string[] {
 
 export const getArtworks = tool('artic_get_artworks', {
   title: 'Get artworks',
-  description:
-    'Fetch full Art Institute of Chicago records for the first 10 artworks by id, returning deferred_ids for the rest: description, provenance, exhibition and publication history, dimensions, inscriptions, credit line, categorization, gallery, image URLs with rights status, and related multimedia. Long histories are opt-in through sections. Ids come from artic_search_artworks, artic_search_exhibitions, or artic_search_artists.',
+  description: `Fetch full Art Institute of Chicago records for up to ${MAX_ARTWORK_IDS} artworks by id in one call, returning deferred_ids for the rest: description, provenance, exhibition and publication history, dimensions, inscriptions, credit line, categorization, gallery, image URLs with rights status, and related multimedia. The long text sections are opt-in through sections; request the sections and ids your client can take, since every section on ${MAX_ARTWORK_IDS} well-documented works comes to about 1.4 MB. Ids come from artic_search_artworks, artic_search_exhibitions, or artic_search_artists.`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     ids: idListInput(z.array(z.number().int().positive()).min(1).max(1000), artworkIdItem).describe(
-      'Artwork ids as an array or comma-separated string, up to 1,000 supplied entries including blanks and duplicates. Comma strings also have a 100,000-character ceiling. Artwork page URLs are read as their id; blanks and duplicates are dropped. Fetches the first 10; deferred_ids names the remainder.',
+      `Artwork ids as an array or comma-separated string, up to 1,000 supplied entries including blanks and duplicates. Comma strings also have a 100,000-character ceiling. Artwork page URLs are read as their id; blanks and duplicates are dropped. Fetches the first ${MAX_ARTWORK_IDS}; deferred_ids names the remainder.`,
     ),
     sections: blankAsUnset(
       listInput(
@@ -211,7 +209,7 @@ export const getArtworks = tool('artic_get_artworks', {
       'Heavy text sections to include: description (also short_description), provenance, exhibition_history, publication_history, catalogue. Defaults to description and provenance; pass an empty array for none.',
     ),
     include_related_media: blankAsUnset(z.boolean().default(true)).describe(
-      'Load related multimedia (lectures, audio stops) for the records, up to 20 items per call.',
+      `Load related multimedia (lectures, audio stops) for the records, up to ${MAX_RELATED_MEDIA} items per call.`,
     ),
   }),
   output: z.object({
@@ -226,7 +224,7 @@ export const getArtworks = tool('artic_get_artworks', {
     deferred_ids: z
       .array(z.number())
       .describe(
-        'Ids left out by the response budget or beyond the first 10 attempted ids, in request order; pass them to artic_get_artworks again.',
+        `Unattempted ids beyond the first ${MAX_ARTWORK_IDS}, in request order; pass them to artic_get_artworks again.`,
       ),
     license_text: z.string().describe('License statement from the API for this data, verbatim.'),
     description_attribution: z
@@ -278,8 +276,6 @@ export const getArtworks = tool('artic_get_artworks', {
         ids: input.ids,
         sections: input.sections,
         include_related_media: input.include_related_media,
-        // format() puts each record on the wire a second time, as markdown.
-        wireBytes: (record) => jsonBytes(record) + jsonBytes(recordLines(record).join('\n')),
       },
       ctx,
     );

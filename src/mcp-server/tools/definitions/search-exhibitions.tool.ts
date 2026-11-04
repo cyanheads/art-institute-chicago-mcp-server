@@ -12,6 +12,7 @@ import { getAicService } from '@/services/aic/aic-service.js';
 import {
   blankAsUnset,
   inlineSafe,
+  PAGE_MAX,
   pageInfo,
   printableUrl,
   quoteBlock,
@@ -36,8 +37,18 @@ const ExhibitionSchema = z
       .describe(
         'Museum status label (Closed, Confirmed, Traveling). It does not say whether the show is on now; the when filter does.',
       ),
-    start: z.string().optional().describe('Opening date and time, ISO 8601 with offset.'),
-    end: z.string().optional().describe('Closing date and time, ISO 8601 with offset.'),
+    start: z
+      .string()
+      .optional()
+      .describe(
+        'Opening date and time, ISO 8601 with offset; absent when not recorded. A show without one is never current or upcoming, and date windows match it on its closing date alone.',
+      ),
+    end: z
+      .string()
+      .optional()
+      .describe(
+        'Closing date and time, ISO 8601 with offset; absent when not recorded. A show without one counts as closed after its opening date when marked Closed, else as still running from its opening.',
+      ),
     gallery: z.string().optional().describe('Gallery where the exhibition is held.'),
     summary: z.string().optional().describe('Short description the museum wrote.'),
     web_url: z.string().optional().describe('Exhibition page on artic.edu.'),
@@ -79,10 +90,14 @@ type Exhibition = z.infer<typeof ExhibitionSchema>;
 
 function exhibitionLines(exhibition: Exhibition): string[] {
   const lines = [`## ${titleText(exhibition.title)} (id ${exhibition.id})`];
-  const dates: string[] = [];
-  if (exhibition.start) dates.push(`opens ${inlineSafe(exhibition.start)}`);
-  if (exhibition.end) dates.push(`closes ${inlineSafe(exhibition.end)}`);
-  if (dates.length > 0) lines.push(`- **Dates:** ${dates.join(' · ')}`);
+  const dates =
+    exhibition.start || exhibition.end
+      ? [
+          exhibition.start ? `opens ${inlineSafe(exhibition.start)}` : 'opening date not recorded',
+          exhibition.end ? `closes ${inlineSafe(exhibition.end)}` : 'closing date not recorded',
+        ].join(' · ')
+      : 'not recorded';
+  lines.push(`- **Dates:** ${dates}`);
   const facts: string[] = [];
   if (exhibition.status) facts.push(`**Status:** ${inlineSafe(exhibition.status)}`);
   if (exhibition.gallery) facts.push(`**Gallery:** ${inlineSafe(exhibition.gallery)}`);
@@ -121,16 +136,16 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
       'Exact museum agent id, from artic_search_artists or an artwork artist_id; matches recorded exhibition relationships. Combined with every other condition using AND.',
     ),
     query: blankAsUnset(z.string().trim().max(200).optional()).describe(
-      'Text matched against exhibition titles, descriptions, and other fields; every word must match.',
+      'Text matched against exhibition titles, descriptions, and other fields; every word must match, except common English words such as the and of, which are ignored.',
     ),
     when: blankAsUnset(z.enum(WHEN).default('any')).describe(
-      'current: open today; upcoming: opens after today; past: closed before today; any: no date condition.',
+      'current: open today; upcoming: opens after today; past: closed before today; any: no date condition. A show with no recorded closing date is past when marked Closed, else current from its opening.',
     ),
     date_from: blankAsUnset(z.iso.date().optional()).describe(
-      'Earliest date, YYYY-MM-DD; an exhibition matches when its run overlaps date_from to date_to.',
+      'Earliest date, YYYY-MM-DD; an exhibition matches when its run overlaps date_from to date_to. A show with no recorded closing date ran on its opening date alone when marked Closed, else runs on from its opening; one with only a closing date ran on that date alone; one with no dates matches no window.',
     ),
     date_to: blankAsUnset(z.iso.date().optional()).describe(
-      'Latest date, YYYY-MM-DD; an exhibition matches when its run overlaps date_from to date_to.',
+      'Latest date, YYYY-MM-DD; an exhibition matches when its run overlaps date_from to date_to. Missing dates are read as described for date_from.',
     ),
     sort: blankAsUnset(z.enum(SORTS).optional()).describe(
       'relevance ranks by query text; start_desc and start_asc sort by opening date. Defaults to relevance with a query, else start_desc; relevance without a query sorts as start_desc.',
@@ -139,7 +154,7 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
       'Page to return (1-based); page times the applied limit may not exceed 1,000.',
     ),
     limit: blankAsUnset(z.number().int().min(1).max(1000).default(10)).describe(
-      'Requested exhibitions per page (1-1,000); at most 25 are returned.',
+      `Requested exhibitions per page (1-1,000); at most ${PAGE_MAX} are returned.`,
     ),
   }),
   output: z.object({
@@ -220,7 +235,7 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
 
   async handler(input, ctx) {
     const requestedLimit = input.limit;
-    input = { ...input, limit: Math.min(input.limit, 25) };
+    input = { ...input, limit: Math.min(input.limit, PAGE_MAX) };
     ctx.enrich.total(0);
     ctx.enrich({ truncated: false, shown: 0, cap: input.limit });
 

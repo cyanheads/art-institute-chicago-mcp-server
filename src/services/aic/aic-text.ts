@@ -3,8 +3,8 @@
  * definitions: input preprocessors for form-client blanks and comma lists,
  * HTML-to-text conversion, markdown-safe rendering of upstream text,
  * upstream URL and image-id screening, constructed IIIF and web URLs, search
- * ranking text, vocabulary filter routing, placeholder-year screening, and
- * search-window paging.
+ * ranking text and stop-word removal, vocabulary filter routing,
+ * placeholder-year screening, and search-window paging.
  * @module services/aic/aic-text
  */
 
@@ -124,11 +124,18 @@ export function nonEmpty(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
-/** An HTML-bearing upstream field converted to plain text; absent when nothing remains. */
-export function htmlField(value: unknown): string | undefined {
+/**
+ * An HTML-bearing upstream field converted to plain text; absent when nothing
+ * remains. `sourceBreaks` is `htmlToText`'s: `'keep'` for a field whose single
+ * newlines separate entries, such as inscriptions.
+ */
+export function htmlField(
+  value: unknown,
+  sourceBreaks: 'fold' | 'keep' = 'fold',
+): string | undefined {
   const raw = nonEmpty(value);
   if (raw === undefined) return;
-  const text = htmlToText(raw);
+  const text = htmlToText(raw, sourceBreaks);
   return text === '' ? undefined : text;
 }
 
@@ -363,31 +370,38 @@ function citationHref(tag: string): string | undefined {
       while (cursor < tag.length - 1 && !/\s/.test(tag[cursor] ?? '')) cursor++;
       value = tag.slice(valueStart, cursor);
     }
-    if (name === 'href') {
-      const decoded = decodeEntities(value);
-      if (
-        !/^https?:\/\//i.test(decoded) ||
-        /[\s\\<>"']/.test(decoded) ||
-        decoded.search(UNSAFE_INLINE) !== -1
-      )
-        return;
-      return httpUrl(decoded);
-    }
+    if (name === 'href') return citationUrl(value);
   }
   return;
 }
 
+/** A citation destination, entity-decoded once; absent unless it is a safe absolute HTTP(S) URL. */
+function citationUrl(value: string): string | undefined {
+  const decoded = decodeEntities(value);
+  if (
+    !/^https?:\/\//i.test(decoded) ||
+    /[\s\\<>"']/.test(decoded) ||
+    decoded.search(UNSAFE_INLINE) !== -1
+  )
+    return;
+  return httpUrl(decoded);
+}
+
 /**
  * Converts HTML to plain text with paragraphs, table boundaries, and safe
- * citation URLs. Single source newlines fold to spaces; blank-line paragraphs
- * survive. Text and href entities decode once, after tag recognition, so
- * encoded markup stays data. Tags stop at the next angle bracket; attribute
- * scans and comment stripping make bounded progress on malformed openers.
+ * citation URLs: an anchor's destination follows its text as `(url)`, and a
+ * literal `<scheme://…>` span is text rendered `(url)` in its place. A single
+ * source newline folds to a space, as HTML renders it, or with `sourceBreaks`
+ * `'keep'` stays a line break; blank-line paragraphs survive either way. Text,
+ * href, and span entities decode once, after tag recognition, so encoded markup
+ * stays data. Tags stop at the next angle bracket; attribute scans and comment
+ * stripping make bounded progress on malformed openers.
  */
-export function htmlToText(html: string): string {
+export function htmlToText(html: string, sourceBreaks: 'fold' | 'keep' = 'fold'): string {
+  const singleBreak = sourceBreaks === 'keep' ? '\n' : ' ';
   const source = html.replace(/<!--[\s\S]*?(?:-->|$)/g, '').replace(/\s+/g, (run) => {
     const breaks = run.match(/\r\n|[\r\n]/g)?.length ?? 0;
-    return breaks > 1 ? '\n\n' : breaks === 1 ? ' ' : run;
+    return breaks > 1 ? '\n\n' : breaks === 1 ? singleBreak : run;
   });
   const parts: string[] = [];
   const anchors: (string | undefined)[] = [];
@@ -397,7 +411,10 @@ export function htmlToText(html: string): string {
     const tag = match[0];
     const name = match[1]?.toLowerCase();
     const closing = tag[1] === '/';
-    if (name === 'a') {
+    if (!closing && tag.startsWith('://', 1 + (name?.length ?? 0))) {
+      const url = citationUrl(tag.slice(1, -1));
+      if (url !== undefined) parts.push(`(${url})`);
+    } else if (name === 'a') {
       if (closing) {
         const href = anchors.pop();
         if (href !== undefined) parts.push(` (${href})`);
@@ -576,6 +593,91 @@ export function rankingText(query: string): string {
   return HEX_COLOR.test(text) ? '' : text;
 }
 
+/** Elasticsearch's `_english_` stop list, the 33 words the index's text fields drop. */
+const STOP_WORDS = new Set([
+  'a',
+  'an',
+  'and',
+  'are',
+  'as',
+  'at',
+  'be',
+  'but',
+  'by',
+  'for',
+  'if',
+  'in',
+  'into',
+  'is',
+  'it',
+  'no',
+  'not',
+  'of',
+  'on',
+  'or',
+  'such',
+  'that',
+  'the',
+  'their',
+  'then',
+  'there',
+  'these',
+  'they',
+  'this',
+  'to',
+  'was',
+  'will',
+  'with',
+]);
+
+/**
+ * A query split the way `simple_query_string` reads it: a `"`-quoted phrase (an
+ * unterminated quote runs to the end), a word, or a run of the parser's
+ * whitespace (space, tab, CR, LF).
+ */
+const QUERY_TOKENS = /"[^"]*(?:"|$)|[^ \t\n\r"]+|[ \t\n\r]+/g;
+
+/** A word that is letters, then optionally `'s` or `’s`, then optionally trailing `,;:.!?`. */
+const STOP_WORD_FORM = /^([a-z]+)(?:['’]s)?[,;:.!?]*$/i;
+
+const isStopWord = (token: string) =>
+  STOP_WORDS.has(STOP_WORD_FORM.exec(token)?.[1]?.toLowerCase() ?? '');
+
+const isQueryWhitespace = (token: string | undefined) => /^[ \t\n\r]/.test(token ?? '');
+
+/** A word made only of `simple_query_string` operator characters, which names no term. */
+const isOperatorOnly = (token: string) => /^[+|\-()*~]+$/.test(token);
+
+/**
+ * The query an every-field must clause sends. The index drops English stop
+ * words from its analyzed text fields, but its keyword and numeric fields keep
+ * each as an exact term almost no record holds (8 works are titled one, such as
+ * `A`), so a stop word left in the clause empties the search. Each word
+ * outside a quoted phrase that is a stop word, ignoring case, trailing
+ * `,;:.!?`, and a trailing `'s` or `’s`, is left out with the whitespace after
+ * it (or, at the end, before it). Phrases and words
+ * carrying an operator (`-the`, `the*`, `monet|the`) stay as typed; a query
+ * with no stop word, or nothing else but operators (`the | a`), is returned
+ * unchanged.
+ */
+export function withoutStopWords(query: string): string {
+  const tokens = query.match(QUERY_TOKENS) ?? [];
+  const kept: string[] = [];
+  let dropped = false;
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index] ?? '';
+    if (!isStopWord(token)) {
+      kept.push(token);
+      continue;
+    }
+    dropped = true;
+    if (isQueryWhitespace(tokens[index + 1])) index++;
+    else if (isQueryWhitespace(kept.at(-1))) kept.pop();
+  }
+  const hasTerm = kept.some((token) => !isQueryWhitespace(token) && !isOperatorOnly(token));
+  return dropped && hasTerm ? kept.join('') : query;
+}
+
 // --- Vocabulary routing ------------------------------------------------------
 
 /** Vocabularies `artic_lookup_vocabulary` lists, and the keyword field each aggregates. */
@@ -720,6 +822,9 @@ export function containsPattern(text: string): string {
 
 /** Anonymous callers reach only `offset + limit <= 1000` of any search. */
 export const SEARCH_WINDOW = 1000;
+
+/** Most rows a search page returns, and most agent ids one call attempts: the API's page and `ids` maximum (101 is refused). Divides the 1,000-match window. */
+export const PAGE_MAX = 100;
 
 export const WINDOW_NOTICE =
   'Only the first 1,000 matches are reachable; narrow the search with filters to see the rest.';

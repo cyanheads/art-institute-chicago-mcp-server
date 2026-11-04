@@ -8,6 +8,7 @@
  * @module tests/tools/search-exhibitions.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -15,6 +16,9 @@ import { searchExhibitions } from '@/mcp-server/tools/definitions/search-exhibit
 import { disposeAicService } from '@/services/aic/aic-service.js';
 import { WINDOW_NOTICE } from '@/services/aic/aic-text.js';
 import {
+  EXHIBITION_WHEN_FILTERS,
+  exhibitionFromClause,
+  exhibitionToClause,
   hangingResponder,
   jsonResponder,
   scriptedFetch,
@@ -105,8 +109,8 @@ describe('artic_search_exhibitions request', () => {
       date_to: '2020-12-31',
     });
     expect(filtersOf(fetchFake)).toEqual([
-      { range: { aic_end_at: { gte: '2020-01-01' } } },
-      { range: { aic_start_at: { lte: '2020-12-31' } } },
+      exhibitionFromClause('2020-01-01'),
+      exhibitionToClause('2020-12-31'),
       { term: { artwork_ids: 16568 } },
       { term: { artist_ids: 35809 } },
     ]);
@@ -195,6 +199,15 @@ describe('artic_search_exhibitions request', () => {
     expect(out.sort_applied).toBe('relevance');
   });
 
+  it('leaves stop words out of the must clause and keeps them in q', async () => {
+    const fetchFake = emptyResults();
+    await search({ query: 'Monet and Chicago' });
+    expect(bodyOf(fetchFake).q).toBe('Monet and Chicago');
+    expect(mustOf(fetchFake)).toEqual([
+      { simple_query_string: { query: 'Monet Chicago', default_operator: 'and' } },
+    ]);
+  });
+
   it.each([
     ['start_asc', 'asc'],
     ['start_desc', 'desc'],
@@ -219,15 +232,12 @@ describe('artic_search_exhibitions request', () => {
     expect(out.sort_applied).toBe('start_desc');
   });
 
-  it.each([
-    ['any', []],
-    [
-      'current',
-      [{ range: { aic_start_at: { lte: 'now' } } }, { range: { aic_end_at: { gte: 'now' } } }],
-    ],
-    ['upcoming', [{ range: { aic_start_at: { gt: 'now' } } }]],
-    ['past', [{ range: { aic_end_at: { lt: 'now' } } }]],
-  ])('maps when=%s to Elasticsearch date math, never a server timestamp', async (when, filters) => {
+  it.each(
+    (['any', 'current', 'upcoming', 'past'] as const).map((when) => [
+      when,
+      EXHIBITION_WHEN_FILTERS[when],
+    ]),
+  )('maps when=%s to Elasticsearch date math, never a server timestamp', async (when, filters) => {
     const fetchFake = emptyResults();
     const out = structuredOf<ExhibitionsRun>(await search({ when }));
     expect(filtersOf(fetchFake)).toEqual(filters);
@@ -239,14 +249,14 @@ describe('artic_search_exhibitions request', () => {
     const fetchFake = emptyResults();
     await search({ date_from: '2024-03-01', date_to: '2024-09-30' });
     expect(filtersOf(fetchFake)).toEqual([
-      { range: { aic_end_at: { gte: '2024-03-01' } } },
-      { range: { aic_start_at: { lte: '2024-09-30' } } },
+      exhibitionFromClause('2024-03-01'),
+      exhibitionToClause('2024-09-30'),
     ]);
   });
 
   it.each([
-    ['date_from', { date_from: '2024-03-01' }, { range: { aic_end_at: { gte: '2024-03-01' } } }],
-    ['date_to', { date_to: '2024-09-30' }, { range: { aic_start_at: { lte: '2024-09-30' } } }],
+    ['date_from', { date_from: '2024-03-01' }, exhibitionFromClause('2024-03-01')],
+    ['date_to', { date_to: '2024-09-30' }, exhibitionToClause('2024-09-30')],
   ])('accepts %s alone', async (_name, input, filter) => {
     const fetchFake = emptyResults();
     expect((await search(input)).isError).toBeUndefined();
@@ -257,8 +267,8 @@ describe('artic_search_exhibitions request', () => {
     const fetchFake = emptyResults();
     await search({ when: 'past', date_from: '2000-01-01' });
     expect(filtersOf(fetchFake)).toEqual([
-      { range: { aic_end_at: { lt: 'now' } } },
-      { range: { aic_end_at: { gte: '2000-01-01' } } },
+      ...EXHIBITION_WHEN_FILTERS.past,
+      exhibitionFromClause('2000-01-01'),
     ]);
   });
 
@@ -334,11 +344,50 @@ describe('artic_search_exhibitions input validation', () => {
   it.each([
     ['page 40 at limit 25', { page: 40, limit: 25 }],
     ['limit 25', { limit: 25 }],
+    ['page 10 at limit 100', { page: 10, limit: 100 }],
     ['a leap day', { date_from: '2024-02-29' }],
     ['a query of exactly 200 characters', { query: 'x'.repeat(200) }],
   ])('accepts %s', async (_name, input) => {
     emptyResults();
     expect((await search(input)).isError).toBeUndefined();
+  });
+
+  it('describes how a missing opening or closing date is read, on the filters and the row', () => {
+    expect(z.toJSONSchema(searchExhibitions.input, { io: 'input' })).toMatchObject({
+      properties: {
+        when: {
+          description: expect.stringMatching(
+            /no recorded closing date is past when marked Closed, else current from its opening/,
+          ),
+        },
+        date_from: {
+          description: expect.stringMatching(
+            /no recorded closing date ran on its opening date alone when marked Closed, else runs on from its opening; one with only a closing date ran on that date alone; one with no dates matches no window/,
+          ),
+        },
+        date_to: { description: expect.stringContaining('Missing dates are read as described') },
+      },
+    });
+    expect(z.toJSONSchema(searchExhibitions.output)).toMatchObject({
+      properties: {
+        exhibitions: {
+          items: {
+            properties: {
+              start: {
+                description: expect.stringMatching(
+                  /absent when not recorded\. A show without one is never current or upcoming/,
+                ),
+              },
+              end: {
+                description: expect.stringMatching(
+                  /absent when not recorded\. A show without one counts as closed after its opening date when marked Closed, else as still running/,
+                ),
+              },
+            },
+          },
+        },
+      },
+    });
   });
 });
 
@@ -363,8 +412,8 @@ describe('artic_search_exhibitions date-range guard', () => {
     const result = await search({ date_from: '2024-05-05', date_to: '2024-05-05' });
     expect(result.isError).toBeUndefined();
     expect(filtersOf(fetchFake)).toEqual([
-      { range: { aic_end_at: { gte: '2024-05-05' } } },
-      { range: { aic_start_at: { lte: '2024-05-05' } } },
+      exhibitionFromClause('2024-05-05'),
+      exhibitionToClause('2024-05-05'),
     ]);
   });
 
@@ -858,6 +907,36 @@ describe('artic_search_exhibitions format', () => {
     emptyResults();
     expect(textOf(await search())).toContain('No exhibition rows on this page.');
   });
+
+  it.each([
+    [
+      'an opening date alone',
+      { aic_end_at: null },
+      ['end'],
+      '- **Dates:** opens 2020-01-01T00:00:00-06:00 · closing date not recorded',
+    ],
+    [
+      'a closing date alone',
+      { aic_start_at: null },
+      ['start'],
+      '- **Dates:** opening date not recorded · closes 2020-06-01T00:00:00-05:00',
+    ],
+    [
+      'no dates',
+      { aic_start_at: null, aic_end_at: null },
+      ['start', 'end'],
+      '- **Dates:** not recorded',
+    ],
+  ])(
+    'names the unrecorded date for %s, absent from structuredContent',
+    async (_name, dates, absent, line) => {
+      serve(searchEnvelope([exhibitionRecord(1, dates)], 1));
+      const result = await search();
+      const [exhibition] = structuredOf<ExhibitionsRun>(result).exhibitions;
+      for (const key of absent) expect(exhibition).not.toHaveProperty(key);
+      expect(textOf(result).split('\n')).toContain(line);
+    },
+  );
 
   it('percent-encodes brackets in printed URLs and leaves structuredContent untouched', async () => {
     serve(

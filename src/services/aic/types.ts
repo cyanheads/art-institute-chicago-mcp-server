@@ -63,6 +63,8 @@ export interface RawArtwork {
   dimensions?: string | null;
   edition?: string | null;
   exhibition_history?: string | null;
+  /** The fiscal year in which the museum acquired the work; absent when unrecorded. */
+  fiscal_year?: number | null;
   gallery_title?: string | null;
   id: number;
   image_id?: string | null;
@@ -153,6 +155,7 @@ export interface AltImage {
 
 /** Compact artwork row returned by collection search. */
 export interface ArtworkSummary {
+  acquisition_fiscal_year?: number;
   artist_display?: string;
   artist_id?: number;
   artwork_type?: string;
@@ -165,6 +168,8 @@ export interface ArtworkSummary {
   image?: ArtworkImage;
   is_on_view: boolean;
   is_public_domain: boolean;
+  /** Accession number; empty when the museum lists none. */
+  main_reference_number: string;
   medium?: string;
   place_of_origin?: string;
   title: string;
@@ -201,7 +206,6 @@ export interface ArtworkDetail extends ArtworkSummary {
   edition?: string;
   exhibition_history?: string;
   inscriptions?: string;
-  main_reference_number: string;
   manifest_url?: string;
   materials: string[];
   on_loan?: string;
@@ -234,7 +238,11 @@ export type FacetName =
   | 'style'
   | 'subject'
   | 'classification'
+  | 'material'
+  | 'technique'
+  | 'theme'
   | 'place_of_origin'
+  | 'gallery'
   | 'artist';
 
 export interface ArtworkFacets {
@@ -242,9 +250,13 @@ export interface ArtworkFacets {
   artwork_type?: FacetValue[];
   classification?: FacetValue[];
   department?: FacetValue[];
+  gallery?: FacetValue[];
+  material?: FacetValue[];
   place_of_origin?: FacetValue[];
   style?: FacetValue[];
   subject?: FacetValue[];
+  technique?: FacetValue[];
+  theme?: FacetValue[];
 }
 
 export interface Agent {

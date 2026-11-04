@@ -161,10 +161,13 @@ describe('artic_lookup_vocabulary input', () => {
     expect(bucketBody(fetchFake, 1)).not.toHaveProperty('query');
   });
 
-  it('passes limit through as the aggregation size', async () => {
+  it.each([100, 1000])('passes limit %i through as the aggregation size', async (limit) => {
     const fetchFake = installAicService(scriptedFetch(jsonResponder(aggregationEnvelope('v', []))));
-    await runToolContract(lookupVocabulary, { vocabulary: 'subject', limit: 100 });
-    expect(bucketBody(fetchFake).aggs.v.terms.size).toBe(100);
+    const out = structuredOf<VocabularyRun>(
+      await runToolContract(lookupVocabulary, { vocabulary: 'subject', limit }),
+    );
+    expect(bucketBody(fetchFake).aggs.v.terms.size).toBe(limit);
+    expect(out.cap).toBe(limit);
   });
 
   it.each([
@@ -250,7 +253,7 @@ describe('artic_lookup_vocabulary output and enrichment', () => {
       truncated: true,
       shown: 1,
       cap: 1,
-      notice: 'More values exist: raise limit (up to 100) or narrow with contains.',
+      notice: 'More values exist: raise limit (up to 1,000) or narrow with contains.',
     });
   });
 
