@@ -2,6 +2,8 @@
  * @fileoverview Bounded requested limits and ordered ID continuation at the real fetch seam.
  * @module tests/tools/limits.tool.test
  */
+import { z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it } from 'vitest';
 import { getArtworks } from '@/mcp-server/tools/definitions/get-artworks.tool.js';
@@ -13,11 +15,12 @@ import { searchExhibitions } from '@/mcp-server/tools/definitions/search-exhibit
 import { disposeAicService } from '@/services/aic/aic-service.js';
 import {
   jsonResponder,
+  numberedSearch,
   scriptedFetch,
   searchBodyOf,
   urlOfCall,
 } from '../fixtures/aic-service-kit.js';
-import { errorOf, installAicService, structuredOf } from '../fixtures/aic-tool-kit.js';
+import { errorOf, installAicService, structuredOf, textOf } from '../fixtures/aic-tool-kit.js';
 import {
   agentRecord,
   artworkRecord,
@@ -62,6 +65,187 @@ describe('limits characterization', () => {
     const result = await run(searchArtworks as never, { limit: 0 });
     expect(structuredOf<Output>(result).cap).toBe(0);
   });
+});
+
+describe('following next_page to the end of the window', () => {
+  const PAGED = [
+    ['artic_search_artworks', searchArtworks, 'artworks', artworkRecord, {}],
+    ['artic_search_artists', searchArtists, 'artists', agentRecord, { query: 'a' }],
+    ['artic_search_exhibitions', searchExhibitions, 'exhibitions', exhibitionRecord, {}],
+    ['artic_search_audio_guide', searchAudioGuide, 'stops', mobileSoundRecord, { query: 'a' }],
+  ] as const;
+
+  /** The one request that starts inside the window and would end past it, per limit. */
+  const CROSSING = [
+    [7, { from: 994, limit: 6 }],
+    [12, { from: 996, limit: 4 }],
+    [30, { from: 990, limit: 10 }],
+    [99, { from: 990, limit: 10 }],
+    [100, undefined],
+  ] as const;
+
+  const CASES = PAGED.flatMap((tool) =>
+    CROSSING.flatMap(([limit, crossing]) =>
+      [998, 1000, 1337].map((total) => [...tool, limit, total, crossing] as const),
+    ),
+  );
+
+  /** Serves `total` numbered rows on the tool's page search; the artists tool's artwork-count lookups get none. */
+  const servePaged = (
+    tool: unknown,
+    total: number,
+    row: (position: number) => Record<string, unknown>,
+  ) => {
+    const upstream = numberedSearch(total, (position) => row(position));
+    const isPage = (url: string) =>
+      tool !== searchArtists || new URL(url).pathname.endsWith('/agents/search');
+    const fetch = installAicService(
+      scriptedFetch((url, init) =>
+        isPage(url) ? upstream(url, init) : Response.json(searchEnvelope([], 0)),
+      ),
+    );
+    return { fetch, isPage };
+  };
+
+  it.each(CASES)(
+    '%s reaches each match once: $5 at a time of $6',
+    async (_name, tool, key, row, input, limit, total, crossing) => {
+      const { fetch, isPage } = servePaged(tool, total, row);
+      const seen: number[] = [];
+      let last: Output | undefined;
+      for (let page: number | undefined = 1; page !== undefined; page = last.next_page) {
+        const result = await run(tool as never, { ...input, limit, page });
+        last = structuredOf<Output>(result);
+        const ids = last[key]!.map((record) => record.id);
+        expect(last).toMatchObject({ page, cap: limit, shown: ids.length, totalCount: total });
+        for (const id of ids) surfaces(result, `(id ${id})`);
+        seen.push(...ids);
+      }
+      expect(seen).toEqual(Array.from({ length: Math.min(total, 1000) }, (_, i) => i + 1));
+      expect(last).toMatchObject({ has_more: total > 1000, truncated: total > 1000 });
+
+      const requests = fetch.mock.calls
+        .filter(([url]) => isPage(url))
+        .map(([url]) => searchBodyOf(url));
+      const whole = Math.floor(1000 / limit);
+      expect(requests.slice(0, whole).map(({ page, limit }) => ({ page, limit }))).toEqual(
+        Array.from({ length: whole }, (_, index) => ({ page: index + 1, limit })),
+      );
+      expect(requests.slice(0, whole).some((request) => 'from' in request)).toBe(false);
+      expect(requests.slice(whole).map(({ from, limit }) => ({ from, limit }))).toEqual(
+        crossing ? [crossing] : [],
+      );
+      expect(requests.slice(whole).some((request) => 'page' in request)).toBe(false);
+    },
+  );
+
+  const SHORTENED =
+    'Page 34 starts at match 991 and holds only the rows that remain inside the first 1,000 matches, so it is shorter than the limit of 30.';
+  const WINDOW =
+    'Only the first 1,000 matches are reachable; narrow the search with filters to see the rest.';
+
+  it.each(
+    PAGED.flatMap((tool) =>
+      (
+        [
+          [5000, 10, true, `${SHORTENED} ${WINDOW}`],
+          [1000, 10, false, undefined],
+          [993, 3, false, undefined],
+          [990, 0, false, 'Page 34 is past the last match (990 total); request a lower page.'],
+        ] as const
+      ).map((expected) => [...tool, ...expected] as const),
+    ),
+  )(
+    '%s explains the crossing page of $5 matches on both surfaces',
+    async (_name, tool, key, row, input, total, shown, hasMore, notice) => {
+      servePaged(tool, total, row);
+      const result = await run(tool as never, { ...input, limit: 30, page: 34 });
+      const out = structuredOf<Output>(result);
+      expect(out).toMatchObject({
+        page: 34,
+        has_more: hasMore,
+        truncated: hasMore,
+        totalCount: total,
+        shown,
+        cap: 30,
+      });
+      expect(out.notice).toBe(notice);
+      expect(out[key]?.map((record) => record.id)).toEqual(
+        Array.from({ length: shown }, (_, index) => 991 + index),
+      );
+      expect(out).not.toHaveProperty('next_page');
+      surfaces(
+        result,
+        `**${total} total**\n**truncated:** ${hasMore}\n**shown:** ${shown}\n**cap:** 30${notice === undefined ? '' : `\n> ${notice}`}`,
+      );
+      if (notice === undefined) {
+        expect(textOf(result)).not.toContain('shorter than the limit');
+      }
+    },
+  );
+
+  it.each(PAGED)(
+    '%s points page 33 at limit 30 to the crossing page',
+    async (_name, tool, _key, row, input) => {
+      servePaged(tool, 5000, row);
+      const result = await run(tool as never, { ...input, limit: 30, page: 33 });
+      expect(structuredOf<Output>(result)).toMatchObject({
+        has_more: true,
+        next_page: 34,
+        shown: 30,
+        notice: 'More matches: call again with page 34.',
+      });
+      surfaces(result, '**Next page:** 34');
+    },
+  );
+
+  it.each(PAGED)('%s advertises where a page may start', (_name, tool) => {
+    expect(z.toJSONSchema(tool.input, { io: 'input' })).toMatchObject({
+      properties: {
+        page: {
+          description: expect.stringContaining(
+            'A page must start within the first 1,000 matches; one that crosses match 1,000 holds only the rows up to it.',
+          ),
+        },
+      },
+    });
+    expect(z.toJSONSchema(tool.output)).toMatchObject({
+      properties: {
+        next_page: {
+          description: expect.stringContaining('the next page would start past match 1,000'),
+        },
+      },
+    });
+    expect(tool.errors?.find(({ reason }) => reason === 'page_beyond_window')).toMatchObject({
+      when: 'The page starts past match 1,000, the last reachable one: (page - 1) times the applied limit is 1,000 or more.',
+    });
+  });
+
+  it.each(PAGED)(
+    '%s refuses the page after the crossing one before any request, naming its first match',
+    async (_name, tool, _key, _row, input) => {
+      const fetch = serveEmpty();
+      for (const [page, limit, firstMatch] of [
+        [85, 12, 1009],
+        [35, 30, 1021],
+        [144, 7, 1002],
+        [12, 99, 1090],
+        // Clamped to 100, as a page of 100 is counted.
+        [11, 1000, 1001],
+      ] as const) {
+        const result = await run(tool as never, { ...input, page, limit });
+        const error = errorOf(result);
+        expect(error.data.reason).toBe('page_beyond_window');
+        expect(error.message).toMatch(
+          new RegExp(
+            `^Page ${page} with (?:applied )?limit ${Math.min(limit, 100)} starts at match ${firstMatch}, past the first 1,000\\.`,
+          ),
+        );
+        surfaces(result, `starts at match ${firstMatch}, past the first 1,000`);
+      }
+      expect(fetch).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe('bounded oversized reads', () => {
@@ -374,5 +558,149 @@ describe('bounded oversized reads', () => {
     expect(out.artworks).toHaveLength(100);
     expect(out.deferred_ids).toEqual(ids.slice(100));
     surfaces(result, `**Deferred ids:** ${ids.slice(100).join(', ')}`);
+  });
+});
+
+/** The emitted input schemas of a tool, by field. */
+const inputProperties = (tool: { input: z.ZodType }) =>
+  z.toJSONSchema(tool.input, { io: 'input' }).properties as Record<
+    string,
+    { type?: string; maximum?: number }
+  >;
+
+interface ScalarInput {
+  expected: 'number' | 'boolean';
+  field: string;
+  name: string;
+  required: Record<string, unknown>;
+  tool: { input: z.ZodType };
+  value: number | boolean | undefined;
+}
+
+/** Every input the six tools advertise as a number or boolean, beside the arguments its tool requires. */
+const SCALAR_INPUTS = [
+  { tool: searchArtworks, required: {} },
+  { tool: getArtworks, required: { ids: [1] } },
+  { tool: searchArtists, required: { query: 'a' } },
+  { tool: searchExhibitions, required: {} },
+  { tool: searchAudioGuide, required: { query: 'a' } },
+  { tool: lookupVocabulary, required: { vocabulary: 'material' } },
+].flatMap(({ tool, required }) =>
+  Object.entries(inputProperties(tool)).flatMap(([field, { type, maximum }]): ScalarInput[] => {
+    const row = { name: `${tool.name}.${field}`, tool, required, field };
+    if (type === 'integer' || type === 'number')
+      return [{ ...row, expected: 'number', value: maximum }];
+    if (type === 'boolean') return [{ ...row, expected: 'boolean', value: true }];
+    return [];
+  }),
+);
+
+describe('number and boolean inputs', () => {
+  it('finds them on every tool', () => {
+    expect(SCALAR_INPUTS.map(({ name }) => name)).toEqual([
+      'artic_search_artworks.artist_id',
+      'artic_search_artworks.year_from',
+      'artic_search_artworks.year_to',
+      'artic_search_artworks.acquired_from',
+      'artic_search_artworks.acquired_to',
+      'artic_search_artworks.public_domain_only',
+      'artic_search_artworks.on_view_only',
+      'artic_search_artworks.has_image',
+      'artic_search_artworks.page',
+      'artic_search_artworks.limit',
+      'artic_get_artworks.include_related_media',
+      'artic_search_artists.artists_only',
+      'artic_search_artists.born_from',
+      'artic_search_artists.born_to',
+      'artic_search_artists.page',
+      'artic_search_artists.limit',
+      'artic_search_exhibitions.artwork_id',
+      'artic_search_exhibitions.artist_id',
+      'artic_search_exhibitions.page',
+      'artic_search_exhibitions.limit',
+      'artic_search_audio_guide.page',
+      'artic_search_audio_guide.limit',
+      'artic_lookup_vocabulary.public_domain_only',
+      'artic_lookup_vocabulary.limit',
+    ]);
+  });
+
+  it('advertises the inner schema, default included, and none as required', () => {
+    const described = { description: expect.any(String) };
+    const artworks = inputProperties(searchArtworks);
+    expect(artworks.artist_id).toStrictEqual({
+      ...described,
+      type: 'integer',
+      exclusiveMinimum: 0,
+      maximum: 9007199254740991,
+    });
+    expect(artworks.year_from).toStrictEqual({
+      ...described,
+      type: 'integer',
+      minimum: -8000,
+      maximum: 2100,
+    });
+    expect(artworks.public_domain_only).toStrictEqual({
+      ...described,
+      type: 'boolean',
+      default: false,
+    });
+    expect(inputProperties(lookupVocabulary).limit).toStrictEqual({
+      ...described,
+      type: 'integer',
+      minimum: 1,
+      maximum: 1000,
+      default: 25,
+    });
+    expect(inputProperties(getArtworks).include_related_media).toStrictEqual({
+      ...described,
+      type: 'boolean',
+      default: true,
+    });
+    for (const { tool, field } of SCALAR_INPUTS) {
+      expect(z.toJSONSchema(tool.input, { io: 'input' }).required ?? []).not.toContain(field);
+    }
+  });
+
+  it.each(SCALAR_INPUTS)(
+    'rejects a string that spells neither on $name with its type error, before upstream work',
+    async ({ tool, required, field, expected }) => {
+      const fetch = serveEmpty();
+      const result = await run(tool as never, { ...required, [field]: 'abc' });
+      const message = `${field}: Invalid input: expected ${expected}, received string`;
+      const error = errorOf(result);
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data).toStrictEqual({
+        issues: [
+          {
+            code: 'invalid_type',
+            expected,
+            path: [field],
+            message: `Invalid input: expected ${expected}, received string`,
+          },
+        ],
+        reason: 'invalid_arguments',
+        recovery: { hint: message },
+      });
+      expect(textOf(result)).toContain(message);
+      expect(fetch).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(SCALAR_INPUTS)(
+    'reads the string form of $name as the value itself',
+    ({ tool, required, field, value }) => {
+      const typed = tool.input.parse({ ...required, [field]: value }) as Record<string, unknown>;
+      expect(typed[field]).toBe(value);
+      expect(tool.input.parse({ ...required, [field]: String(value) })).toStrictEqual(typed);
+    },
+  );
+
+  // A form client sends "" for a field its user left empty.
+  it.each(SCALAR_INPUTS)('reads a blank $name as leaving it out', ({ tool, required, field }) => {
+    const omitted = tool.input.parse(required) as Record<string, unknown>;
+    const blank = tool.input.parse({ ...required, [field]: '' });
+    // Parsing keeps the key of a field that was sent, holding undefined when nothing defaults it.
+    expect(blank).toStrictEqual({ ...omitted, [field]: omitted[field] });
   });
 });

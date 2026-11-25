@@ -10,8 +10,10 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getAicService } from '@/services/aic/aic-service.js';
 import {
   blankAsUnset,
+  booleanInput,
   containsPattern,
   inlineSafe,
+  numberInput,
   VOCABULARY_FIELDS,
   VOCABULARY_FILTERS,
 } from '@/services/aic/aic-text.js';
@@ -33,10 +35,10 @@ export const lookupVocabulary = tool('artic_lookup_vocabulary', {
     contains: blankAsUnset(z.string().trim().max(60).optional()).describe(
       'Case- and accent-insensitive substring the values must contain, such as "impress" for Impressionism and Post-Impressionism, or "applique" for appliqué (technique). Omit to list the most common values.',
     ),
-    public_domain_only: blankAsUnset(z.boolean().default(false)).describe(
+    public_domain_only: booleanInput(z.boolean().default(false)).describe(
       'Count only public-domain artworks.',
     ),
-    limit: blankAsUnset(z.number().int().min(1).max(LIMIT_MAX).default(25)).describe(
+    limit: numberInput(z.number().int().min(1).max(LIMIT_MAX).default(25)).describe(
       'Values to return, most common first (1-1,000). Narrow with contains for more specific values.',
     ),
   }),

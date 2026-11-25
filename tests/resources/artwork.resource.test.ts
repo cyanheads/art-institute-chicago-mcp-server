@@ -2,9 +2,10 @@
  * @fileoverview Tests for the `artic://artworks/{id}` resource driven through a
  * real `AicService` over a fake `fetch`: param validation, the by-id request
  * and its default sections, the record envelope (license, description
- * attribution, notice), unknown ids, related-media degradation and cap, a
- * very large record returned whole, upstream failure classes, and the
- * resource's declared metadata.
+ * attribution, publication license and citation, notice), unknown ids,
+ * related-media and publication-section degradation and cap, a very large
+ * record returned whole, upstream failure classes, and the resource's declared
+ * metadata.
  * @module tests/resources/artwork.resource.test
  */
 
@@ -13,7 +14,7 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { artworkResource } from '@/mcp-server/resources/definitions/artwork.resource.js';
 import { type AicServiceOptions, disposeAicService } from '@/services/aic/aic-service.js';
-import { DESCRIPTION_ATTRIBUTION } from '@/services/aic/artwork-records.js';
+import { DESCRIPTION_ATTRIBUTION, PUBLICATION_CITATION } from '@/services/aic/artwork-records.js';
 import {
   hangingResponder,
   jsonResponder,
@@ -21,8 +22,10 @@ import {
   type Responder,
   rejectionOf,
   routedFetch,
+  SECTIONS,
   SOUNDS,
   soundSearchOf,
+  TEXTS,
   textResponder,
   urlOfCall,
 } from '../fixtures/aic-service-kit.js';
@@ -35,9 +38,14 @@ import {
   IIIF_URL,
   IMAGE_ID,
   placeholderYearArtworkRecord,
+  SECTION_LICENSE,
+  searchEnvelope,
+  sectionRecord,
   soundRecord,
   soundUuid,
   sparseArtworkRecord,
+  textRecord,
+  textUuid,
 } from '../fixtures/aic-upstream.js';
 
 interface ResourceBody {
@@ -45,6 +53,8 @@ interface ResourceBody {
   description_attribution?: string;
   license_text: string;
   notice?: string;
+  publication_citation?: string;
+  publication_license_text?: string;
 }
 
 type FetchFake = ReturnType<typeof routedFetch>;
@@ -52,10 +62,10 @@ type FetchFake = ReturnType<typeof routedFetch>;
 const ARTWORKS = '/api/v1/artworks';
 
 const DETAIL_FIELDS =
-  'id,title,alt_titles,main_reference_number,fiscal_year,artist_display,artist_id,artist_ids,date_display,date_start,date_end,date_qualifier_title,place_of_origin,medium_display,dimensions,inscriptions,credit_line,copyright_notice,edition,artwork_type_title,department_title,classification_title,style_title,style_titles,subject_titles,material_titles,technique_titles,theme_titles,is_public_domain,is_on_view,gallery_title,on_loan_display,image_id,alt_image_ids,thumbnail,sound_ids';
+  'id,title,alt_titles,main_reference_number,fiscal_year,artist_display,artist_id,artist_ids,date_display,date_start,date_end,date_qualifier_title,place_of_origin,medium_display,dimensions,inscriptions,credit_line,copyright_notice,edition,artwork_type_title,department_title,classification_title,style_title,style_titles,subject_titles,material_titles,technique_titles,theme_titles,is_public_domain,is_on_view,gallery_title,on_loan_display,image_id,alt_image_ids,thumbnail,sound_ids,section_ids,text_ids';
 
 const RELATED_MEDIA_DEGRADED =
-  'Related media could not be loaded; the artwork records are complete. Call artic_get_artworks again to retry related media.';
+  'The linked sound recordings could not be loaded; the artwork records themselves are complete. Call artic_get_artworks again to retry.';
 
 afterEach(() => {
   disposeAicService();
@@ -422,7 +432,7 @@ describe('artic://artworks/{id} related media', () => {
     const body = await read('7');
     expect(body.artwork.related_media as unknown[]).toHaveLength(100);
     expect(body.notice).toBe(
-      'Related media is capped at 100 items per call; artwork 7 is missing some or all of its related media. Call artic_get_artworks with fewer ids to load it.',
+      'Linked sound recordings are capped at 100 per call; artwork 7 is missing some or all of them. Call artic_get_artworks with fewer ids to load them.',
     );
   });
 
@@ -446,6 +456,108 @@ describe('artic://artworks/{id} related media', () => {
     await vi.waitFor(() => expect(paths(fetchFake)).toContain('/sounds/search'));
     controller.abort(new DOMException('cancelled by caller', 'AbortError'));
     expect(await pending).toMatchObject({ name: 'AbortError' });
+  });
+});
+
+// --- Publication sections and texts --------------------------------------------------------------------------
+
+describe('artic://artworks/{id} publication sections and texts', () => {
+  const serveLinked = (artwork: unknown, sections: Responder): FetchFake =>
+    installAicService(
+      routedFetch({
+        [ARTWORKS]: jsonResponder(envelope([artwork])),
+        [SOUNDS]: jsonResponder(searchEnvelope([soundRecord(soundUuid(1))])),
+        [SECTIONS]: sections,
+        [TEXTS]: jsonResponder(searchEnvelope([textRecord(textUuid(1))])),
+      }),
+    );
+  const linked = artworkRecord(7, {
+    sound_ids: [soundUuid(1)],
+    section_ids: [36741370056],
+    text_ids: [textUuid(1)],
+  });
+
+  it('carries the sections with their license and citation, and the texts after the sounds', async () => {
+    const fetchFake = serveLinked(
+      linked,
+      jsonResponder(searchEnvelope([sectionRecord(36741370056)], 1, { license: SECTION_LICENSE })),
+    );
+    const body = await read('7');
+    expect(paths(fetchFake)).toEqual([
+      '/artworks',
+      '/sounds/search',
+      '/sections/search',
+      '/texts/search',
+    ]);
+    expect(body.artwork.publication_sections).toEqual([
+      {
+        id: 36741370056,
+        title: 'Cat. 36741370056 Synthetic Entry, 1877',
+        publication_title: 'Synthetic Paintings at the Art Institute of Chicago',
+        web_url: 'https://publications.artic.edu/synthetic/reader/works/section/36741370056',
+      },
+    ]);
+    expect((body.artwork.related_media as { type: string }[]).map((m) => m.type)).toEqual([
+      'sound',
+      'text',
+    ]);
+    expect(body.license_text).toBe(ARTWORK_LICENSE);
+    expect(body.publication_license_text).toBe(SECTION_LICENSE);
+    expect(body.publication_citation).toBe(PUBLICATION_CITATION);
+    expect(Object.keys(body).sort()).toEqual([
+      'artwork',
+      'license_text',
+      'publication_citation',
+      'publication_license_text',
+    ]);
+  });
+
+  it('carries no publication license or citation when the linked section is gone upstream', async () => {
+    serveLinked(linked, jsonResponder(searchEnvelope([], 0, { license: SECTION_LICENSE })));
+    const body = await read('7');
+    expect(body.artwork).not.toHaveProperty('publication_sections');
+    expect(Object.keys(body).sort()).toEqual(['artwork', 'license_text']);
+  });
+
+  it('returns the record and its media with a notice naming the sections when their load fails', async () => {
+    serveLinked(linked, jsonResponder({}, 500));
+    const body = await read('7');
+    expect(body.artwork.related_media as unknown[]).toHaveLength(2);
+    expect(body.artwork).not.toHaveProperty('publication_sections');
+    expect(body.notice).toBe(
+      'The linked publication sections could not be loaded; the artwork records themselves are complete. Call artic_get_artworks again to retry.',
+    );
+    expect(Object.keys(body).sort()).toEqual(['artwork', 'license_text', 'notice']);
+  });
+
+  it('carries the publication license, empty, and the citation when the sections envelope states no license', async () => {
+    serveLinked(
+      linked,
+      jsonResponder(searchEnvelope([sectionRecord(36741370056)], 1, { license: '' })),
+    );
+    const body = await read('7');
+    expect(body.artwork.publication_sections).toHaveLength(1);
+    expect(body.publication_license_text).toBe('');
+    expect(body.publication_citation).toBe(
+      "Publication sections © Art Institute of Chicago and third parties, https://www.artic.edu/terms — cite the section's web_url.",
+    );
+  });
+
+  it('carries every notice: the sections that failed, then the sounds past the cap', async () => {
+    serveLinked({ ...withSounds(7, 101), section_ids: [1] }, jsonResponder({}, 500));
+    const body = await read('7');
+    expect(body.notice).toBe(
+      'The linked publication sections could not be loaded; the artwork records themselves are complete. Call artic_get_artworks again to retry. Linked sound recordings are capped at 100 per call; artwork 7 is missing some or all of them. Call artic_get_artworks with fewer ids to load them.',
+    );
+  });
+
+  it('rethrows a cancellation during the sections load', async () => {
+    const controller = new AbortController();
+    serveLinked(linked, () => {
+      controller.abort(new DOMException('cancelled by caller', 'AbortError'));
+      throw controller.signal.reason;
+    });
+    expect(await rejectionOf(read('7', controller.signal))).toBe(controller.signal.reason);
   });
 });
 

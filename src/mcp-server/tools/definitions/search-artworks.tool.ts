@@ -10,16 +10,19 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getAicService } from '@/services/aic/aic-service.js';
 import {
   blankAsUnset,
+  booleanInput,
   galleryInput,
   inlineSafe,
   listInput,
+  numberInput,
   PAGE_MAX,
   pageInfo,
+  pageWindow,
   quoteBlock,
   SEARCH_WINDOW,
   VOCABULARY_FILTERS,
   vocabularyInput,
-  WINDOW_NOTICE,
+  windowNotices,
   YEAR_MAX,
   YEAR_MIN,
 } from '@/services/aic/aic-text.js';
@@ -58,7 +61,7 @@ const SearchInput = z.object({
   artist: blankAsUnset(z.string().trim().max(120).optional()).describe(
     'Artist or culture name matched against every credited artist (all words must match).',
   ),
-  artist_id: blankAsUnset(z.number().int().positive().optional()).describe(
+  artist_id: numberInput(z.number().int().positive().optional()).describe(
     'Agent id from artic_search_artists or an artist facet row; matches preferred and other credits.',
   ),
   department: vocabularyInput(120).describe(
@@ -91,25 +94,28 @@ const SearchInput = z.object({
   gallery: galleryInput(120).describe(
     'Gallery where the work is on view, such as Gallery 240 (a bare 240 is read as Gallery 240). Only on-view works carry a gallery.',
   ),
-  year_from: blankAsUnset(z.number().int().min(YEAR_MIN).max(YEAR_MAX).optional()).describe(
+  year_from: numberInput(z.number().int().min(YEAR_MIN).max(YEAR_MAX).optional()).describe(
     'Earliest year; a work matches when its date span overlaps year_from to year_to. Negative for BCE.',
   ),
-  year_to: blankAsUnset(z.number().int().min(YEAR_MIN).max(YEAR_MAX).optional()).describe(
+  year_to: numberInput(z.number().int().min(YEAR_MIN).max(YEAR_MAX).optional()).describe(
     'Latest year; a work matches when its date span overlaps year_from to year_to. Negative for BCE.',
   ),
-  acquired_from: blankAsUnset(z.number().int().min(ACQUIRED_MIN).max(YEAR_MAX).optional()).describe(
+  acquired_from: numberInput(z.number().int().min(ACQUIRED_MIN).max(YEAR_MAX).optional()).describe(
     'Earliest fiscal year in which the museum acquired the work (acquisition_fiscal_year), inclusive. Works with no recorded acquisition year never match, so this filter alone never gives a complete provenance-review set.',
   ),
-  acquired_to: blankAsUnset(z.number().int().min(ACQUIRED_MIN).max(YEAR_MAX).optional()).describe(
+  acquired_to: numberInput(z.number().int().min(ACQUIRED_MIN).max(YEAR_MAX).optional()).describe(
     'Latest fiscal year in which the museum acquired the work (acquisition_fiscal_year), inclusive. Works with no recorded acquisition year never match.',
   ),
-  public_domain_only: blankAsUnset(z.boolean().default(false)).describe(
+  provenance: blankAsUnset(z.enum(['recorded', 'unrecorded']).optional()).describe(
+    'recorded keeps only works whose record carries provenance text; unrecorded keeps only works whose record carries none. The filter reads whether text is present, which says nothing about whether the provenance is complete. With acquired_from or acquired_to, works with no recorded acquisition year are still left out.',
+  ),
+  public_domain_only: booleanInput(z.boolean().default(false)).describe(
     'Only public-domain works, whose images are CC0.',
   ),
-  on_view_only: blankAsUnset(z.boolean().default(false)).describe(
+  on_view_only: booleanInput(z.boolean().default(false)).describe(
     'Only works on view at the museum now.',
   ),
-  has_image: blankAsUnset(z.boolean().default(false)).describe('Only works with an image.'),
+  has_image: booleanInput(z.boolean().default(false)).describe('Only works with an image.'),
   facets: blankAsUnset(
     listInput(z.array(z.enum(FACETS)).max(FACETS.length).optional(), FACETS.length),
   ).describe(
@@ -122,10 +128,10 @@ const SearchInput = z.object({
   ).describe(
     'relevance ranks by query text, or by museum popularity without it. date_asc and date_desc sort by start year: works without one come last, and records with a placeholder start year (outside -8000 to 2100) are left out. acquired_desc (recent acquisitions first) and acquired_asc sort by acquisition fiscal year, with works that have no recorded fiscal year last.',
   ),
-  page: blankAsUnset(z.number().int().min(1).max(SEARCH_WINDOW).default(1)).describe(
-    'Page to return (1-based); page times the applied limit may not exceed 1,000.',
+  page: numberInput(z.number().int().min(1).max(SEARCH_WINDOW).default(1)).describe(
+    'Page to return (1-based). A page must start within the first 1,000 matches; one that crosses match 1,000 holds only the rows up to it.',
   ),
-  limit: blankAsUnset(z.number().int().min(0).max(1000).default(10)).describe(
+  limit: numberInput(z.number().int().min(0).max(1000).default(10)).describe(
     `Requested rows per page (0-1,000); at most ${PAGE_MAX} are returned. 0 returns only totalCount and facets.`,
   ),
 });
@@ -161,6 +167,11 @@ function zeroHitFragments(input: SearchInputValues): string[] {
   if (input.year_from !== undefined || input.year_to !== undefined) {
     fragments.push(
       'Widen year_from/year_to; a work matches when its date span overlaps the range.',
+    );
+  }
+  if (input.provenance) {
+    fragments.push(
+      `Drop provenance "${input.provenance}" to include works whose record carries ${input.provenance === 'recorded' ? 'no ' : ''}provenance text.`,
     );
   }
   return fragments;
@@ -217,7 +228,7 @@ export const searchArtworks = tool('artic_search_artworks', {
       .number()
       .optional()
       .describe(
-        'Page to request next; absent when nothing remains or the next page would pass the first 1,000 matches.',
+        'Page to request next; absent when nothing remains or the next page would start past match 1,000.',
       ),
     sort_applied: z
       .enum(['relevance', 'popularity', 'date_asc', 'date_desc', 'acquired_desc', 'acquired_asc'])
@@ -235,18 +246,18 @@ export const searchArtworks = tool('artic_search_artworks', {
       .string()
       .optional()
       .describe(
-        'Guidance when nothing matched, more pages exist, or the reachable window is exhausted.',
+        'Guidance when nothing matched, more pages exist, the page was shortened at match 1,000, or the reachable window is exhausted.',
       ),
   },
   errors: [
     {
       reason: 'page_beyond_window',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'page times the applied limit exceeds 1,000, past the reachable search window.',
+      when: 'The page starts past match 1,000, the last reachable one: (page - 1) times the applied limit is 1,000 or more.',
       retryable: false,
       severity: 'notice',
       recovery:
-        'Only the first 1,000 matches of a search are reachable. Narrow artic_search_artworks with filters such as department, artwork_type, or year_from, using values from artic_lookup_vocabulary.',
+        'Only the first 1,000 matches of a search are reachable. Narrow artic_search_artworks with filters such as department, artwork_type, or year_from, using values from artic_lookup_vocabulary, and start again at page 1.',
     },
     {
       reason: 'invalid_year_range',
@@ -292,10 +303,11 @@ export const searchArtworks = tool('artic_search_artworks', {
     ctx.enrich.total(0);
     ctx.enrich({ truncated: false, shown: 0, cap: input.limit });
 
-    if (input.page * input.limit > SEARCH_WINDOW) {
+    const { firstMatch, position } = pageWindow(input.page, input.limit);
+    if (position === 'beyond') {
       throw ctx.fail(
         'page_beyond_window',
-        `Page ${input.page} with limit ${input.limit} reaches match ${input.page * input.limit}, past the first 1,000.`,
+        `Page ${input.page} with limit ${input.limit} starts at match ${firstMatch}, past the first 1,000.`,
       );
     }
     if (
@@ -342,8 +354,8 @@ export const searchArtworks = tool('artic_search_artworks', {
       );
     } else if (paging.next_page !== undefined) {
       fragments.push(`More matches: call again with page ${paging.next_page}.`);
-    } else if (paging.windowExhausted) {
-      fragments.push(WINDOW_NOTICE);
+    } else {
+      fragments.push(...windowNotices(result.total, input.page, input.limit));
     }
     if (input.acquired_from !== undefined || input.acquired_to !== undefined) {
       fragments.push(

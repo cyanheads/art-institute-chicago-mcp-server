@@ -14,7 +14,13 @@ import {
   type ArtworkSearchParams,
   type FetchFn,
 } from '@/services/aic/aic-service.js';
-import { EDGE_BLOCK_HTML, envelope } from './aic-upstream.js';
+import {
+  API_INVALID_LIMIT_BODY,
+  API_INVALID_RESULTS_BODY,
+  EDGE_BLOCK_HTML,
+  envelope,
+  searchEnvelope,
+} from './aic-upstream.js';
 
 export const API_ORIGIN = 'https://api.artic.edu';
 
@@ -99,6 +105,31 @@ export function behindFirewall(inner: Responder): Responder {
       });
     }
     return inner(url, init);
+  };
+}
+
+/**
+ * Answers a paged search as the API does over a population numbered 1 to
+ * `total`: the rows from `from`, or from `page`, whichever the request carries,
+ * with its 403 for a `limit` over 100 and for rows that would pass match 1,000.
+ */
+export function numberedSearch(
+  total: number,
+  make: (position: number) => Record<string, unknown>,
+): Responder {
+  return (url, init) => {
+    const body = typeof init.body === 'string' ? JSON.parse(init.body) : searchBodyOf(url);
+    const { from, limit = 10, page } = body as { from?: number; limit?: number; page?: number };
+    if (from !== undefined && page !== undefined) {
+      throw new Error(`Request carries both from and page: ${url}`);
+    }
+    const start = from ?? ((page ?? 1) - 1) * limit;
+    if (limit > 100) return jsonResponder(API_INVALID_LIMIT_BODY, 403)(url, init);
+    if (start + limit > 1000) return jsonResponder(API_INVALID_RESULTS_BODY, 403)(url, init);
+    const rows = Array.from({ length: Math.max(0, Math.min(limit, total - start)) }, (_, index) =>
+      make(start + index + 1),
+    );
+    return jsonResponder(searchEnvelope(rows, total))(url, init);
   };
 }
 
@@ -217,32 +248,54 @@ export function searchCallOf(fetchFake: Mock<FetchFn>, call = 0): SearchCall {
   return { body: searchBodyOf(url), headers, init, method: 'GET', url };
 }
 
-/** Path of the multimedia search the artwork records load related media through. */
+/** Paths of the searches the artwork records load their linked items through. */
 export const SOUNDS = '/api/v1/sounds/search';
+export const SECTIONS = '/api/v1/sections/search';
+export const TEXTS = '/api/v1/texts/search';
 
-/** One `/sounds/search` request: the uuids of its `id` terms filter and its field list. */
-export interface SoundSearch {
+/** One search by id: the ids of its `id` terms filter and its field list. */
+export interface IdSearch<Id = string> {
   fields: string;
-  ids: string[];
+  ids: Id[];
 }
 
-/** Every `/sounds/search` request recorded, in call order. */
-export function soundSearchesOf(fetchFake: Mock<FetchFn>): SoundSearch[] {
+/** Every search by id recorded on `path`, in call order. */
+export function idSearchesOf<Id = string>(fetchFake: Mock<FetchFn>, path: string): IdSearch<Id>[] {
   return fetchFake.mock.calls.flatMap(([url], index) => {
-    if (new URL(url).pathname !== SOUNDS) return [];
+    if (new URL(url).pathname !== path) return [];
     const body = searchCallOf(fetchFake, index).body as {
       fields: string;
-      query: { bool: { filter: [{ terms: { id: string[] } }] } };
+      query: { bool: { filter: [{ terms: { id: Id[] } }] } };
     };
     return [{ ids: body.query.bool.filter[0].terms.id, fields: body.fields }];
   });
 }
 
+/** Every `/sounds/search` request recorded, in call order. */
+export function soundSearchesOf(fetchFake: Mock<FetchFn>): IdSearch[] {
+  return idSearchesOf(fetchFake, SOUNDS);
+}
+
 /** The first `/sounds/search` request recorded. */
-export function soundSearchOf(fetchFake: Mock<FetchFn>): SoundSearch {
+export function soundSearchOf(fetchFake: Mock<FetchFn>): IdSearch {
   const [first] = soundSearchesOf(fetchFake);
   if (!first) throw new Error('No call to /sounds/search');
   return first;
+}
+
+/**
+ * Wraps responders so none answers until `count` of their requests are in
+ * flight: a caller that sends them one after another never gets its first answer.
+ */
+export function barrier(count: number): (inner: Responder) => Responder {
+  let arrived = 0;
+  const { promise, resolve } = Promise.withResolvers<void>();
+  return (inner) => async (url, init) => {
+    arrived += 1;
+    if (arrived === count) resolve();
+    await promise;
+    return await inner(url, init);
+  };
 }
 
 /** Awaits a promise that must reject and returns what it rejected with. */

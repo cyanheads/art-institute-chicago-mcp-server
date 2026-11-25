@@ -18,6 +18,7 @@ import {
   behindFirewall,
   hangingResponder,
   jsonResponder,
+  numberedSearch,
   queryParam,
   type Responder,
   routedFetch,
@@ -44,6 +45,7 @@ import {
   envelope,
   searchEnvelope,
 } from '../fixtures/aic-upstream.js';
+import { markdownText } from '../fixtures/markdown.js';
 
 interface ArtistsRun {
   artists: Record<string, unknown>[];
@@ -198,6 +200,15 @@ describe('artic_search_artists mode guards', () => {
     expect(paths(fetchFake)).toEqual(['/agents/search', '/artworks/search']);
   });
 
+  it('ignores a page past the window in ids mode, which returns its one page', async () => {
+    const fetchFake = serveIds([agentRecord(1)]);
+    const out = structuredOf<ArtistsRun>(await find({ ids: [1], page: 1000, limit: 100 }));
+    expect(out.artists.map((artist) => artist.id)).toEqual([1]);
+    expect(out).toMatchObject({ page: 1, has_more: false, totalCount: 1, shown: 1, cap: 1 });
+    expect(out).not.toHaveProperty('notice');
+    expect(paths(fetchFake)).toEqual(['/agents', '/artworks/search']);
+  });
+
   it('checks the mode before the page window', async () => {
     serve({});
     const error = errorOf(await find({ page: 100, limit: 25 }));
@@ -274,6 +285,60 @@ describe('artic_search_artists input validation', () => {
     const result = await find({ query: 'seurat', ids: '', born_from: '', born_to: '  ' });
     expect(result.isError).toBeUndefined();
     expect(bodyTo(blank, AGENTS_SEARCH)).toEqual(plainBody);
+  });
+
+  it('reads numbers and booleans sent as strings as the values they spell', async () => {
+    const spelledFetch = serveSearch(agents(5, 6), 40);
+    const spelled = await find({
+      query: '1942',
+      artists_only: 'false',
+      born_from: '-500',
+      born_to: ' 1859 ',
+      page: '2',
+      limit: '5',
+    });
+    expect(bodyTo(spelledFetch, AGENTS_SEARCH)).toMatchObject({ page: 2, limit: 5 });
+    expect(bodyTo(spelledFetch, AGENTS_SEARCH).query).toEqual({
+      bool: {
+        must: [
+          {
+            simple_query_string: {
+              query: '1942',
+              fields: ['title', 'alt_titles', 'sort_title'],
+              default_operator: 'and',
+            },
+          },
+        ],
+        filter: [{ range: { birth_date: { gte: -500, lte: 1859 } } }],
+      },
+    });
+    serveSearch(agents(5, 6), 40);
+    const typed = await find({
+      query: '1942',
+      artists_only: false,
+      born_from: -500,
+      born_to: 1859,
+      page: 2,
+      limit: 5,
+    });
+    expect(structuredOf<ArtistsRun>(spelled)).toEqual(structuredOf<ArtistsRun>(typed));
+    expect(structuredOf<ArtistsRun>(spelled)).toMatchObject({
+      artists_only_applied: false,
+      page: 2,
+      cap: 5,
+      shown: 5,
+    });
+    expect(spelled.content).toEqual(typed.content);
+  });
+
+  it.each([
+    ['a zero-padded born_from string', { born_from: '01859' }, 'born_from'],
+    ['an upper-case artists_only string', { artists_only: 'FALSE' }, 'artists_only'],
+  ])('rejects %s at its own path without calling upstream', async (_name, input, field) => {
+    const fetchFake = serve({});
+    const error = errorOf(await find({ query: 'seurat', ...input }));
+    expect(error.data).toMatchObject({ reason: 'invalid_arguments', issues: [{ path: [field] }] });
+    expect(fetchFake).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -398,7 +463,7 @@ describe('artic_search_artists guards', () => {
     expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
     expect(error.data.reason).toBe('page_beyond_window');
     expect(error.data.recovery?.hint).toBe(
-      'Only the first 1,000 matches are reachable. Add more of the name, or set born_from and born_to, and call artic_search_artists again.',
+      'Only the first 1,000 matches are reachable. Add more of the name, or set born_from and born_to, and call artic_search_artists again from page 1.',
     );
     expect(fetchFake).not.toHaveBeenCalled();
   });
@@ -533,6 +598,21 @@ describe('artic_search_artists paging and enrichment', () => {
     expect(out).not.toHaveProperty('next_page');
   });
 
+  it('keeps the degraded-counts fragment after the shortened-page notice', async () => {
+    serve({
+      search: numberedSearch(5000, agentRecord),
+      stats: jsonResponder(API_INVALID_LIMIT_BODY, 403),
+    });
+    const result = await find({ query: 'a', page: 34, limit: 30 });
+    const out = structuredOf<ArtistsRun>(result);
+    const notice = `Page 34 starts at match 991 and holds only the rows that remain inside the first 1,000 matches, so it is shorter than the limit of 30. ${WINDOW_NOTICE} ${STATS_DEGRADED}`;
+    expect(out).toMatchObject({ has_more: true, truncated: true, shown: 10, cap: 30, notice });
+    expect(out.artists[0]).not.toHaveProperty('artwork_count');
+    expect(
+      result.content.some((block) => block.type === 'text' && block.text.includes(`> ${notice}`)),
+    ).toBe(true);
+  });
+
   it('offers page 40 at limit 25 because it still ends inside the window', async () => {
     serveSearch(agents(25, 951), 5000);
     const out = structuredOf<ArtistsRun>(await find({ query: 'a', page: 39, limit: 25 }));
@@ -640,6 +720,40 @@ describe('artic_search_artists records', () => {
       death_year: 1900,
     });
     expect(artist?.biography).toMatch(/^Born in a synthetic town\.\s+Second & last\.$/);
+  });
+
+  it('carries the path links of a biography on both surfaces, beside its absolute ones', async () => {
+    serveIds([
+      agentRecord(34732, {
+        description:
+          '<p>Green helped form the <a href="https://www.artic.edu/artists/114577/the-hairy-who" target="_blank">Hairy Who</a>. The artists—<a href="/artists/110896/james-falconer">Jim Falconer</a>,&nbsp;<a href="/artists/36022">Gladys Nilsson</a>, and <a href="//x.test/artists/1">one more</a>—met.</p><p>A <a href="/exhibitions/2722/hairy-who-19661969">2018 exhibition</a> showed <a href="/artworks/27992/a-sunday-on-la-grande-jatte-1884"><em>A Sunday</em></a><em>—</em>too.</p>',
+      }),
+    ]);
+    const result = await find({ ids: [34732] });
+    const biography =
+      'Green helped form the Hairy Who (https://www.artic.edu/artists/114577/the-hairy-who). The artists—Jim Falconer (https://www.artic.edu/artists/110896/james-falconer), Gladys Nilsson (https://www.artic.edu/artists/36022), and one more—met.\n\nA 2018 exhibition (https://www.artic.edu/exhibitions/2722/hairy-who-19661969) showed A Sunday (https://www.artic.edu/artworks/27992/a-sunday-on-la-grande-jatte-1884)—too.';
+    expect(structuredOf<ArtistsRun>(result).artists[0]?.biography).toBe(biography);
+    expect(markdownText(textOf(result))).toContain(biography.replace('\n\n', '\n'));
+  });
+
+  it('reads a linked name or title as one line in its heading and its list row', async () => {
+    serveSearch(
+      [agentRecord(10, { title: '<a href="/artists/10/x_y">Linked Name</a>' })],
+      1,
+      statsFor(
+        bucket(10, 1, [
+          { id: 7, title: '<a href="/artworks/7">Linked Work</a>', date_display: '1890' },
+        ]),
+      ),
+    );
+    const result = await find({ query: 'a' });
+    expect(structuredOf<ArtistsRun>(result).artists[0]).toMatchObject({
+      name: 'Linked Name (https://www.artic.edu/artists/10/x_y)',
+      sample_works: [{ id: 7, title: 'Linked Work (https://www.artic.edu/artworks/7)' }],
+    });
+    const lines = markdownText(textOf(result)).split('\n');
+    expect(lines).toContain('Linked Name (https://www.artic.edu/artists/10/x_y) (id 10)');
+    expect(lines).toContain('Linked Work (https://www.artic.edu/artworks/7), 1890 (id 7)');
   });
 
   it('survives a record that carries nothing but an id', async () => {

@@ -12,11 +12,13 @@ import { getAicService } from '@/services/aic/aic-service.js';
 import {
   blankAsUnset,
   inlineSafe,
+  numberInput,
   PAGE_MAX,
   pageInfo,
+  pageWindow,
   printableUrl,
   quoteBlock,
-  WINDOW_NOTICE,
+  windowNotices,
 } from '@/services/aic/aic-text.js';
 import { titleText, yesNo } from '../artwork-output.js';
 
@@ -129,10 +131,10 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
     'Search Art Institute of Chicago exhibitions by text, date, artwork_id, or artist_id. Relationship filters cover recorded museum links; an absent link does not prove an artwork or artist never appeared in a show. For the full exhibition record of one artwork, read the exhibition_history section of artic_get_artworks. Results carry dates, gallery, summary, web page, and listed artworks. Pass artwork ids to artic_get_artworks for full records.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
-    artwork_id: blankAsUnset(z.number().int().positive().optional()).describe(
+    artwork_id: numberInput(z.number().int().positive().optional()).describe(
       'Exact museum artwork id, from artic_search_artworks or artic_get_artworks; matches recorded exhibition relationships. Combined with every other condition using AND.',
     ),
-    artist_id: blankAsUnset(z.number().int().positive().optional()).describe(
+    artist_id: numberInput(z.number().int().positive().optional()).describe(
       'Exact museum agent id, from artic_search_artists or an artwork artist_id; matches recorded exhibition relationships. Combined with every other condition using AND.',
     ),
     query: blankAsUnset(z.string().trim().max(200).optional()).describe(
@@ -150,10 +152,10 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
     sort: blankAsUnset(z.enum(SORTS).optional()).describe(
       'relevance ranks by query text; start_desc and start_asc sort by opening date. Defaults to relevance with a query, else start_desc; relevance without a query sorts as start_desc.',
     ),
-    page: blankAsUnset(z.number().int().min(1).max(1000).default(1)).describe(
-      'Page to return (1-based); page times the applied limit may not exceed 1,000.',
+    page: numberInput(z.number().int().min(1).max(1000).default(1)).describe(
+      'Page to return (1-based). A page must start within the first 1,000 matches; one that crosses match 1,000 holds only the rows up to it.',
     ),
-    limit: blankAsUnset(z.number().int().min(1).max(1000).default(10)).describe(
+    limit: numberInput(z.number().int().min(1).max(1000).default(10)).describe(
       `Requested exhibitions per page (1-1,000); at most ${PAGE_MAX} are returned.`,
     ),
   }),
@@ -169,7 +171,7 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
       .number()
       .optional()
       .describe(
-        'Page to request next; absent when nothing remains or the next page would pass the first 1,000 matches.',
+        'Page to request next; absent when nothing remains or the next page would start past match 1,000.',
       ),
     license_text: z.string().describe('License statement from the API for this data, verbatim.'),
   }),
@@ -182,7 +184,7 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
       .string()
       .optional()
       .describe(
-        'Guidance when nothing matched, more pages exist, or the reachable window is exhausted.',
+        'Guidance when nothing matched, more pages exist, the page was shortened at match 1,000, or the reachable window is exhausted.',
       ),
   },
   errors: [
@@ -198,11 +200,11 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
     {
       reason: 'page_beyond_window',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'page times the applied limit exceeds 1,000, past the reachable search window.',
+      when: 'The page starts past match 1,000, the last reachable one: (page - 1) times the applied limit is 1,000 or more.',
       retryable: false,
       severity: 'notice',
       recovery:
-        'Only the first 1,000 matches are reachable. Narrow artic_search_exhibitions with artwork_id, artist_id, query text, when, or date_from and date_to.',
+        'Only the first 1,000 matches are reachable. Narrow artic_search_exhibitions with artwork_id, artist_id, query text, when, or date_from and date_to, and start again at page 1.',
     },
     {
       reason: 'rate_limited',
@@ -239,10 +241,11 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
     ctx.enrich.total(0);
     ctx.enrich({ truncated: false, shown: 0, cap: input.limit });
 
-    if (input.page * input.limit > 1000) {
+    const { firstMatch, position } = pageWindow(input.page, input.limit);
+    if (position === 'beyond') {
       throw ctx.fail(
         'page_beyond_window',
-        `Page ${input.page} with applied limit ${input.limit} reaches match ${input.page * input.limit}, past the first 1,000.`,
+        `Page ${input.page} with applied limit ${input.limit} starts at match ${firstMatch}, past the first 1,000.`,
       );
     }
 
@@ -296,8 +299,8 @@ export const searchExhibitions = tool('artic_search_exhibitions', {
       );
     } else if (paging.next_page !== undefined) {
       fragments.push(`More matches: call again with page ${paging.next_page}.`);
-    } else if (paging.windowExhausted) {
-      fragments.push(WINDOW_NOTICE);
+    } else {
+      fragments.push(...windowNotices(result.total, input.page, input.limit));
     }
     const notice = fragments.join(' ');
     if (paging.has_more) ctx.enrich.truncated({ shown, cap: input.limit, guidance: notice });

@@ -1,9 +1,9 @@
 /**
  * @fileoverview Pure helpers shared by the Art Institute service and the tool
- * definitions: input preprocessors for form-client blanks and comma lists,
- * HTML-to-text conversion, markdown-safe rendering of upstream text,
- * upstream URL and image-id screening, constructed IIIF and web URLs, search
- * ranking text and stop-word removal, vocabulary filter routing,
+ * definitions: input preprocessors for form-client blanks, spelled numbers and
+ * booleans, and comma lists, HTML-to-text conversion, markdown-safe rendering
+ * of upstream text, upstream URL and image-id screening, constructed IIIF and
+ * web URLs, search ranking text and stop-word removal, vocabulary filter routing,
  * placeholder-year screening, and search-window paging.
  * @module services/aic/aic-text
  */
@@ -20,6 +20,37 @@ export const blankAsUnset = <T extends z.ZodType>(schema: T) =>
     (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
     schema,
   );
+
+/**
+ * `blankAsUnset` for a number input, which also reads a string as the number it
+ * spells. The framework's repair of spelled scalars never reaches a preprocessed
+ * field, so its rule is applied here: only where `String(n)` gives the trimmed
+ * text back (`"5"`, `"-500"`; not `"05"`, `"1e3"`, `"5.0"`). Any other value
+ * reaches `schema` as sent, so it fails with that schema's own error.
+ */
+export const numberInput = <T extends z.ZodType<number | undefined>>(schema: T) =>
+  z.preprocess((value) => {
+    if (typeof value !== 'string') return value;
+    const text = value.trim();
+    if (text === '') return;
+    const number = Number(text);
+    return Number.isFinite(number) && String(number) === text ? number : value;
+  }, schema);
+
+/** `numberInput` for a boolean input, where exactly `"true"` and `"false"`, trimmed, spell a value. */
+export const booleanInput = <T extends z.ZodType<boolean | undefined>>(schema: T) =>
+  z.preprocess((value) => {
+    switch (typeof value === 'string' ? value.trim() : value) {
+      case '':
+        return;
+      case 'true':
+        return true;
+      case 'false':
+        return false;
+      default:
+        return value;
+    }
+  }, schema);
 
 /**
  * Accepts an array or a comma-joined string. String elements are trimmed and
@@ -370,14 +401,22 @@ function citationHref(tag: string): string | undefined {
       while (cursor < tag.length - 1 && !/\s/.test(tag[cursor] ?? '')) cursor++;
       value = tag.slice(valueStart, cursor);
     }
-    if (name === 'href') return citationUrl(value);
+    if (name === 'href') return anchorUrl(decodeEntities(value));
   }
   return;
 }
 
-/** A citation destination, entity-decoded once; absent unless it is a safe absolute HTTP(S) URL. */
-function citationUrl(value: string): string | undefined {
-  const decoded = decodeEntities(value);
+/**
+ * An anchor's decoded destination, with a path that starts with a single `/`
+ * resolved on the museum's site. That slash ends the fixed origin's authority,
+ * so nothing in the path can name another host.
+ */
+function anchorUrl(decoded: string): string | undefined {
+  return citationUrl(/^\/(?!\/)/.test(decoded) ? `${WEB_ORIGIN}${decoded}` : decoded);
+}
+
+/** A decoded citation destination; absent unless it is a safe absolute HTTP(S) URL. */
+function citationUrl(decoded: string): string | undefined {
   if (
     !/^https?:\/\//i.test(decoded) ||
     /[\s\\<>"']/.test(decoded) ||
@@ -389,13 +428,14 @@ function citationUrl(value: string): string | undefined {
 
 /**
  * Converts HTML to plain text with paragraphs, table boundaries, and safe
- * citation URLs: an anchor's destination follows its text as `(url)`, and a
- * literal `<scheme://…>` span is text rendered `(url)` in its place. A single
- * source newline folds to a space, as HTML renders it, or with `sourceBreaks`
- * `'keep'` stays a line break; blank-line paragraphs survive either way. Text,
- * href, and span entities decode once, after tag recognition, so encoded markup
- * stays data. Tags stop at the next angle bracket; attribute scans and comment
- * stripping make bounded progress on malformed openers.
+ * citation URLs: an anchor's destination follows its text as `(url)`, a path
+ * resolved on the museum's site, and a literal `<scheme://…>` span is text
+ * rendered `(url)` in its place. A single source newline folds to a space, as
+ * HTML renders it, or with `sourceBreaks` `'keep'` stays a line break; blank-line
+ * paragraphs survive either way. Text, href, and span entities decode once,
+ * after tag recognition, so encoded markup stays data. Tags stop at the next
+ * angle bracket; attribute scans and comment stripping make bounded progress on
+ * malformed openers.
  */
 export function htmlToText(html: string, sourceBreaks: 'fold' | 'keep' = 'fold'): string {
   const singleBreak = sourceBreaks === 'keep' ? '\n' : ' ';
@@ -412,7 +452,7 @@ export function htmlToText(html: string, sourceBreaks: 'fold' | 'keep' = 'fold')
     const name = match[1]?.toLowerCase();
     const closing = tag[1] === '/';
     if (!closing && tag.startsWith('://', 1 + (name?.length ?? 0))) {
-      const url = citationUrl(tag.slice(1, -1));
+      const url = citationUrl(decodeEntities(tag.slice(1, -1)));
       if (url !== undefined) parts.push(`(${url})`);
     } else if (name === 'a') {
       if (closing) {
@@ -485,6 +525,9 @@ export function printableUrl(url: string): string {
 
 // --- Constructed URLs --------------------------------------------------------
 
+/** The museum's public site: artwork pages, and the base of the paths its catalog text links to. */
+const WEB_ORIGIN = 'https://www.artic.edu';
+
 export const FALLBACK_IIIF_URL = 'https://www.artic.edu/iiif/2';
 export const API_BASE_URL = 'https://api.artic.edu/api/v1';
 
@@ -520,7 +563,7 @@ export function iiifImageId(value: unknown): string | undefined {
 
 /** The artwork's public page (301s to the slugged URL). */
 export function artworkWebUrl(id: number): string {
-  return `https://www.artic.edu/artworks/${id}`;
+  return `${WEB_ORIGIN}/artworks/${id}`;
 }
 
 /** IIIF manifest URL; the museum publishes manifests for public-domain works. */
@@ -829,23 +872,61 @@ export const PAGE_MAX = 100;
 export const WINDOW_NOTICE =
   'Only the first 1,000 matches are reachable; narrow the search with filters to see the rest.';
 
+export interface PageWindow {
+  /** The page's first match, counted from 1 over the whole result. */
+  firstMatch: number;
+  /**
+   * `inside` the window, `crossing` match 1,000 (the page holds only the rows
+   * up to it), or `beyond` it: no row of the page is reachable.
+   */
+  position: 'inside' | 'crossing' | 'beyond';
+  /** The paging the search sends. The API refuses a page that ends past the window, so a crossing page asks for the rows left. */
+  request: { from: number; limit: number } | { limit: number; page: number };
+}
+
+/** Where a page stands against the search window. */
+export function pageWindow(page: number, limit: number): PageWindow {
+  const from = (page - 1) * limit;
+  const firstMatch = from + 1;
+  if (from >= SEARCH_WINDOW) return { firstMatch, position: 'beyond', request: { page, limit } };
+  return from + limit > SEARCH_WINDOW
+    ? { firstMatch, position: 'crossing', request: { from, limit: SEARCH_WINDOW - from } }
+    : { firstMatch, position: 'inside', request: { page, limit } };
+}
+
 export interface PageInfo {
   has_more: boolean;
   next_page?: number;
-  /** True when matches remain but the next page would cross the 1,000-match window. */
+  /** True when matches remain but the next page would start past the 1,000-match window. */
   windowExhausted: boolean;
 }
 
 /**
  * Paging state for a page-based search. `next_page` is present only when more
- * matches exist and the next page stays inside the search window. `limit: 0`
+ * matches exist and the next page starts inside the search window. `limit: 0`
  * (counts only) reports `has_more` whenever anything matched.
  */
 export function pageInfo(total: number, page: number, limit: number): PageInfo {
   if (limit === 0) return { has_more: total > 0, windowExhausted: false };
-  const hasMore = page * limit < total;
+  const hasMore = Math.min(page * limit, SEARCH_WINDOW) < total;
   if (!hasMore) return { has_more: false, windowExhausted: false };
-  return (page + 1) * limit <= SEARCH_WINDOW
-    ? { has_more: true, next_page: page + 1, windowExhausted: false }
-    : { has_more: true, windowExhausted: true };
+  return pageWindow(page + 1, limit).position === 'beyond'
+    ? { has_more: true, windowExhausted: true }
+    : { has_more: true, next_page: page + 1, windowExhausted: false };
+}
+
+/**
+ * What a page says when matches remain past the window: that the window cut it
+ * short, when it did, and that the rest are out of reach. A crossing page that
+ * reaches the last match is short because nothing is left, so it says nothing.
+ */
+export function windowNotices(total: number, page: number, limit: number): string[] {
+  if (!pageInfo(total, page, limit).windowExhausted) return [];
+  const { firstMatch, position } = pageWindow(page, limit);
+  return position === 'crossing'
+    ? [
+        `Page ${page} starts at match ${firstMatch} and holds only the rows that remain inside the first 1,000 matches, so it is shorter than the limit of ${limit}.`,
+        WINDOW_NOTICE,
+      ]
+    : [WINDOW_NOTICE];
 }

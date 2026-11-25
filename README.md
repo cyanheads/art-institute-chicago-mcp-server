@@ -36,7 +36,7 @@ The Art Institute of Chicago's collection: about 133,000 artworks, plus artists,
 | Tool | Description |
 |:---|:---|
 | `artic_search_artworks` | Search artworks by text and filters, with facet counts and date or acquisition-year sorting |
-| `artic_get_artworks` | Fetch full records for up to 100 artworks: description, provenance, histories, image URLs with rights status, related media |
+| `artic_get_artworks` | Fetch full records for up to 100 artworks: description, provenance, histories, image URLs with rights status, related media, links to scholarly catalogue entries |
 | `artic_search_artists` | Find artists, cultures, and organizations by name or id, with available Getty ULAN identifiers, life dates, artwork counts, and sample works |
 | `artic_search_exhibitions` | Search past, current, and upcoming exhibitions by text, date, artwork id, or artist id |
 | `artic_search_audio_guide` | Search audio-guide stops by text: title, MP3 URL, and transcript |
@@ -60,11 +60,11 @@ The server serves it over MCP as `skill://art-institute-chicago-guide/SKILL.md`;
 
 ## Capability reference
 
-Searches and vocabulary lookup accept limits up to 1,000, and the response states the cap actually applied: 100 rows for artworks, artists, exhibitions, and the audio guide, and 1,000 values for vocabulary. Defaults are 10 rows (audio guide 2, vocabulary 25). Keep the same requested limit when following `next_page`; page times applied size must stay within 1,000. At the vocabulary cap, narrow with `contains`.
+Searches and vocabulary lookup accept limits up to 1,000, and the response states the cap actually applied: 100 rows for artworks, artists, exhibitions, and the audio guide, and 1,000 values for vocabulary. Defaults are 10 rows (audio guide 2, vocabulary 25). Keep the same requested limit when following `next_page`; a page must start within the first 1,000 matches, and the one that crosses match 1,000 returns the rows up to it. At the vocabulary cap, narrow with `contains`.
 
 ### `artic_search_artworks` <sub>tool</sub>
 
-- `query` (every word must match, except common English words such as the and of, which are ignored; `"exact phrase"`, `-exclude`, and `a | b` work) plus filters `artist`, `artist_id`, `department`, `artwork_type`, `style`, `subject`, `classification`, `material`, `technique`, `theme`, `place_of_origin`, `gallery`, `year_from` / `year_to` (date-span overlap, negative for BCE), `acquired_from` / `acquired_to` (fiscal year of acquisition, inclusive; works with no recorded year never match), `public_domain_only`, `on_view_only`, and `has_image`, combined with AND
+- `query` (every word must match, except common English words such as the and of, which are ignored; `"exact phrase"`, `-exclude`, and `a | b` work) plus filters `artist`, `artist_id`, `department`, `artwork_type`, `style`, `subject`, `classification`, `material`, `technique`, `theme`, `place_of_origin`, `gallery`, `year_from` / `year_to` (date-span overlap, negative for BCE), `acquired_from` / `acquired_to` (fiscal year of acquisition, inclusive; works with no recorded year never match), `provenance` (`recorded` or `unrecorded`: whether the record carries provenance text, not whether the provenance is complete), `public_domain_only`, `on_view_only`, and `has_image`, combined with AND
 - Up to 100 rows per page (default 10), within the first 1,000 matches; rows carry `main_reference_number` and, when recorded, `acquisition_fiscal_year`. `sort` is `relevance`, `date_asc`, `date_desc`, `acquired_desc` (recent acquisitions first), or `acquired_asc`; works missing the sorted field come last, and `sort_applied` reports `popularity` when relevance had no query text
 - `facets` adds the top 15 values for any of 11 fields (the ten vocabularies and `artist`; `artist` counts every credited artist and rows carry `artist_id`); `limit: 0` returns counts only
 
@@ -72,9 +72,9 @@ Searches and vocabulary lookup accept limits up to 1,000, and the response state
 
 ### `artic_get_artworks` <sub>tool</sub>
 
-- `ids` takes up to 1,000 entries (comma strings up to 100,000 characters); blanks and duplicates are dropped and artwork page URLs are read as ids. The first 100 are fetched; `sections` chooses from description and provenance (default), exhibition_history, publication_history, and catalogue, and is the size lever: every section on 100 well-documented works comes to about 1.4 MB
+- `ids` takes up to 1,000 entries (comma strings up to 100,000 characters); blanks and duplicates are dropped and artwork page URLs are read as ids. The first 100 are fetched; `sections` chooses from description and provenance (default), exhibition_history, publication_history, and catalogue, and is the size lever: every section on 100 well-documented works comes to about 1.5 MB
 - Records return whole, in request order. `missing_ids` lists ids the museum doesn't have; `deferred_ids` lists ids past the first 100, to pass to the same tool again
-- `include_related_media` (default on) loads up to 100 linked lectures and audio stops; `description_attribution` appears whenever CC BY description text is returned
+- `include_related_media` (default on) loads up to 100 each of the linked sound recordings (lectures, audio stops), text documents, and publication sections (links to the museum's online scholarly catalogue entries), in one extra request per kind linked; `description_attribution` appears whenever CC BY description text is returned, and `publication_license_text` with `publication_citation` whenever a record carries `publication_sections`
 
 ---
 
@@ -112,7 +112,7 @@ Searches and vocabulary lookup accept limits up to 1,000, and the response state
 
 ### `artic://artworks/{id}` <sub>resource</sub>
 
-- `{ artwork, license_text, description_attribution?, notice? }` as `application/json`, where `artwork` is the `artic_get_artworks` record with its default sections and related media
+- `{ artwork, license_text, description_attribution?, publication_license_text?, publication_citation?, notice? }` as `application/json`, where `artwork` is the `artic_get_artworks` record with its default sections, related media, and publication sections
 - An unknown id fails as `artwork_not_found`; ids come from `artic_search_artworks`
 
 ## Features
@@ -128,8 +128,8 @@ Art Institute-specific:
 
 Agent-friendly output:
 
-- Rights travel with the data: `image.rights` (`public_domain` / `in_copyright`) on every image, with the 1686 px URL only where reuse is allowed; the API's `license_text` verbatim; `description_attribution` when CC BY text is returned; `source_citation` on audio-guide results
-- Partial results instead of failures: `artic_get_artworks` reports `missing_ids` and `deferred_ids`, and when a secondary lookup (related media, artist counts) fails, the primary records still return with a `notice` naming what is missing
+- Rights travel with the data: `image.rights` (`public_domain` / `in_copyright`) on every image, with the 1686 px URL only where reuse is allowed; the API's `license_text` verbatim; `description_attribution` when CC BY text is returned; `source_citation` on audio-guide results; `publication_license_text` and `publication_citation` with publication sections
+- Partial results instead of failures: `artic_get_artworks` reports `missing_ids` and `deferred_ids`, and when a secondary lookup (related media, publication sections, artist counts) fails, the primary records still return with a `notice` naming what is missing
 - Paging that names the next move: `totalCount`, `has_more`, `next_page`, and a `notice` for the next page, the 1,000-match ceiling, or the filter to loosen after zero hits
 
 ## Data and licensing
@@ -138,9 +138,10 @@ The Art Institute of Chicago licenses its API data by surface, and the server pa
 
 | Content | Terms |
 |:---|:---|
-| Artwork metadata, artists, exhibitions, vocabulary terms, related media | CC0 |
+| Artwork metadata, artists, exhibitions, vocabulary terms, related media titles and links | CC0; a linked file can carry other rights |
 | Artwork `description` text | CC BY 4.0: credit the Art Institute of Chicago and cite the record's `web_url` |
 | Artwork images | Reusable only for public-domain works (`image.rights: "public_domain"`, CC0); other images need a rights check |
+| Publication sections (scholarly catalogue entries) | Noncommercial educational and personal use, with copyright notices kept and the source cited |
 | Audio-guide content | Noncommercial educational and personal use, with copyright notices kept and the source cited |
 
 This server is an independent project and is not affiliated with or endorsed by the Art Institute of Chicago.
@@ -149,7 +150,7 @@ This server is an independent project and is not affiliated with or endorsed by 
 
 - Only the first 1,000 matches of any search are reachable without an authenticated key. Broad questions need filters or facets.
 - The API's limit of 60 requests a minute is per egress IP, so every client behind one IP shares it. A call that cannot start within its 20-second budget fails as `rate_limited`.
-- Curatorial text is sparse: about 10% of artworks have a `description`, and in a general sample 94% lack provenance. About 1% of artists have a biography, and there is no nationality field, only `artist_display` prose.
+- Curatorial text is sparse: about 10% of artworks have a `description`, and about 73% carry no provenance text (97,960 of 133,375, 2026-11-24). About 1% of artists have a biography, and there is no nationality field, only `artist_display` prose.
 - About 15 artworks carry placeholder years and about 4,900 carry no dates; neither matches a year filter.
 - About a third of artworks (47,677 of 133,165, 2026-11-03) have no recorded acquisition fiscal year; they never match `acquired_from` / `acquired_to` and sort last by acquisition year.
 - Some vocabulary titles are stored cut at 40 characters in the museum's data (`gelatin silver (developing-out-paper) pr`). Pass values as `artic_lookup_vocabulary` lists them.
@@ -210,7 +211,7 @@ See [`.env.example`](./.env.example) for every server setting and the common fra
 
 ### Local development
 
-Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+Requires [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 
 - **Clone and install:**
 

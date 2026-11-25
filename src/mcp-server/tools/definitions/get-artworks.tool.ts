@@ -1,7 +1,7 @@
 /**
  * @fileoverview `artic_get_artworks` — full records for up to 100 artworks by
  * id in one call: curatorial text, provenance, histories, categorization,
- * image URLs with rights status, and related multimedia.
+ * image URLs with rights status, related multimedia, and publication links.
  * @module mcp-server/tools/definitions/get-artworks.tool
  */
 
@@ -11,6 +11,7 @@ import { markdownImage } from '@cyanheads/mcp-ts-core/utils';
 import {
   artworkIdItem,
   blankAsUnset,
+  booleanInput,
   idListInput,
   inlineSafe,
   listInput,
@@ -112,13 +113,32 @@ const ArtworkRecordSchema = z
             id: z.string().describe('Multimedia asset id (uuid).'),
             title: z.string().describe('Asset title; empty when the museum lists none.'),
             url: z.string().describe('Asset URL on artic.edu.'),
-            type: z.string().optional().describe('Asset type, such as sound.'),
+            type: z.string().optional().describe('Asset type, such as sound or text.'),
           })
           .describe('One related multimedia asset.'),
       )
       .optional()
       .describe(
-        'Related multimedia (lectures, audio stops) from the museum; present when requested and at least one linked item loaded, never an empty list.',
+        'Related multimedia from the museum, sound recordings (lectures, audio stops) before text documents; present when requested and at least one linked item loaded, never an empty list.',
+      ),
+    publication_sections: z
+      .array(
+        z
+          .object({
+            id: z
+              .number()
+              .describe('Section id; no tool takes it. The section itself is the page at web_url.'),
+            title: z.string().describe('Section title; empty when the museum lists none.'),
+            publication_title: z
+              .string()
+              .describe('Publication the section is part of; empty when the museum lists none.'),
+            web_url: z.string().describe('Public page of the section.'),
+          })
+          .describe('One publication section.'),
+      )
+      .optional()
+      .describe(
+        "Links to the museum's publications on the work, chiefly its online scholarly catalogue entries. Not CC0: publication_license_text governs the sections. Present when related media was requested and at least one linked section loaded, never an empty list.",
       ),
   })
   .describe('One full artwork record.');
@@ -186,12 +206,20 @@ function recordLines(artwork: ArtworkRecord): string[] {
       );
     }
   }
+  if (artwork.publication_sections && artwork.publication_sections.length > 0) {
+    lines.push('', '### Publication sections');
+    for (const section of artwork.publication_sections) {
+      lines.push(
+        `- ${titleText(section.title)} · in ${titleText(section.publication_title)} · ${printableUrl(section.web_url)} · id ${section.id}`,
+      );
+    }
+  }
   return lines;
 }
 
 export const getArtworks = tool('artic_get_artworks', {
   title: 'Get artworks',
-  description: `Fetch full Art Institute of Chicago records for up to ${MAX_ARTWORK_IDS} artworks by id in one call, returning deferred_ids for the rest: description, provenance, exhibition and publication history, dimensions, inscriptions, credit line, categorization, gallery, image URLs with rights status, and related multimedia. The long text sections are opt-in through sections; request the sections and ids your client can take, since every section on ${MAX_ARTWORK_IDS} well-documented works comes to about 1.4 MB. Ids come from artic_search_artworks, artic_search_exhibitions, or artic_search_artists.`,
+  description: `Fetch full Art Institute of Chicago records for up to ${MAX_ARTWORK_IDS} artworks by id in one call, returning deferred_ids for the rest: description, provenance, exhibition and publication history, dimensions, inscriptions, credit line, categorization, gallery, image URLs with rights status, related multimedia, and links to the museum's online scholarly catalogue entries on the work (noncommercial terms returned with them). The long text sections are opt-in through sections; request the sections and ids your client can take, since every section on ${MAX_ARTWORK_IDS} well-documented works comes to about 1.5 MB. Ids come from artic_search_artworks, artic_search_exhibitions, or artic_search_artists.`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     ids: idListInput(z.array(z.number().int().positive()).min(1).max(1000), artworkIdItem).describe(
@@ -208,8 +236,8 @@ export const getArtworks = tool('artic_get_artworks', {
     ).describe(
       'Heavy text sections to include: description (also short_description), provenance, exhibition_history, publication_history, catalogue. Defaults to description and provenance; pass an empty array for none.',
     ),
-    include_related_media: blankAsUnset(z.boolean().default(true)).describe(
-      `Load related multimedia (lectures, audio stops) for the records, up to ${MAX_RELATED_MEDIA} items per call.`,
+    include_related_media: booleanInput(z.boolean().default(true)).describe(
+      `Load what the records link to: sound recordings (lectures, audio stops) and text documents as related_media, and publication_sections. Up to ${MAX_RELATED_MEDIA} of each kind per call, one extra request per kind linked.`,
     ),
   }),
   output: z.object({
@@ -226,18 +254,34 @@ export const getArtworks = tool('artic_get_artworks', {
       .describe(
         `Unattempted ids beyond the first ${MAX_ARTWORK_IDS}, in request order; pass them to artic_get_artworks again.`,
       ),
-    license_text: z.string().describe('License statement from the API for this data, verbatim.'),
+    license_text: z
+      .string()
+      .describe(
+        'License statement from the API for the artwork records, verbatim; it does not cover publication_sections.',
+      ),
     description_attribution: z
       .string()
       .optional()
       .describe('Attribution owed for description text (CC BY 4.0); present when any is returned.'),
+    publication_license_text: z
+      .string()
+      .optional()
+      .describe(
+        'License statement from the API for publication_sections, verbatim: noncommercial educational and personal use, with notices retained and the source cited. Present when any record carries publication_sections.',
+      ),
+    publication_citation: z
+      .string()
+      .optional()
+      .describe(
+        'Citation to keep with any use of publication_sections; present with publication_license_text.',
+      ),
   }),
   enrichment: {
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when ids are missing or deferred, or related media was capped or could not load.',
+        'Guidance when ids are missing or deferred, or when linked sound recordings, publication sections, or text documents were capped or could not load.',
       ),
   },
   errors: [
@@ -296,6 +340,16 @@ export const getArtworks = tool('artic_get_artworks', {
       lines.push(`**Description attribution:** ${result.description_attribution}`);
     }
     lines.push('', '## License', quoteBlock(result.license_text));
+    if (result.publication_license_text !== undefined) {
+      lines.push(
+        '',
+        '## License for publication sections',
+        quoteBlock(result.publication_license_text),
+      );
+    }
+    if (result.publication_citation) {
+      lines.push('', `**Publication citation:** ${result.publication_citation}`);
+    }
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

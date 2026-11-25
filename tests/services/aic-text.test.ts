@@ -5,12 +5,14 @@
  * @module tests/services/aic-text.test
  */
 
-import { z } from '@cyanheads/mcp-ts-core';
+import { tool, z } from '@cyanheads/mcp-ts-core';
+import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it } from 'vitest';
 import {
   artworkIdItem,
   artworkWebUrl,
   blankAsUnset,
+  booleanInput,
   buildImage,
   containsPattern,
   definedOnly,
@@ -30,8 +32,10 @@ import {
   listInput,
   manifestUrl,
   nonEmpty,
+  numberInput,
   numericIdItem,
   pageInfo,
+  pageWindow,
   plausibleYear,
   printableUrl,
   quoteBlock,
@@ -43,6 +47,7 @@ import {
   vocabularyFilterClause,
   vocabularyInput,
   WINDOW_NOTICE,
+  windowNotices,
   withoutStopWords,
 } from '@/services/aic/aic-text.js';
 import { markdownHtml, markdownText } from '../fixtures/markdown.js';
@@ -129,6 +134,206 @@ describe('blankAsUnset', () => {
 
   it('still enforces the wrapped schema on populated input', () => {
     expect(optionalText.safeParse('toolong').success).toBe(false);
+  });
+});
+
+/** Strings that spell a number, beside the number. */
+const SPELLED_NUMBERS = [
+  ['5', 5],
+  ['-500', -500],
+  ['2.5', 2.5],
+  ['0', 0],
+  [' 5 ', 5],
+  ['\t7\n', 7],
+  ['9007199254740991', 9007199254740991],
+  // The form `String` itself gives a number this large.
+  ['1e+21', 1e21],
+] as const;
+
+/** Strings that spell a boolean, beside the boolean. */
+const SPELLED_BOOLEANS = [
+  ['true', true],
+  ['false', false],
+  [' true ', true],
+  ['\tfalse\n', false],
+] as const;
+
+/** Strings that spell neither. */
+const SPELL_NEITHER = [
+  'abc',
+  '05',
+  '+5',
+  '5.0',
+  '2.50',
+  '.5',
+  '5.',
+  '1e3',
+  '1e21',
+  '0x10',
+  '0b1',
+  '-0',
+  '- 5',
+  '1,000',
+  '1_000',
+  '5n',
+  '5 6',
+  'Infinity',
+  '-Infinity',
+  'NaN',
+  '9007199254740993',
+  chars(0xff15),
+  'TRUE',
+  'True',
+  'yes',
+  'on',
+  't r u e',
+  'null',
+  'undefined',
+  '[5]',
+  '{}',
+  '"5"',
+  '"true"',
+];
+
+/** The issues a schema raises for a value; empty when it accepts. */
+const issuesOf = (schema: z.ZodType, value: unknown) => schema.safeParse(value).error?.issues ?? [];
+
+describe('numberInput', () => {
+  const number = numberInput(z.number().optional());
+
+  it.each(SPELLED_NUMBERS)('reads %j as %d', (text, expected) => {
+    expect(number.parse(text)).toBe(expected);
+  });
+
+  it.each([...SPELL_NEITHER, 'true', 'false'])('leaves %j to the schema', (text) => {
+    expect(issuesOf(number, text)).toEqual([
+      {
+        code: 'invalid_type',
+        expected: 'number',
+        path: [],
+        message: 'Invalid input: expected number, received string',
+      },
+    ]);
+  });
+
+  it.each([null, true, false, [], [5], ['5'], {}, Number.NaN, Number.POSITIVE_INFINITY])(
+    'leaves the non-string %j to the schema',
+    (value) => {
+      expect(issuesOf(number, value)).toHaveLength(1);
+      expect(issuesOf(number, value)).toEqual(issuesOf(z.number().optional(), value));
+    },
+  );
+
+  it.each(['', ' ', '\t\n'])('reads blank %j as unset, taking the default', (blank) => {
+    expect(number.parse(blank)).toBeUndefined();
+    expect(numberInput(z.number().int().default(10)).parse(blank)).toBe(10);
+  });
+
+  it('passes a number through, zero included', () => {
+    expect(number.parse(7)).toBe(7);
+    expect(number.parse(0)).toBe(0);
+    expect(number.parse(undefined)).toBeUndefined();
+  });
+
+  it.each([
+    ['2.5', z.number().int(), 'Invalid input: expected int, received number'],
+    ['9007199254740992', z.number().int(), 'Too big: expected int to be <=9007199254740991'],
+    ['0', z.number().int().positive(), 'Too small: expected number to be >0'],
+    ['1001', z.number().int().max(1000), 'Too big: expected number to be <=1000'],
+    ['-8001', z.number().int().min(-8000), 'Too small: expected number to be >=-8000'],
+  ])('holds %j to the check its number fails', (text, schema, message) => {
+    expect(issuesOf(numberInput(schema), text)).toMatchObject([{ message }]);
+    expect(issuesOf(numberInput(schema), text)).toEqual(issuesOf(schema, Number(text)));
+  });
+
+  it('is a type error around a string schema, whose digits are text', () => {
+    // @ts-expect-error only a schema that outputs a number is accepted
+    expect(numberInput(z.string().optional()).safeParse('5').success).toBe(false);
+  });
+
+  it.each([
+    ['digits', (n: number) => '1'.repeat(n)],
+    ['hex digits', (n: number) => `0x${'f'.repeat(n)}`],
+    ['exponent digits', (n: number) => `1e${'9'.repeat(n)}`],
+    ['a fraction', (n: number) => `0.${'0'.repeat(n)}1`],
+    ['edge whitespace', (n: number) => `${' '.repeat(n)}5 ${' '.repeat(n)}`],
+    ['inner whitespace', (n: number) => `5${' '.repeat(n)}5`],
+  ])('reads %s in linear time', (_name, make) => {
+    expectLinearTime(make, (text) => number.safeParse(text));
+  });
+});
+
+describe('booleanInput', () => {
+  const boolean = booleanInput(z.boolean().optional());
+
+  it.each(SPELLED_BOOLEANS)('reads %j as %s', (text, expected) => {
+    expect(boolean.parse(text)).toBe(expected);
+  });
+
+  it.each([...SPELL_NEITHER, '1', '0', '5'])('leaves %j to the schema', (text) => {
+    expect(issuesOf(boolean, text)).toEqual([
+      {
+        code: 'invalid_type',
+        expected: 'boolean',
+        path: [],
+        message: 'Invalid input: expected boolean, received string',
+      },
+    ]);
+  });
+
+  it.each([null, 1, 0, [], [true], {}])('leaves the non-string %j to the schema', (value) => {
+    expect(issuesOf(boolean, value)).toHaveLength(1);
+    expect(issuesOf(boolean, value)).toEqual(issuesOf(z.boolean().optional(), value));
+  });
+
+  it.each(['', ' ', '\t\n'])('reads blank %j as unset, taking the default', (blank) => {
+    expect(boolean.parse(blank)).toBeUndefined();
+    expect(booleanInput(z.boolean().default(true)).parse(blank)).toBe(true);
+  });
+
+  it('passes a boolean through, false included', () => {
+    expect(boolean.parse(true)).toBe(true);
+    expect(boolean.parse(false)).toBe(false);
+    expect(boolean.parse(undefined)).toBeUndefined();
+  });
+
+  it('is a type error around a string schema, whose "true" is text', () => {
+    // @ts-expect-error only a schema that outputs a boolean is accepted
+    expect(booleanInput(z.string().optional()).safeParse('true').success).toBe(false);
+  });
+});
+
+describe('numberInput and booleanInput beside the framework repair', () => {
+  /** A tool with each input as the server declares it and as the framework reads it unwrapped. */
+  const probe = tool('spelling_probe', {
+    description: 'Echoes the value of one input.',
+    input: z.object({
+      number: numberInput(z.number().optional()).describe('Wrapped number.'),
+      bare_number: z.number().optional().describe('Unwrapped number.'),
+      boolean: booleanInput(z.boolean().optional()).describe('Wrapped boolean.'),
+      bare_boolean: z.boolean().optional().describe('Unwrapped boolean.'),
+    }),
+    output: z.object({
+      value: z.union([z.number(), z.boolean()]).optional().describe('The value read.'),
+    }),
+    handler: (input) => ({
+      value: input.number ?? input.bare_number ?? input.boolean ?? input.bare_boolean,
+    }),
+    format: (result) => [{ type: 'text', text: String(result.value) }],
+  });
+
+  it.each([
+    ...SPELLED_NUMBERS.map(([text]) => text),
+    ...SPELLED_BOOLEANS.map(([text]) => text),
+    ...SPELL_NEITHER,
+    '1',
+  ])('reads %j as the framework reads it on an unwrapped field', async (text) => {
+    for (const kind of ['number', 'boolean'] as const) {
+      const wrapped = await runToolContract(probe, { [kind]: text });
+      const bare = await runToolContract(probe, { [`bare_${kind}`]: text });
+      expect(wrapped.isError).toBe(bare.isError);
+      if (!wrapped.isError) expect(wrapped.structuredContent).toEqual(bare.structuredContent);
+    }
   });
 });
 
@@ -529,7 +734,7 @@ describe('htmlToText', () => {
     'javascript:alert(1)',
     'data:text/html,x',
     '//x.test/a',
-    '/relative',
+    'relative',
     'https://',
     'https:x',
     'https://x.test/&#10;evil',
@@ -545,6 +750,95 @@ describe('htmlToText', () => {
       }
     },
   );
+
+  it.each([
+    ['/relative', 'https://www.artic.edu/relative'],
+    ['/artists/36022', 'https://www.artic.edu/artists/36022'],
+    [
+      '/exhibitions/2722/hairy-who-19661969',
+      'https://www.artic.edu/exhibitions/2722/hairy-who-19661969',
+    ],
+    ['/search?q=a&amp;amp;b&amp;page=2#top', 'https://www.artic.edu/search?q=a&amp;b&page=2#top'],
+    ['&#47;artists&#x2F;36022', 'https://www.artic.edu/artists/36022'],
+    ['/café', 'https://www.artic.edu/café'],
+    ['/a//b', 'https://www.artic.edu/a//b'],
+    ['/', 'https://www.artic.edu/'],
+    // Read as a host or a user name anywhere but after the fixed origin.
+    ['/@x.test/a', 'https://www.artic.edu/@x.test/a'],
+    ['/:80@x.test/a', 'https://www.artic.edu/:80@x.test/a'],
+    ['/.x.test/a', 'https://www.artic.edu/.x.test/a'],
+    ['/..//x.test/a', 'https://www.artic.edu/..//x.test/a'],
+    ['/%5Cx.test/a', 'https://www.artic.edu/%5Cx.test/a'],
+    ['/%2F%2Fx.test/a', 'https://www.artic.edu/%2F%2Fx.test/a'],
+    ['/https://x.test/a', 'https://www.artic.edu/https://x.test/a'],
+  ])('resolves the anchor path %s on the museum site', (href, url) => {
+    expect(htmlToText(`<a href="${href}"><b>Visible</b></a>`)).toBe(`Visible (${url})`);
+    expect(new URL(url).host).toBe('www.artic.edu');
+    expect(new URL(url).username).toBe('');
+  });
+
+  it('resolves an unquoted or single-quoted anchor path beside an absolute link', () => {
+    expect(
+      htmlToText(
+        `<a href=/artists/1>One</a>, <a class='x' HREF='/artists/2' target="_blank">Two</a>, <a href="https://x.test/3">Three</a>`,
+      ),
+    ).toBe(
+      'One (https://www.artic.edu/artists/1), Two (https://www.artic.edu/artists/2), Three (https://x.test/3)',
+    );
+  });
+
+  it.each([
+    ['a scheme-relative URL', '//x.test/a'],
+    ['a scheme-relative URL on the museum host', '//www.artic.edu/artists/1'],
+    ['three slashes', '///x.test/a'],
+    ['an entity slash ahead of a slash', '&#47;/x.test/a'],
+    ['a slash ahead of an entity slash', '/&#47;x.test/a'],
+    ['two hex entity slashes', '&#x2f;&#x2F;x.test/a'],
+    ['a slash and a backslash', '/\\x.test/a'],
+    ['a backslash and a slash', '\\/x.test/a'],
+    ['a slash and an entity backslash', '/&#92;x.test/a'],
+    ['a backslash later in the path', '/a\\b'],
+    ['a tab after the slash', '/\t/x.test/a'],
+    ['an entity tab after the slash', '/&#9;/x.test/a'],
+    ['a line break after the slash', '/\n/x.test/a'],
+    ['an entity line break after the slash', '/&#10;/x.test/a'],
+    ['an entity carriage return after the slash', '/&#13;/x.test/a'],
+    ['a no-break space', '/a&#160;b'],
+    ['a space', '/with space'],
+    ['a leading space', ' /artists/1'],
+    ['a single quote', "/a'b"],
+    ['an entity double quote', '/a&quot;b'],
+    ['encoded angle brackets', '/a&lt;b&gt;'],
+    ['a bidi control', '/a&#x202e;b'],
+    ['a zero-width space', '/a&#x200b;b'],
+    ['a C1 control', '/a&#x9f;b'],
+    ['a tag character', '/a&#xe0041;b'],
+    ['no leading slash', 'artists/1'],
+    ['a bare host', 'www.artic.edu/artists/1'],
+    ['a dot segment', './artists/1'],
+    ['a parent segment', '../artists/1'],
+    ['a fragment', '#bio'],
+    ['a query', '?page=2'],
+    ['a mailto link', 'mailto:a@x.test'],
+    ['a javascript link', 'javascript:/artists/1'],
+    ['a mixed-case javascript link', 'JavaScript:alert(1)'],
+    ['a data link', 'data:text/html,/artists/1'],
+    ['another scheme', 'ftp://x.test/a'],
+    ['an empty href', ''],
+  ])('drops an anchor href that is %s but keeps its text', (_name, href) => {
+    expect(htmlToText(`<a href="${href}"><b>Visible</b></a>`)).toBe('Visible');
+  });
+
+  it.each([
+    ['another attribute', '<a data-href="/artists/1">Visible</a>'],
+    ['a closing anchor', '<a>Visible</a href="/artists/1">'],
+    ['an image', 'Visible<img src="/iiif/2/x">'],
+    ['a tag that is not an anchor', '<area href="/artists/1"><link href="/artists/2">Visible'],
+    ['a literal span with an empty host', 'Visible <a:///artists/1>'],
+    ['a literal path span', 'Visible </artists/1>'],
+  ])('resolves no path from %s', (_name, html) => {
+    expect(htmlToText(html)).toBe('Visible');
+  });
 
   it('keeps an angle-bracket URL as a citation in place of the span', () => {
     expect(
@@ -762,6 +1056,23 @@ describe('htmlToText', () => {
       expect(largeMs).toBeLessThan(1000);
       expect(largeMs / smallMs).toBeLessThan(256);
     });
+  });
+
+  /** Linear-time bounds from `expectLinearTime`, at doubling sizes. */
+  it.each([
+    ['path anchors throughout', (n: number) => '<a href="/artists/36022">x</a>'.repeat(n / 30)],
+    [
+      'nested path anchors',
+      (n: number) =>
+        `${'<a href="/artists/1">'.repeat(n / 21)}label${'</a>'.repeat(Math.floor(n / 21))}`,
+    ],
+    ['a path the length of the text', (n: number) => `<a href="/${'a'.repeat(n)}">x</a>`],
+    ['a slash run the length of the text', (n: number) => `<a href="${'/'.repeat(n)}">x</a>`],
+    ['a path of entity slashes', (n: number) => `<a href="/${'&#47;'.repeat(n / 5)}">x</a>`],
+    ['a path of parent segments', (n: number) => `<a href="/${'../'.repeat(n / 3)}">x</a>`],
+    ['a path ending in an unsafe character', (n: number) => `<a href="/${'a'.repeat(n)}\\">x</a>`],
+  ])('converts %s in linear time', (_name, make) => {
+    expectLinearTime(make, htmlToText);
   });
 
   /** Linear-time bounds from `expectLinearTime`, at doubling sizes. */
@@ -1855,7 +2166,7 @@ describe('pageInfo', () => {
     });
   });
 
-  it('flags the window as exhausted when the next page would cross it', () => {
+  it('flags the window as exhausted when the next page would start past it', () => {
     const info = pageInfo(5000, 10, 100);
     expect(info).toEqual({ has_more: true, windowExhausted: true });
     expect(info).not.toHaveProperty('next_page');
@@ -1889,6 +2200,107 @@ describe('pageInfo', () => {
 
   it('exposes the window constants', () => {
     expect(SEARCH_WINDOW).toBe(1000);
-    expect(WINDOW_NOTICE).toContain('1,000');
+    expect(WINDOW_NOTICE).toBe(
+      'Only the first 1,000 matches are reachable; narrow the search with filters to see the rest.',
+    );
+  });
+
+  const NO_MORE = { has_more: false, windowExhausted: false };
+  const EXHAUSTED = { has_more: true, windowExhausted: true };
+  const nextPage = (next_page: number) => ({ has_more: true, next_page, windowExhausted: false });
+
+  it.each([
+    // limit 12: page 83 ends at match 996, page 84 crosses 1,000, page 85 starts past it.
+    [995, 83, 12, NO_MORE],
+    [995, 84, 12, NO_MORE],
+    [995, 85, 12, NO_MORE],
+    [996, 83, 12, NO_MORE],
+    [996, 84, 12, NO_MORE],
+    [996, 85, 12, NO_MORE],
+    [998, 83, 12, nextPage(84)],
+    [998, 84, 12, NO_MORE],
+    [998, 85, 12, NO_MORE],
+    [1000, 83, 12, nextPage(84)],
+    [1000, 84, 12, NO_MORE],
+    [1000, 85, 12, NO_MORE],
+    [1001, 83, 12, nextPage(84)],
+    [1001, 84, 12, EXHAUSTED],
+    [1001, 85, 12, EXHAUSTED],
+    [1005, 83, 12, nextPage(84)],
+    [1005, 84, 12, EXHAUSTED],
+    [1005, 85, 12, EXHAUSTED],
+    [133_375, 83, 12, nextPage(84)],
+    [133_375, 84, 12, EXHAUSTED],
+    [133_375, 85, 12, EXHAUSTED],
+    // limits that divide 1,000: no page crosses.
+    [133_375, 99, 10, nextPage(100)],
+    [133_375, 100, 10, EXHAUSTED],
+    [133_375, 101, 10, EXHAUSTED],
+    [1000, 99, 10, nextPage(100)],
+    [1000, 100, 10, NO_MORE],
+    [133_375, 10, 100, EXHAUSTED],
+    [133_375, 11, 100, EXHAUSTED],
+    [1000, 10, 100, NO_MORE],
+    // limit 30: page 33 ends at match 990, page 34 crosses.
+    [133_375, 33, 30, nextPage(34)],
+    [133_375, 34, 30, EXHAUSTED],
+    [990, 33, 30, NO_MORE],
+    [991, 33, 30, nextPage(34)],
+    [991, 34, 30, NO_MORE],
+    // limit 0 counts only.
+    [0, 1, 0, NO_MORE],
+    [133_375, 1, 0, { has_more: true, windowExhausted: false }],
+    [133_375, 1000, 0, { has_more: true, windowExhausted: false }],
+  ])('of %i matches, page %i at limit %i', (total, page, limit, expected) => {
+    expect(pageInfo(total, page, limit)).toEqual(expected);
+  });
+});
+
+describe('pageWindow', () => {
+  it.each([
+    ['the first page', 1, 12, 'inside', 1, { page: 1, limit: 12 }],
+    ['the last whole page', 83, 12, 'inside', 985, { page: 83, limit: 12 }],
+    ['the page that crosses', 84, 12, 'crossing', 997, { from: 996, limit: 4 }],
+    ['the page after it', 85, 12, 'beyond', 1009, { page: 85, limit: 12 }],
+    ['a page that ends on match 1,000', 100, 10, 'inside', 991, { page: 100, limit: 10 }],
+    ['a page that starts on match 1,001', 101, 10, 'beyond', 1001, { page: 101, limit: 10 }],
+    ['a full page that ends on match 1,000', 10, 100, 'inside', 901, { page: 10, limit: 100 }],
+    ['a full page past it', 11, 100, 'beyond', 1001, { page: 11, limit: 100 }],
+    ['limit 30 on its last whole page', 33, 30, 'inside', 961, { page: 33, limit: 30 }],
+    ['limit 30 across the edge', 34, 30, 'crossing', 991, { from: 990, limit: 10 }],
+    ['limit 99 across the edge', 11, 99, 'crossing', 991, { from: 990, limit: 10 }],
+    ['a page whose first match is 1,000', 38, 27, 'crossing', 1000, { from: 999, limit: 1 }],
+    ['one row a page', 1000, 1, 'inside', 1000, { page: 1000, limit: 1 }],
+    ['counts only', 1, 0, 'inside', 1, { page: 1, limit: 0 }],
+    ['counts only on a deep page', 1000, 0, 'inside', 1, { page: 1000, limit: 0 }],
+  ])('places %s', (_name, page, limit, position, firstMatch, request) => {
+    expect(pageWindow(page, limit)).toEqual({ position, firstMatch, request });
+  });
+});
+
+describe('windowNotices', () => {
+  const SHORTENED =
+    'Page 84 starts at match 997 and holds only the rows that remain inside the first 1,000 matches, so it is shorter than the limit of 12.';
+
+  it('says the crossing page was shortened, and what to do when more matches exist', () => {
+    expect(windowNotices(133_375, 84, 12)).toEqual([SHORTENED, WINDOW_NOTICE]);
+    expect(windowNotices(1001, 84, 12)).toEqual([SHORTENED, WINDOW_NOTICE]);
+  });
+
+  it('says nothing on a crossing page that reaches the last match, short only because nothing is left', () => {
+    expect(windowNotices(1000, 84, 12)).toEqual([]);
+    expect(windowNotices(998, 84, 12)).toEqual([]);
+  });
+
+  it('keeps the window wording alone for a whole page that ends the window', () => {
+    expect(windowNotices(5000, 10, 100)).toEqual([WINDOW_NOTICE]);
+    expect(windowNotices(5000, 100, 10)).toEqual([WINDOW_NOTICE]);
+  });
+
+  it('says nothing inside the window', () => {
+    expect(windowNotices(5000, 83, 12)).toEqual([]);
+    expect(windowNotices(1000, 10, 100)).toEqual([]);
+    expect(windowNotices(25, 3, 10)).toEqual([]);
+    expect(windowNotices(5000, 1, 0)).toEqual([]);
   });
 });

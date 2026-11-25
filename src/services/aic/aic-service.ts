@@ -40,6 +40,7 @@ import {
   integerList,
   manifestUrl,
   nonEmpty,
+  pageWindow,
   plausibleYear,
   rankingText,
   stringList,
@@ -61,23 +62,31 @@ import type {
   AudioGuideStop,
   Exhibition,
   FacetName,
+  PublicationSection,
   RawAgent,
   RawAggregation,
   RawArtistFacetHit,
   RawArtwork,
   RawEnvelope,
   RawExhibition,
+  RawMediaAsset,
   RawMobileSound,
-  RawSound,
+  RawSection,
   RawTopHits,
   RelatedMedia,
   SampleWork,
 } from './types.js';
 
-/** Bodies past this are abandoned mid-stream; the largest observed is about 1.33 MB. */
+/** Bodies past this are abandoned mid-stream; the largest observed is about 1.58 MB. */
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
 /** Per-attempt network budget, clipped to what remains of the total deadline. */
 const ATTEMPT_TIMEOUT_MS = 10_000;
+/**
+ * The longest a load of the records an artwork links to waits for a request slot. Below the
+ * deadline a main request waits out, so a full queue drops these loads first; above the pacer's
+ * 10-second cooldown, so one rate limit alone leaves a record at least its first two kinds.
+ */
+const LINKED_LOAD_MAX_WAIT_MS = 12_000;
 /** The longest query string, without the `?`, the API's edge firewall lets a GET carry. */
 const MAX_GET_QUERY_BYTES = 2048;
 
@@ -147,6 +156,8 @@ const ARTWORK_DETAIL_FIELDS = [
   'alt_image_ids',
   'thumbnail',
   'sound_ids',
+  'section_ids',
+  'text_ids',
 ];
 
 /** Upstream fields each opt-in section adds, in canonical section order. */
@@ -166,7 +177,11 @@ const EXHIBITION_FIELDS =
 
 const MOBILE_SOUND_FIELDS = 'id,title,web_url,transcript';
 
-const SOUND_FIELDS = 'id,title,type,content';
+/** `/sounds` and `/texts` assets; `content` is the asset URL. */
+const MEDIA_FIELDS = 'id,title,type,content';
+
+/** Never a section's `content`: HTML of up to 271,554 characters on the longest one measured. */
+const PUBLICATION_SECTION_FIELDS = 'id,title,web_url,publication_title';
 
 const FACET_SIZE = 15;
 
@@ -212,6 +227,8 @@ export interface ArtworkSearchParams {
   on_view_only: boolean;
   page: number;
   place_of_origin?: string | undefined;
+  /** Whether the record carries provenance text (`recorded`) or none (`unrecorded`). */
+  provenance?: 'recorded' | 'unrecorded' | undefined;
   public_domain_only: boolean;
   query?: string | undefined;
   sort: ArtworkSort;
@@ -231,10 +248,15 @@ export interface ArtworkSearchResult {
   total: number;
 }
 
-/** One artwork from the `ids=` batch route, with the sound asset ids it links to. */
+/** One artwork from the `ids=` batch route, with the ids of the records it links to. */
 export interface ArtworkBatchEntry {
   detail: ArtworkDetail;
+  /** `/sections` ids; some pass 2^32. */
+  section_ids: number[];
+  /** `/sounds` uuids. */
   sound_ids: string[];
+  /** `/texts` uuids. */
+  text_ids: string[];
 }
 
 export interface ArtworkBatchResult {
@@ -249,6 +271,19 @@ export interface SoundBatchResult {
   license_text: string;
   /** Found sound assets with a content URL, in request order. */
   sounds: RelatedMedia[];
+}
+
+export interface SectionBatchResult {
+  /** Terms for the sections, which are not CC0. */
+  license_text: string;
+  /** Found publication sections with a web page, in request order. */
+  sections: PublicationSection[];
+}
+
+export interface TextBatchResult {
+  license_text: string;
+  /** Found text assets with a content URL, in request order. */
+  texts: RelatedMedia[];
 }
 
 export interface AgentSearchParams {
@@ -331,6 +366,12 @@ interface FetchedBody {
   text: string;
 }
 
+/** How long one request may take, and how long any attempt of it may queue for a slot. */
+interface TimeLimits {
+  deadlineMs: number;
+  maxWaitMs: number;
+}
+
 export class AicService {
   readonly #cache: ResponseCache;
   readonly #fetch: FetchFn;
@@ -365,12 +406,13 @@ export class AicService {
     const must = params.query ? [simpleQuery(params.query)] : [];
     const fieldSort = params.sort === 'relevance' ? undefined : fieldSortClauses(params.sort);
     const facets = params.facets ?? [];
+    const mustNot = [...(fieldSort?.mustNot ?? [])];
+    if (params.provenance === 'unrecorded') mustNot.push(HAS_PROVENANCE);
     const body = {
       ...(fieldSort ? {} : rankingParam(params.query)),
-      ...boolQuery(must, artworkFilters(params), fieldSort?.mustNot),
+      ...boolQuery(must, artworkFilters(params), mustNot),
       ...(fieldSort ? { sort: fieldSort.sort } : {}),
-      page: params.page,
-      limit: params.limit,
+      ...pageWindow(params.page, params.limit).request,
       fields: ARTWORK_SEARCH_FIELDS,
       ...(facets.length > 0 ? { aggs: facetAggregations(facets) } : {}),
     };
@@ -404,7 +446,9 @@ export class AicService {
     return {
       entries: batch.found.map((raw) => ({
         detail: toArtworkDetail(raw, iiifUrl),
+        section_ids: integerList(raw.section_ids).filter(Number.isSafeInteger),
         sound_ids: stringList(raw.sound_ids),
+        text_ids: stringList(raw.text_ids),
       })),
       license_text: licenseText(batch.envelope),
       missing_ids: batch.missing_ids,
@@ -417,21 +461,42 @@ export class AicService {
    * listing: the firewall's GET limit stops `ids=` at 51 uuids, and a search posts past it.
    */
   async getSounds(ids: readonly string[], ctx: Context): Promise<SoundBatchResult> {
-    const envelope = await this.#search<RawSound>(
+    const { items, license_text } = await this.#searchByIds(
       '/sounds/search',
-      { ...boolQuery([], [{ terms: { id: ids } }]), limit: ids.length, fields: SOUND_FIELDS },
-      TTL_MS.record,
+      ids,
+      MEDIA_FIELDS,
+      toRelatedMedia,
       ctx,
     );
-    const byId = new Map<string, RelatedMedia>();
-    for (const raw of envelope.data ?? []) {
-      const sound = toRelatedMedia(raw);
-      if (sound) byId.set(sound.id, sound);
-    }
-    return {
-      license_text: licenseText(envelope),
-      sounds: ids.flatMap((id) => byId.get(id) ?? []),
-    };
+    return { license_text, sounds: items };
+  }
+
+  /**
+   * Links to `/sections` records (entries of the museum's online scholarly catalogues and its other
+   * publications) for up to 100 ids, reordered to request order; unknown ids and sections without
+   * a web page are dropped.
+   */
+  async getSections(ids: readonly number[], ctx: Context): Promise<SectionBatchResult> {
+    const { items, license_text } = await this.#searchByIds(
+      '/sections/search',
+      ids,
+      PUBLICATION_SECTION_FIELDS,
+      toPublicationSection,
+      ctx,
+    );
+    return { license_text, sections: items };
+  }
+
+  /** `/texts` assets (text documents) for up to 100 uuids, reordered to request order; unknown uuids are dropped. */
+  async getTexts(ids: readonly string[], ctx: Context): Promise<TextBatchResult> {
+    const { items, license_text } = await this.#searchByIds(
+      '/texts/search',
+      ids,
+      MEDIA_FIELDS,
+      toRelatedMedia,
+      ctx,
+    );
+    return { license_text, texts: items };
   }
 
   /** Name search over agents (artists, cultures, organizations); all words must match. */
@@ -448,8 +513,7 @@ export class AicService {
     const body = {
       ...rankingParam(params.query),
       ...boolQuery([simpleQuery(params.query, ['title', 'alt_titles', 'sort_title'])], filter),
-      page: params.page,
-      limit: params.limit,
+      ...pageWindow(params.page, params.limit).request,
       fields: AGENT_FIELDS,
     };
     const envelope = await this.#search<RawAgent>('/agents/search', body, TTL_MS.search, ctx);
@@ -536,8 +600,7 @@ export class AicService {
       ...(relevance
         ? {}
         : { sort: [{ aic_start_at: { order: sortApplied === 'start_asc' ? 'asc' : 'desc' } }] }),
-      page: params.page,
-      limit: params.limit,
+      ...pageWindow(params.page, params.limit).request,
       fields: EXHIBITION_FIELDS,
     };
     const envelope = await this.#search<RawExhibition>(
@@ -563,8 +626,7 @@ export class AicService {
     const body = {
       ...rankingParam(params.query),
       ...boolQuery([simpleQuery(params.query)], []),
-      page: params.page,
-      limit: params.limit,
+      ...pageWindow(params.page, params.limit).request,
       fields: MOBILE_SOUND_FIELDS,
     };
     const envelope = await this.#search<RawMobileSound>(
@@ -633,11 +695,42 @@ export class AicService {
     body: Record<string, unknown>,
     ttlMs: number,
     ctx: Context,
+    limits: Partial<TimeLimits> = {},
   ): Promise<RawEnvelope<T>> {
     const json = JSON.stringify(body, (_key, value: unknown) =>
       typeof value === 'string' ? value.normalize('NFC') : value,
     );
-    return this.#request<T>(path, { params: json }, ttlMs, ctx, { postBody: json });
+    return this.#request<T>(path, { params: json }, ttlMs, ctx, { ...limits, postBody: json });
+  }
+
+  /**
+   * One search for the records of `path` whose `id` is among `ids` (at most 100, the page maximum),
+   * which an artwork links to. `items` comes back in `ids` order, without the ids the API does not
+   * have and the records `normalize` rejects.
+   */
+  async #searchByIds<Id extends number | string, Raw, Item extends { id: Id }>(
+    path: string,
+    ids: readonly Id[],
+    fields: string,
+    normalize: (raw: Raw) => Item | undefined,
+    ctx: Context,
+  ): Promise<{ items: Item[]; license_text: string }> {
+    const envelope = await this.#search<Raw>(
+      path,
+      { ...boolQuery([], [{ terms: { id: ids } }]), limit: ids.length, fields },
+      TTL_MS.record,
+      ctx,
+      { maxWaitMs: LINKED_LOAD_MAX_WAIT_MS },
+    );
+    const byId = new Map<Id, Item>();
+    for (const raw of envelope.data ?? []) {
+      const item = normalize(raw);
+      if (item) byId.set(item.id, item);
+    }
+    return {
+      items: ids.flatMap((id) => byId.get(id) ?? []),
+      license_text: licenseText(envelope),
+    };
   }
 
   /**
@@ -689,7 +782,8 @@ export class AicService {
    * `GET <path>?<params>`, cached under that URL whichever way it is sent. A
    * search passes `postBody`, sent as `POST <path>` instead when the GET query
    * string would be too long; a later chunk of an ids listing passes
-   * `deadlineMs`, what remains of the deadline its first chunk started.
+   * `deadlineMs`, what remains of the deadline its first chunk started; a load of
+   * linked records passes `maxWaitMs`.
    */
   async #request<T>(
     path: string,
@@ -698,8 +792,9 @@ export class AicService {
     ctx: Context,
     {
       deadlineMs = this.#retry.deadlineMs,
+      maxWaitMs = deadlineMs,
       postBody,
-    }: { deadlineMs?: number; postBody?: string } = {},
+    }: Partial<TimeLimits> & { postBody?: string } = {},
   ): Promise<RawEnvelope<T>> {
     const url = new URL(`${API_BASE_URL}${path}`);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
@@ -713,9 +808,10 @@ export class AicService {
     }
 
     const headers = { Accept: 'application/json', 'AIC-User-Agent': this.#userAgent };
+    const limits = { deadlineMs, maxWaitMs };
     const fetched =
       postBody === undefined || queryBytes(params) <= MAX_GET_QUERY_BYTES
-        ? await this.#fetchResilient(href, { headers }, path, deadlineMs, ctx)
+        ? await this.#fetchResilient(href, { headers }, path, limits, ctx)
         : await this.#fetchResilient(
             `${API_BASE_URL}${path}`,
             {
@@ -724,7 +820,7 @@ export class AicService {
               headers: { ...headers, 'Content-Type': 'application/json' },
             },
             path,
-            deadlineMs,
+            limits,
             ctx,
           );
     this.#cache.set(href, fetched.text, fetched.bytes, ttlMs);
@@ -733,14 +829,15 @@ export class AicService {
 
   /**
    * Retry outside, pacer inside: every attempt is re-paced and its queue time is
-   * charged to the deadline. A pacer shed (the call could not start in time) is
-   * not retried and leaves as `rate_limited` so the calling tool's recovery applies.
+   * charged to the deadline. A pacer shed (the attempt could not start within
+   * `maxWaitMs` or what remains of the deadline) is not retried and leaves as
+   * `rate_limited` so the calling tool's recovery applies.
    */
   async #fetchResilient(
     target: string,
     init: RequestInit,
     path: string,
-    deadlineMs: number,
+    { deadlineMs, maxWaitMs }: TimeLimits,
     ctx: Context,
   ): Promise<FetchedBody> {
     try {
@@ -748,7 +845,7 @@ export class AicService {
         (attempt) =>
           this.#pacer.run(
             (signal) => this.#attempt(target, init, signal, attempt.remainingMs, ctx),
-            { signal: attempt.signal, maxWaitMs: attempt.remainingMs },
+            { signal: attempt.signal, maxWaitMs: Math.min(maxWaitMs, attempt.remainingMs) },
           ),
         {
           operation: `AicService ${path}`,
@@ -822,7 +919,7 @@ function queryBytes(params: Record<string, string>): number {
 /**
  * `ids` as consecutive chunks whose `ids=<csv>&fields=<fields>` query each fits
  * the firewall's GET limit: one chunk when the whole list fits, otherwise each
- * filled as far as it fits. One id with every artwork section is about 700
+ * filled as far as it fits. One id with every artwork section is about 710
  * bytes, so every chunk holds at least one.
  */
 function idChunks(ids: readonly number[], fields: string): [number[], ...number[][]] {
@@ -1053,6 +1150,10 @@ function fieldSortClauses(sort: Exclude<ArtworkSort, 'relevance'>): {
   };
 }
 
+/** The record carries provenance text: every record that has the field holds text (Design Decision 47). */
+const HAS_PROVENANCE = { exists: { field: 'provenance_text' } };
+
+/** The required filter clauses; `provenance: 'unrecorded'` excludes instead, so it is not among them. */
 function artworkFilters(params: ArtworkSearchParams): unknown[] {
   const filter: unknown[] = [];
   if (params.artist) {
@@ -1080,6 +1181,7 @@ function artworkFilters(params: ArtworkSearchParams): unknown[] {
       range: { fiscal_year: definedOnly({ gte: params.acquired_from, lte: params.acquired_to }) },
     });
   }
+  if (params.provenance === 'recorded') filter.push(HAS_PROVENANCE);
   if (params.public_domain_only) filter.push({ term: { is_public_domain: true } });
   if (params.on_view_only) filter.push({ term: { is_on_view: true } });
   if (params.has_image) filter.push({ exists: { field: 'image_id' } });
@@ -1259,7 +1361,7 @@ function toArtworkDetail(raw: RawArtwork, iiifUrl: string): ArtworkDetail {
   };
 }
 
-function toRelatedMedia(raw: RawSound): RelatedMedia | undefined {
+function toRelatedMedia(raw: RawMediaAsset): RelatedMedia | undefined {
   const url = httpUrl(raw?.content);
   if (typeof raw?.id !== 'string' || url === undefined) return;
   return {
@@ -1267,6 +1369,18 @@ function toRelatedMedia(raw: RawSound): RelatedMedia | undefined {
     title: htmlField(raw.title) ?? '',
     url,
     ...definedOnly({ type: nonEmpty(raw.type) }),
+  };
+}
+
+/** A section's link; a section without a web page has nothing to link to and is dropped. */
+function toPublicationSection(raw: RawSection): PublicationSection | undefined {
+  const webUrl = httpUrl(raw?.web_url);
+  if (!Number.isSafeInteger(raw?.id) || webUrl === undefined) return;
+  return {
+    id: raw.id,
+    title: htmlField(raw.title) ?? '',
+    publication_title: htmlField(raw.publication_title) ?? '',
+    web_url: webUrl,
   };
 }
 

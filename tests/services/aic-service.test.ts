@@ -27,6 +27,7 @@ import {
   idsOfWidth,
   jsonResponder,
   networkErrorResponder,
+  numberedSearch,
   queryParam,
   queryStringBytes,
   type Responder,
@@ -39,6 +40,7 @@ import {
   streamingBody,
   TEST_CONTACT,
   TEST_VERSION,
+  type TestService,
   textResponder,
   urlOfCall,
 } from '../fixtures/aic-service-kit.js';
@@ -63,11 +65,15 @@ import {
   inCopyrightArtworkRecord,
   MOBILE_SOUND_LICENSE,
   mobileSoundRecord,
+  NBSP,
   placeholderYearArtworkRecord,
   searchEnvelope,
+  sectionRecord,
   soundRecord,
   soundUuid,
   sparseArtworkRecord,
+  textRecord,
+  textUuid,
 } from '../fixtures/aic-upstream.js';
 
 const MIB = 1024 * 1024;
@@ -884,8 +890,27 @@ describe('AicService listing by ids under the GET limit', () => {
     const { service, fetch } = createTestService(scriptedFetch(jsonResponder(envelope([]))));
     await service.getArtworks(ids, ALL_SECTIONS, ctx);
     expect(fetch).toHaveBeenCalledTimes(1);
-    expect(queryStringBytes(urlOfCall(fetch))).toBe(1_573);
+    expect(queryStringBytes(urlOfCall(fetch))).toBe(1_598);
     expect(idsSent(fetch)).toEqual([ids]);
+  });
+
+  const DEFAULT = ['description', 'provenance'] as const;
+
+  it.each([
+    [4, 'the default sections', [100], DEFAULT],
+    [6, 'the default sections', [100], DEFAULT],
+    [11, 'the default sections', [100], DEFAULT],
+    [10, 'every section', [100], ALL_SECTIONS],
+    [11, 'every section', [96, 4], ALL_SECTIONS],
+    [16, 'every section', [71, 29], ALL_SECTIONS],
+  ])('sends 100 %i-digit ids with %s as GETs of %j ids', async (digits, _name, sizes, sections) => {
+    const ids = idsOfWidth(digits);
+    const { service, fetch } = createTestService(
+      scriptedFetch(behindFirewall(jsonResponder(envelope([])))),
+    );
+    await service.getArtworks(ids, sections, ctx);
+    expect(idsSent(fetch).map((chunk) => chunk.length)).toEqual(sizes);
+    expect(idsSent(fetch).flat()).toEqual(ids);
   });
 
   it.each([
@@ -1290,6 +1315,146 @@ describe('AicService pacer', () => {
     pacer.dispose();
   });
 
+  describe('queue time of the loads linked to an artwork', () => {
+    /** Starts one search on a pacer with `gapMs` between starts, so the next request must wait that long. */
+    async function behindOneStart(gapMs: number) {
+      vi.useFakeTimers();
+      const pacer = createPacer({ name: 'aic-test-linked', minStartGapMs: gapMs });
+      const made = createTestService(scriptedFetch(jsonResponder(envelope([]))), { pacer });
+      await made.service.searchArtworks(artworkParams({ query: 'one' }), makeCtx());
+      return { ...made, pacer };
+    }
+
+    it.each([
+      ['sound recordings', (s: TestService['service']) => s.getSounds([soundUuid(1)], makeCtx())],
+      ['publication sections', (s: TestService['service']) => s.getSections([1], makeCtx())],
+      ['text documents', (s: TestService['service']) => s.getTexts([textUuid(1)], makeCtx())],
+    ])('waits up to 12 seconds to load %s, then gives the slot up', async (_kind, load) => {
+      const inTime = await behindOneStart(12_000);
+      const loaded = load(inTime.service);
+      await vi.advanceTimersByTimeAsync(12_000);
+      await loaded;
+      expect(inTime.fetch).toHaveBeenCalledTimes(2);
+      inTime.pacer.dispose();
+
+      const tooLate = await behindOneStart(12_001);
+      const shed = rejection(load(tooLate.service));
+      await vi.advanceTimersByTimeAsync(12_001);
+      const error = await shed;
+      expect(error.data).toMatchObject({ reason: 'rate_limited' });
+      expect(tooLate.fetch).toHaveBeenCalledTimes(1);
+      tooLate.pacer.dispose();
+    });
+
+    it('holds a load too long for one GET to the same 12 seconds', async () => {
+      const uuids = Array.from({ length: 100 }, (_, index) => soundUuid(index + 1));
+      const inTime = await behindOneStart(12_000);
+      const loaded = inTime.service.getSounds(uuids, makeCtx());
+      await vi.advanceTimersByTimeAsync(12_000);
+      await loaded;
+      expect(inTime.fetch).toHaveBeenCalledTimes(2);
+      expect(searchCallOf(inTime.fetch, 1).method).toBe('POST');
+      inTime.pacer.dispose();
+
+      const tooLate = await behindOneStart(12_001);
+      const shed = rejection(tooLate.service.getSounds(uuids, makeCtx()));
+      await vi.advanceTimersByTimeAsync(12_001);
+      const error = await shed;
+      expect(error.data).toMatchObject({ reason: 'rate_limited' });
+      expect(tooLate.fetch).toHaveBeenCalledTimes(1);
+      tooLate.pacer.dispose();
+    });
+
+    it.each<[string, (s: TestService['service']) => Promise<unknown>]>([
+      ['artworks by id', (s) => s.getArtworks([1], [], makeCtx())],
+      ['an artworks search', (s) => s.searchArtworks(artworkParams({ query: 'two' }), makeCtx())],
+      ['agents by id', (s) => s.getAgents([1], makeCtx())],
+      [
+        'an agents search',
+        (s) => s.searchAgents({ artists_only: true, limit: 10, page: 1, query: 'two' }, makeCtx()),
+      ],
+      ['the artist counts', (s) => s.artistWorkStats([1], makeCtx())],
+      [
+        'an exhibitions search',
+        (s) =>
+          s.searchExhibitions({ limit: 10, page: 1, sort: 'start_desc', when: 'any' }, makeCtx()),
+      ],
+      [
+        'an audio-guide search',
+        (s) => s.searchMobileSounds({ limit: 2, page: 1, query: 'two' }, makeCtx()),
+      ],
+      [
+        'a vocabulary',
+        (s) =>
+          s.aggregate('style_titles.keyword', { public_domain_only: false, size: 5 }, makeCtx()),
+      ],
+    ])('lets %s wait out its whole deadline', async (_kind, request) => {
+      const { fetch, pacer, service } = await behindOneStart(19_000);
+      const pending = request(service);
+      await vi.advanceTimersByTimeAsync(19_000);
+      await pending;
+      expect(fetch).toHaveBeenCalledTimes(2);
+      pacer.dispose();
+    });
+
+    it('lets a later chunk of an ids listing wait out what remains of the deadline', async () => {
+      vi.useFakeTimers();
+      const pacer = createPacer({ name: 'aic-test-linked-chunk', minStartGapMs: 19_000 });
+      const { fetch, service } = createTestService(scriptedFetch(jsonResponder(envelope([]))), {
+        pacer,
+      });
+      const pending = service.getArtworks(idsOfWidth(16), [], makeCtx());
+      await vi.advanceTimersByTimeAsync(19_000);
+      await pending;
+      expect(fetch).toHaveBeenCalledTimes(2);
+      pacer.dispose();
+    });
+
+    it('gives a retried load its own 12 seconds, inside the same deadline', async () => {
+      vi.useFakeTimers();
+      const pacer = createPacer({ name: 'aic-test-linked-retry', minStartGapMs: 9_000 });
+      const ok = jsonResponder(envelope([]));
+      const { fetch, service } = createTestService(scriptedFetch(ok, jsonResponder({}, 503), ok), {
+        pacer,
+      });
+      await service.searchArtworks(artworkParams({ query: 'one' }), makeCtx());
+      const loaded = service.getSounds([soundUuid(1)], makeCtx());
+      await vi.advanceTimersByTimeAsync(18_000);
+      await loaded;
+      expect(fetch).toHaveBeenCalledTimes(3);
+      pacer.dispose();
+    });
+
+    it('holds a retried load to 12 seconds too', async () => {
+      vi.useFakeTimers();
+      const pacer = createPacer({ name: 'aic-test-linked-retry-cap', minStartGapMs: 12_001 });
+      const { fetch, service } = createTestService(
+        scriptedFetch(jsonResponder({}, 503), jsonResponder(envelope([]))),
+        { pacer },
+      );
+      const shed = rejection(service.getSounds([soundUuid(1)], makeCtx()));
+      await vi.advanceTimersByTimeAsync(12_001);
+      const error = await shed;
+      expect(error.data).toMatchObject({ reason: 'rate_limited' });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      pacer.dispose();
+    });
+
+    it('clips the wait to what remains of a shorter deadline', async () => {
+      vi.useFakeTimers();
+      const pacer = createPacer({ name: 'aic-test-linked-clip', minStartGapMs: 6_000 });
+      const { fetch, service } = createTestService(scriptedFetch(jsonResponder(envelope([]))), {
+        pacer,
+        retry: { baseDelayMs: 0, deadlineMs: 5_000 },
+      });
+      await service.searchArtworks(artworkParams({ query: 'one' }), makeCtx());
+      const error = await rejection(service.getSounds([soundUuid(1)], makeCtx()));
+      expect(error.data).toMatchObject({ reason: 'rate_limited' });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      pacer.dispose();
+    });
+  });
+
   it('builds a production pacer from requestsPerMinute when none is injected', async () => {
     const { service, fetch } = createTestService(scriptedFetch(emptySearch()), {
       productionPacer: true,
@@ -1507,6 +1672,16 @@ describe('AicService cache', () => {
       (s: ReturnType<typeof createTestService>['service']) => s.getSounds([soundUuid(1)], ctx),
     ],
     [
+      'sections by id',
+      6 * 60 * MINUTE,
+      (s: ReturnType<typeof createTestService>['service']) => s.getSections([1], ctx),
+    ],
+    [
+      'texts by id',
+      6 * 60 * MINUTE,
+      (s: ReturnType<typeof createTestService>['service']) => s.getTexts([textUuid(1)], ctx),
+    ],
+    [
       'vocabulary aggregation',
       24 * 60 * MINUTE,
       (s: ReturnType<typeof createTestService>['service']) =>
@@ -1633,6 +1808,77 @@ describe('AicService.searchArtworks', () => {
   it('adds no filter clauses for unset optional inputs', async () => {
     const { body } = await run({});
     expect(body).not.toHaveProperty('query');
+  });
+
+  describe('provenance', () => {
+    const HAS_TEXT = { exists: { field: 'provenance_text' } };
+    const PLACEHOLDER_STARTS = [
+      { range: { date_start: { lt: -8000 } } },
+      { range: { date_start: { gt: 2100 } } },
+    ];
+
+    it('requires provenance text for recorded and excludes it for unrecorded', async () => {
+      expect((await run({ provenance: 'recorded' })).body.query).toEqual({
+        bool: { filter: [HAS_TEXT] },
+      });
+      expect((await run({ provenance: 'unrecorded' })).body.query).toEqual({
+        bool: { must_not: [HAS_TEXT] },
+      });
+    });
+
+    it('sends the same request unset as absent', async () => {
+      const [unset, absent] = await Promise.all([
+        run({ provenance: undefined, has_image: true }),
+        run({ has_image: true }),
+      ]);
+      expect(urlOfCall(unset.fetch)).toBe(urlOfCall(absent.fetch));
+    });
+
+    it.each([
+      ['date_asc', 'unrecorded', { must_not: [...PLACEHOLDER_STARTS, HAS_TEXT] }],
+      ['date_desc', 'unrecorded', { must_not: [...PLACEHOLDER_STARTS, HAS_TEXT] }],
+      ['date_asc', 'recorded', { filter: [HAS_TEXT], must_not: PLACEHOLDER_STARTS }],
+      ['acquired_desc', 'unrecorded', { must_not: [HAS_TEXT] }],
+      ['acquired_asc', 'recorded', { filter: [HAS_TEXT] }],
+    ] as const)('keeps what a %s sort excludes beside %s', async (sort, provenance, bool) => {
+      expect((await run({ sort, provenance })).body.query).toEqual({ bool });
+    });
+
+    it.each([
+      ['recorded', [HAS_TEXT], undefined],
+      ['unrecorded', [], [HAS_TEXT]],
+    ] as const)(
+      'ANDs %s with the query, every kind of filter, facets, and limit 0',
+      async (provenance, required, mustNot) => {
+        const { body } = await run({
+          provenance,
+          query: 'durand-ruel',
+          artist_id: 35809,
+          department: 'PC-10',
+          year_to: 1945,
+          acquired_from: 1933,
+          public_domain_only: true,
+          facets: ['department'],
+          limit: 0,
+        });
+        const { bool } = body.query as { bool: Record<string, unknown> };
+        expect(bool.filter).toEqual([
+          { term: { artist_ids: 35809 } },
+          { term: { department_id: 'PC-10' } },
+          { range: { date_start: { lte: 1945 } } },
+          { range: { date_start: { gte: -8000 } } },
+          { range: { date_end: { lte: 2100 } } },
+          { range: { fiscal_year: { gte: 1933 } } },
+          ...required,
+          { term: { is_public_domain: true } },
+        ]);
+        expect(bool.must).toEqual([
+          { simple_query_string: { query: 'durand-ruel', default_operator: 'and' } },
+        ]);
+        expect(bool.must_not).toEqual(mustNot);
+        expect(body).toMatchObject({ limit: 0, aggs: { department: expect.anything() } });
+      },
+    );
   });
 
   it.each([
@@ -2294,6 +2540,62 @@ describe('AicService.getArtworks', () => {
     expect(entries.map((e) => e.sound_ids)).toEqual([[soundUuid(1), soundUuid(2)], [], []]);
   });
 
+  it('carries the section ids beside each record, keeping safe integers past 2^32 and nothing else', async () => {
+    const { service } = createTestService(
+      scriptedFetch(
+        jsonResponder(
+          envelope([
+            artworkRecord(1, {
+              section_ids: [421375, 36741370056, '520264', null, 1.5, 2 ** 53, 2 ** 53 - 1],
+            }),
+            artworkRecord(2, { section_ids: null }),
+            artworkRecord(3, { section_ids: 421375 }),
+            sparseArtworkRecord(4),
+          ]),
+        ),
+      ),
+    );
+    const { entries } = await service.getArtworks([1, 2, 3, 4], [], ctx);
+    expect(entries.map((e) => e.section_ids)).toEqual([
+      [421375, 36741370056, 9007199254740991],
+      [],
+      [],
+      [],
+    ]);
+  });
+
+  it('carries the text ids beside each record and drops non-string and blank ones', async () => {
+    const { service } = createTestService(
+      scriptedFetch(
+        jsonResponder(
+          envelope([
+            artworkRecord(1, { text_ids: [textUuid(1), '', null, 5, textUuid(2)] }),
+            artworkRecord(2, { text_ids: null }),
+            sparseArtworkRecord(3),
+          ]),
+        ),
+      ),
+    );
+    const { entries } = await service.getArtworks([1, 2, 3], [], ctx);
+    expect(entries.map((e) => e.text_ids)).toEqual([[textUuid(1), textUuid(2)], [], []]);
+  });
+
+  it('requests the section and text ids whatever sections are named, and keeps them off the record', async () => {
+    const { service, fetch } = createTestService(
+      scriptedFetch(
+        jsonResponder(envelope([artworkRecord(1, { section_ids: [7], text_ids: [textUuid(1)] })])),
+      ),
+    );
+    const { entries } = await service.getArtworks([1], [], ctx);
+    expect((queryParam(urlOfCall(fetch), 'fields') ?? '').split(',').slice(-3)).toEqual([
+      'sound_ids',
+      'section_ids',
+      'text_ids',
+    ]);
+    expect(entries[0]?.detail).not.toHaveProperty('section_ids');
+    expect(entries[0]?.detail).not.toHaveProperty('text_ids');
+  });
+
   it('returns the license text of the batch', async () => {
     const { service } = createTestService(
       scriptedFetch(jsonResponder(envelope([artworkRecord(1)]))),
@@ -2608,6 +2910,203 @@ describe('AicService.getSounds', () => {
       title: 'Stop on Light',
       url: `https://www.artic.edu/assets/${soundUuid(1)}`,
     });
+  });
+});
+
+// --- getSections -------------------------------------------------------------------------------------------
+
+describe('AicService.getSections', () => {
+  const ctx = makeCtx();
+  const sections = async (ids: number[], data: unknown[], license: string | null = 'Notice') => {
+    const { service } = createTestService(
+      scriptedFetch(jsonResponder(searchEnvelope(data, data.length, { license }))),
+    );
+    return await service.getSections(ids, ctx);
+  };
+
+  it('searches for the ids by an id terms filter, sized to the list, without the section content', async () => {
+    const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+    await service.getSections([36741370056, 421375], ctx);
+    const sent = searchCallOf(fetch);
+    expect(new URL(sent.url).pathname).toBe('/api/v1/sections/search');
+    expect(sent.method).toBe('GET');
+    expect(sent.body).toEqual({
+      query: { bool: { filter: [{ terms: { id: [36741370056, 421375] } }] } },
+      limit: 2,
+      fields: 'id,title,web_url,publication_title',
+    });
+  });
+
+  it('posts 100 ids too wide for one GET and returns every section in request order', async () => {
+    const ids = idsOfWidth(16);
+    const { service, fetch } = createTestService(
+      scriptedFetch(
+        behindFirewall(
+          jsonResponder(searchEnvelope([...ids].reverse().map((id) => sectionRecord(id)))),
+        ),
+      ),
+    );
+    const result = await service.getSections(ids, ctx);
+    expect(result.sections.map((section) => section.id)).toEqual(ids);
+    const sent = searchCallOf(fetch);
+    expect(sent.method).toBe('POST');
+    expect(sent.body).toMatchObject({
+      query: { bool: { filter: [{ terms: { id: ids } }] } },
+      limit: 100,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns the link fields and the license, with non-breaking space runs folded to one space', async () => {
+    const result = await sections(
+      [520264],
+      [
+        {
+          _score: 1,
+          id: 520264,
+          title: `Cat. 2 ${NBSP}Paris Street; Rainy Day, 1877`,
+          web_url:
+            'https://publications.artic.edu/caillebotte/reader/paintingsanddrawings/section/574',
+          publication_title: `Caillebotte${NBSP}${NBSP}Paintings &amp; <em>Drawings</em>`,
+          content: '<p>never requested</p>',
+        },
+      ],
+    );
+    expect(result).toEqual({
+      license_text: 'Notice',
+      sections: [
+        {
+          id: 520264,
+          title: 'Cat. 2 Paris Street; Rainy Day, 1877',
+          publication_title: 'Caillebotte Paintings & Drawings',
+          web_url:
+            'https://publications.artic.edu/caillebotte/reader/paintingsanddrawings/section/574',
+        },
+      ],
+    });
+  });
+
+  it('reorders to request order and drops unknown ids and sections that were not asked for', async () => {
+    const result = await sections(
+      [3, 2, 36741370056],
+      [sectionRecord(36741370056), sectionRecord(99), sectionRecord(3)],
+    );
+    expect(result.sections.map((section) => section.id)).toEqual([3, 36741370056]);
+  });
+
+  it('drops sections without an http(s) page or a usable id, and tolerates null entries', async () => {
+    const result = await sections(
+      [1, 2, 3, 4, 5, 6, 7],
+      [
+        sectionRecord(1, { web_url: null }),
+        sectionRecord(2, { web_url: '  ' }),
+        sectionRecord(3, { web_url: 'javascript:alert(1)' }),
+        sectionRecord(4, { web_url: '/reader/section/4' }),
+        null,
+        { ...sectionRecord(5), id: '5' },
+        { ...sectionRecord(6), id: 2 ** 53 },
+        sectionRecord(7, { web_url: 'http://publications.artic.edu/7' }),
+      ],
+    );
+    expect(result.sections.map((section) => [section.id, section.web_url])).toEqual([
+      [7, 'http://publications.artic.edu/7'],
+    ]);
+  });
+
+  it('keeps a section that has a page but no title or publication, with empty strings', async () => {
+    const result = await sections(
+      [1, 2],
+      [
+        sectionRecord(1, { title: null, publication_title: undefined }),
+        sectionRecord(2, { title: '<em> </em>', publication_title: NBSP }),
+      ],
+    );
+    expect(result.sections.map((s) => [s.id, s.title, s.publication_title])).toEqual([
+      [1, '', ''],
+      [2, '', ''],
+    ]);
+  });
+
+  it('reports an envelope without license text as an empty one', async () => {
+    expect((await sections([1], [sectionRecord(1)], null)).license_text).toBe('');
+  });
+});
+
+// --- getTexts ----------------------------------------------------------------------------------------------
+
+describe('AicService.getTexts', () => {
+  const ctx = makeCtx();
+  const texts = async (ids: string[], data: unknown[]) => {
+    const { service } = createTestService(
+      scriptedFetch(jsonResponder(searchEnvelope(data, data.length, { license: 'CC0' }))),
+    );
+    return await service.getTexts(ids, ctx);
+  };
+
+  it('searches for the uuids by an id terms filter, sized to the list, with the asset fields', async () => {
+    const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+    await service.getTexts([textUuid(2), textUuid(1)], ctx);
+    const sent = searchCallOf(fetch);
+    expect(new URL(sent.url).pathname).toBe('/api/v1/texts/search');
+    expect(sent.method).toBe('GET');
+    expect(sent.body).toEqual({
+      query: { bool: { filter: [{ terms: { id: [textUuid(2), textUuid(1)] } }] } },
+      limit: 2,
+      fields: 'id,title,type,content',
+    });
+  });
+
+  it('posts 100 uuids past the GET limit and returns every asset in request order', async () => {
+    const ids = Array.from({ length: 100 }, (_, index) => textUuid(index + 1));
+    const { service, fetch } = createTestService(
+      scriptedFetch(
+        behindFirewall(
+          jsonResponder(searchEnvelope([...ids].reverse().map((id) => textRecord(id)))),
+        ),
+      ),
+    );
+    const result = await service.getTexts(ids, ctx);
+    expect(result.texts.map((text) => text.id)).toEqual(ids);
+    expect(searchCallOf(fetch)).toMatchObject({ method: 'POST', body: { limit: 100 } });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('reorders to request order, drops unknown uuids, and returns the license', async () => {
+    const result = await texts(
+      [textUuid(1), textUuid(2), textUuid(3)],
+      [textRecord(textUuid(3)), textRecord(textUuid(1), { title: `Manual:${NBSP} <em>Art</em>` })],
+    );
+    expect(result).toEqual({
+      license_text: 'CC0',
+      texts: [
+        {
+          id: textUuid(1),
+          title: 'Manual: Art',
+          url: `https://www.artic.edu/assets/${textUuid(1)}`,
+          type: 'text',
+        },
+        {
+          id: textUuid(3),
+          title: 'Synthetic text 0003',
+          url: `https://www.artic.edu/assets/${textUuid(3)}`,
+          type: 'text',
+        },
+      ],
+    });
+  });
+
+  it('drops texts whose content is not an http(s) URL, such as prose', async () => {
+    const result = await texts(
+      [textUuid(1), textUuid(2), textUuid(3), textUuid(4)],
+      [
+        textRecord(textUuid(1), { content: 'A teaching text.' }),
+        textRecord(textUuid(2), { content: null }),
+        textRecord(textUuid(3), { content: 'javascript:alert(1)' }),
+        null,
+        textRecord(textUuid(4)),
+      ],
+    );
+    expect(result.texts.map((text) => text.id)).toEqual([textUuid(4)]);
   });
 });
 
@@ -3388,6 +3887,119 @@ describe('AicService.aggregate', () => {
     );
     expect(result.buckets).toEqual([]);
     expect(result.sum_other_doc_count).toBe(0);
+  });
+});
+
+// --- Search paging ----------------------------------------------------------------------------------------------------------------
+
+describe('AicService search paging', () => {
+  const ctx = makeCtx();
+  type Paging = { limit: number; page: number };
+  type Service = ReturnType<typeof createTestService>['service'];
+
+  /** Each paged search, and the JSON it sends with `paging` in place of its paging keys. */
+  const SEARCHES: [string, (s: Service, p: Paging) => Promise<unknown>, (p: string) => string][] = [
+    [
+      'searchArtworks',
+      (service, paging) => service.searchArtworks(artworkParams(paging), ctx),
+      (paging) =>
+        `{${paging},"fields":"id,title,main_reference_number,fiscal_year,artist_display,artist_id,artist_title,date_display,date_start,date_end,medium_display,artwork_type_title,department_title,place_of_origin,is_public_domain,is_on_view,gallery_title,image_id,thumbnail"}`,
+    ],
+    [
+      'searchAgents',
+      (service, paging) =>
+        service.searchAgents({ artists_only: false, query: 'monet', ...paging }, ctx),
+      (paging) =>
+        `{"q":"monet","query":{"bool":{"must":[{"simple_query_string":{"query":"monet","fields":["title","alt_titles","sort_title"],"default_operator":"and"}}]}},${paging},"fields":"id,title,sort_title,alt_titles,is_artist,agent_type_title,birth_date,death_date,description,ulan_id"}`,
+    ],
+    [
+      'searchExhibitions',
+      (service, paging) =>
+        service.searchExhibitions({ sort: 'start_desc', when: 'any', ...paging }, ctx),
+      (paging) =>
+        `{"sort":[{"aic_start_at":{"order":"desc"}}],${paging},"fields":"id,title,status,aic_start_at,aic_end_at,gallery_id,gallery_title,short_description,web_url,image_id,image_url,artwork_ids,artwork_titles,artist_ids,is_featured"}`,
+    ],
+    [
+      'searchMobileSounds',
+      (service, paging) => service.searchMobileSounds({ query: 'monet', ...paging }, ctx),
+      (paging) =>
+        `{"q":"monet","query":{"bool":{"must":[{"simple_query_string":{"query":"monet","default_operator":"and"}}]}},${paging},"fields":"id,title,web_url,transcript"}`,
+    ],
+  ];
+
+  it.each(SEARCHES)(
+    '%s sends page and limit byte for byte off the page that crosses match 1,000',
+    async (_name, run, json) => {
+      for (const [page, limit] of [
+        [1, 10],
+        [83, 12],
+        [10, 100],
+        [100, 10],
+        [1000, 1],
+        // Past the window: the tools refuse these, and the API does when the service is asked.
+        [85, 12],
+        [11, 100],
+      ] as const) {
+        const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+        await run(service, { page, limit });
+        expect(queryParam(urlOfCall(fetch), 'params')).toBe(
+          json(`"page":${page},"limit":${limit}`),
+        );
+      }
+    },
+  );
+
+  it('sends page and limit for a counts-only search on any page', async () => {
+    const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+    await service.searchArtworks(artworkParams({ page: 1000, limit: 0 }), ctx);
+    expect(queryParam(urlOfCall(fetch), 'params')).toMatch(/^\{"page":1000,"limit":0,"fields":/);
+  });
+
+  it.each(SEARCHES)(
+    '%s sends from and the limit left inside the window on the page that crosses match 1,000',
+    async (_name, run, json) => {
+      for (const [page, limit, from, left] of [
+        [84, 12, 996, 4],
+        [34, 30, 990, 10],
+        [143, 7, 994, 6],
+        [11, 99, 990, 10],
+        [38, 27, 999, 1],
+      ] as const) {
+        const { service, fetch } = createTestService(scriptedFetch(emptySearch()));
+        await run(service, { page, limit });
+        expect(queryParam(urlOfCall(fetch), 'params')).toBe(json(`"from":${from},"limit":${left}`));
+      }
+    },
+  );
+
+  it('posts from and the remaining limit when the crossing page is past the GET limit', async () => {
+    const { service, fetch } = createTestService(
+      scriptedFetch(behindFirewall(numberedSearch(1005, artworkRecord))),
+    );
+    const result = await service.searchArtworks(
+      artworkParams({ query: '版画'.repeat(100), page: 84, limit: 12 }),
+      ctx,
+    );
+    const call = searchCallOf(fetch);
+    expect(call.method).toBe('POST');
+    expect(call.body).toMatchObject({ from: 996, limit: 4 });
+    expect(call.body).not.toHaveProperty('page');
+    expect(result.artworks.map((artwork) => artwork.id)).toEqual([997, 998, 999, 1000]);
+    expect(result.total).toBe(1005);
+  });
+
+  it('keeps the crossing page in its own cache entry', async () => {
+    const { service, fetch } = createTestService(
+      scriptedFetch(numberedSearch(5000, artworkRecord)),
+    );
+    const idsOfPage = async (page: number, limit: number) =>
+      (await service.searchArtworks(artworkParams({ page, limit }), ctx)).artworks.map(
+        (artwork) => artwork.id,
+      );
+    expect(await idsOfPage(84, 12)).toEqual([997, 998, 999, 1000]);
+    expect(await idsOfPage(250, 4)).toEqual([997, 998, 999, 1000]);
+    expect(await idsOfPage(84, 12)).toEqual([997, 998, 999, 1000]);
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });
 

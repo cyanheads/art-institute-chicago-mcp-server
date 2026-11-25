@@ -1,7 +1,8 @@
 /**
  * @fileoverview `artic://artworks/{id}` — one artwork record as JSON, built
- * through the same path as `artic_get_artworks` with its default sections and
- * related media, alongside the license text and description attribution.
+ * through the same path as `artic_get_artworks` with its default sections,
+ * related media, and publication sections, alongside the license texts and the
+ * description attribution.
  * @module mcp-server/resources/definitions/artwork.resource
  */
 
@@ -13,7 +14,7 @@ export const artworkResource = resource('artic://artworks/{id}', {
   name: 'artic-artwork',
   title: 'Artwork record',
   description:
-    'Read one Art Institute of Chicago artwork record by id as JSON: the artic_get_artworks record with the description and provenance sections and related media, plus the API license text, the CC BY 4.0 attribution when description text is present, and a notice when related media was capped or could not load.',
+    'Read one Art Institute of Chicago artwork record by id as JSON: the artic_get_artworks record with the description and provenance sections, related media, and publication sections, plus the API license text, the CC BY 4.0 attribution when description text is present, the publication license text and citation when publication sections are present, and a notice when linked sound recordings, publication sections, or text documents were capped or could not load.',
   mimeType: 'application/json',
   params: z.object({
     id: z
@@ -64,7 +65,14 @@ export const artworkResource = resource('artic://artworks/{id}', {
     if (!Number.isSafeInteger(id)) {
       throw ctx.fail('artwork_not_found', `No artwork exists for id ${params.id}.`);
     }
-    const { artworks, license_text, description_attribution, notices } = await loadArtworkRecords(
+    const {
+      artworks,
+      license_text,
+      description_attribution,
+      publication_license_text,
+      publication_citation,
+      notices,
+    } = await loadArtworkRecords(
       { ids: [id], sections: DEFAULT_SECTIONS, include_related_media: true },
       ctx,
     );
@@ -74,6 +82,7 @@ export const artworkResource = resource('artic://artworks/{id}', {
       artwork,
       license_text,
       ...(description_attribution ? { description_attribution } : {}),
+      ...(publication_citation ? { publication_license_text, publication_citation } : {}),
       ...(notices.length > 0 ? { notice: notices.join(' ') } : {}),
     };
   },

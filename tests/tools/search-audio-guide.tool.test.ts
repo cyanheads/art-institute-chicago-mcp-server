@@ -67,7 +67,7 @@ const ZERO_HIT_NOTICE =
   "No audio-guide stops matched. Try the artwork's title or the artist's surname; for a known work, artic_get_artworks lists related_media.";
 
 const WINDOW_RECOVERY =
-  "Only the first 1,000 matches are reachable. Add words to the artic_search_audio_guide query, such as the artwork title or the artist's surname.";
+  "Only the first 1,000 matches are reachable. Add words to the artic_search_audio_guide query, such as the artwork title or the artist's surname, and start again at page 1.";
 
 afterEach(() => {
   disposeAicService();
@@ -232,6 +232,33 @@ describe('artic_search_audio_guide input validation', () => {
     const result = await listen({ query: 'a', ...extra });
     expect(result.isError).toBeUndefined();
     expect(bodyOf(fetchFake)).toMatchObject({ page: 1, limit: 2 });
+  });
+
+  it('reads numbers sent as strings as the values they spell', async () => {
+    const spelledFetch = serve(envelopeOf(rows(5, 6), 40));
+    const spelled = await listen({ query: '1884', page: ' 2 ', limit: '5' });
+    expect(bodyOf(spelledFetch)).toMatchObject({
+      query: {
+        bool: { must: [{ simple_query_string: { query: '1884', default_operator: 'and' } }] },
+      },
+      page: 2,
+      limit: 5,
+    });
+    serve(envelopeOf(rows(5, 6), 40));
+    const typed = await listen({ query: '1884', page: 2, limit: 5 });
+    expect(structuredOf<AudioRun>(spelled)).toEqual(structuredOf<AudioRun>(typed));
+    expect(structuredOf<AudioRun>(spelled)).toMatchObject({ page: 2, cap: 5, shown: 5 });
+    expect(spelled.content).toEqual(typed.content);
+  });
+
+  it('rejects a limit string that spells no number at its own path', async () => {
+    const fetchFake = emptyResults();
+    const error = errorOf(await listen({ query: 'a', limit: '5.0' }));
+    expect(error.data).toMatchObject({
+      reason: 'invalid_arguments',
+      issues: [{ path: ['limit'], message: 'Invalid input: expected number, received string' }],
+    });
+    expect(fetchFake).not.toHaveBeenCalled();
   });
 });
 

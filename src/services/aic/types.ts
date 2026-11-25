@@ -78,22 +78,33 @@ export interface RawArtwork {
   place_of_origin?: string | null;
   provenance_text?: string | null;
   publication_history?: string | null;
+  section_ids?: number[] | null;
   short_description?: string | null;
   sound_ids?: string[] | null;
   style_title?: string | null;
   style_titles?: string[] | null;
   subject_titles?: string[] | null;
   technique_titles?: string[] | null;
+  text_ids?: string[] | null;
   theme_titles?: string[] | null;
   thumbnail?: RawThumbnail | null;
   title?: string | null;
 }
 
-export interface RawSound {
+/** A `/sounds` or `/texts` record; `content` is the asset URL. */
+export interface RawMediaAsset {
   content?: string | null;
   id: string;
   title?: string | null;
   type?: string | null;
+}
+
+/** The fields read from a `/sections` record. */
+export interface RawSection {
+  id: number;
+  publication_title?: string | null;
+  title?: string | null;
+  web_url?: string | null;
 }
 
 export interface RawAgent {
@@ -191,6 +202,16 @@ export interface RelatedMedia {
   url: string;
 }
 
+/** A link to one section of a museum publication, such as a scholarly catalogue entry. */
+export interface PublicationSection {
+  id: number;
+  /** Empty when the museum lists none. */
+  publication_title: string;
+  /** Empty when the museum lists none. */
+  title: string;
+  web_url: string;
+}
+
 /** Full artwork record returned by the `ids=` batch route. */
 export interface ArtworkDetail extends ArtworkSummary {
   alt_images?: AltImage[];
@@ -211,6 +232,7 @@ export interface ArtworkDetail extends ArtworkSummary {
   on_loan?: string;
   provenance?: string;
   publication_history?: string;
+  publication_sections?: PublicationSection[];
   related_media?: RelatedMedia[];
   short_description?: string;
   style?: string;

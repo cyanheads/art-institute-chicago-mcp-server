@@ -161,6 +161,44 @@ describe('artic_lookup_vocabulary input', () => {
     expect(bucketBody(fetchFake, 1)).not.toHaveProperty('query');
   });
 
+  it('reads a number and a boolean sent as strings as the values they spell', async () => {
+    const page = aggregationEnvelope('v', [{ key: 'oil', doc_count: 3 }], 7);
+    const spelledFetch = installAicService(scriptedFetch(jsonResponder(page)));
+    const spelled = await runToolContract(lookupVocabulary, {
+      vocabulary: 'material',
+      contains: 'true',
+      public_domain_only: 'true',
+      limit: ' 1 ',
+    });
+    expect(bucketBody(spelledFetch).aggs.v.terms).toMatchObject({
+      size: 1,
+      include: containsPattern('true'),
+    });
+    expect(bucketBody(spelledFetch).query).toEqual({
+      bool: { filter: [{ term: { is_public_domain: true } }] },
+    });
+    installAicService(scriptedFetch(jsonResponder(page)));
+    const typed = await runToolContract(lookupVocabulary, {
+      vocabulary: 'material',
+      contains: 'true',
+      public_domain_only: true,
+      limit: 1,
+    });
+    expect(structuredOf<VocabularyRun>(spelled)).toEqual(structuredOf<VocabularyRun>(typed));
+    expect(structuredOf<VocabularyRun>(spelled)).toMatchObject({ cap: 1, shown: 1 });
+    expect(spelled.content).toEqual(typed.content);
+  });
+
+  it('reads "false" as false, never as a non-empty string', async () => {
+    const fetchFake = installAicService(scriptedFetch(jsonResponder(aggregationEnvelope('v', []))));
+    const result = await runToolContract(lookupVocabulary, {
+      vocabulary: 'material',
+      public_domain_only: 'false',
+    });
+    expect(result.isError).toBeUndefined();
+    expect(bucketBody(fetchFake)).not.toHaveProperty('query');
+  });
+
   it.each([100, 1000])('passes limit %i through as the aggregation size', async (limit) => {
     const fetchFake = installAicService(scriptedFetch(jsonResponder(aggregationEnvelope('v', []))));
     const out = structuredOf<VocabularyRun>(
@@ -177,6 +215,12 @@ describe('artic_lookup_vocabulary input', () => {
     ['limit 0', { vocabulary: 'style', limit: 0 }, 'limit'],
     ['limit 1001', { vocabulary: 'style', limit: 1001 }, 'limit'],
     ['a fractional limit', { vocabulary: 'style', limit: 2.5 }, 'limit'],
+    ['a limit string in exponent form', { vocabulary: 'style', limit: '1e2' }, 'limit'],
+    [
+      'a public_domain_only string of 1',
+      { vocabulary: 'style', public_domain_only: '1' },
+      'public_domain_only',
+    ],
   ])('rejects %s as invalid arguments without calling upstream', async (_name, input, field) => {
     const fetchFake = installAicService(scriptedFetch(jsonResponder(aggregationEnvelope('v', []))));
     const result = await runToolContract(lookupVocabulary, input as never);

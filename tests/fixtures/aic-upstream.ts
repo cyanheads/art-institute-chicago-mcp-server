@@ -11,14 +11,25 @@ export const ARTWORK_LICENSE =
 export const AGENT_LICENSE = 'Synthetic CC0 license text for agents.';
 export const MOBILE_SOUND_LICENSE =
   'Synthetic noncommercial educational and personal use notice for mobile sounds.';
+export const SECTION_LICENSE =
+  'Synthetic noncommercial educational and personal use notice for publication sections, [retain] *all* notices.';
+export const TEXT_LICENSE = 'Synthetic CC0 license text for texts.';
 export const IIIF_URL = 'https://www.artic.edu/iiif/2';
 
 export const IMAGE_ID = '11111111-2222-3333-4444-555555555555';
 export const ALT_IMAGE_ID = '66666666-7777-8888-9999-000000000000';
 
+/** U+00A0, the non-breaking space upstream titles carry. */
+export const NBSP = String.fromCodePoint(0xa0);
+
 /** A deterministic uuid-shaped sound id; `n` distinguishes ids. */
 export function soundUuid(n: number): string {
   return `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+}
+
+/** A deterministic uuid-shaped text id, distinct from every `soundUuid`. */
+export function textUuid(n: number): string {
+  return `00000000-0000-5000-8000-${String(n).padStart(12, '0')}`;
 }
 
 // --- Envelopes ---------------------------------------------------------------
@@ -116,6 +127,8 @@ export function artworkRecord(
       alt_text: 'A synthetic landscape',
     },
     sound_ids: [],
+    section_ids: [],
+    text_ids: [],
     description: null,
     short_description: null,
     provenance_text: null,
@@ -156,6 +169,27 @@ export function soundRecord(uuid: string, overrides: Record<string, unknown> = {
     title: `Synthetic stop ${uuid.slice(-4)}`,
     type: 'sound',
     content: `https://www.artic.edu/assets/${uuid}`,
+    ...overrides,
+  };
+}
+
+export function textRecord(uuid: string, overrides: Record<string, unknown> = {}) {
+  return {
+    id: uuid,
+    title: `Synthetic text ${uuid.slice(-4)}`,
+    type: 'text',
+    content: `https://www.artic.edu/assets/${uuid}`,
+    ...overrides,
+  };
+}
+
+/** A `/sections` record's link fields, with the title's non-breaking space run the API sends. */
+export function sectionRecord(id: number, overrides: Record<string, unknown> = {}) {
+  return {
+    id,
+    title: `Cat. ${id} ${NBSP}Synthetic Entry, 1877`,
+    web_url: `https://publications.artic.edu/synthetic/reader/works/section/${id}`,
+    publication_title: 'Synthetic Paintings at the Art Institute of Chicago',
     ...overrides,
   };
 }

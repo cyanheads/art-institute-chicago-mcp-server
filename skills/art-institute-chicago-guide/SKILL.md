@@ -4,7 +4,7 @@ description: Gates and workflows for the artic_* tools over the Art Institute of
 license: Apache-2.0
 metadata:
   author: cyanheads
-  version: "1.1"
+  version: "1.2"
 ---
 
 ## Scope
@@ -17,7 +17,7 @@ The Art Institute of Chicago's own public API, keyless: its artworks, the artist
 |:--|:--|:--|
 | Artwork id (integer) | artic_search_artworks rows, exhibition `artworks[]`, artist `sample_works`; an `artic.edu/artworks/<id>` URL also works | artic_get_artworks; artic_search_exhibitions `artwork_id` |
 | Agent id (integer: person, culture, or organization) | artic_search_artists; an artwork's `artist_id` / `artist_ids`; artist facet rows | artic_search_artworks `artist_id`; artic_search_exhibitions `artist_id`; artic_search_artists `ids` |
-| Exhibition id, audio-guide stop id, related-media uuid | their own results | No tool takes them. Use the row's `web_url`, `audio_url`, or `url` |
+| Exhibition id, audio-guide stop id, related-media uuid, publication section id | their own results | No tool takes them. Use the row's `web_url`, `audio_url`, or `url` |
 | `ulan_id` | artist records, rarely | Getty ULAN outside this server, never a museum id |
 
 ## Gates
@@ -32,7 +32,7 @@ The Art Institute of Chicago's own public API, keyless: its artworks, the artist
 
 **A work's exhibition history is in its record, not in the exhibition links.** The `artwork_id` and `artist_id` filters on artic_search_exhibitions see only shows whose record lists artworks, which is a small share. For *La Grande Jatte*, `artwork_id` returns nothing, yet its `exhibition_history` section lists shows from 1886 on. The museum's own 2004 Seurat exhibition exists in the exhibition records but lists no artworks. To answer "where has this work been shown", request the `exhibition_history` section from artic_get_artworks. To get a show's dates, gallery, and web page, search artic_search_exhibitions by query text.
 
-**Missing text means unrecorded.** Most records carry no description and most carry no provenance; the field is simply absent. Say "the museum's record has no provenance text", never "no known provenance".
+**Missing text means unrecorded.** Most records carry no description and most carry no provenance; the field is simply absent. Say "the museum's record has no provenance text", never "no known provenance", for `provenance: unrecorded` results too.
 
 **Exhibition `status` does not mean current.** Shows that closed years ago can still read `Confirmed`. Use `when` (current, upcoming, past) or the date range instead. An exhibition row with no `end` has no recorded closing date, which is not the same as still open. `when` and the date filters read `status` only for those rows: one marked `Closed` counts as past (a window reads it as running on its opening date alone), and any other runs on from its opening. A row with no `start` is never current or upcoming, and a row with no dates at all matches no window, so a date search is not proof a show did not happen.
 
@@ -49,22 +49,26 @@ The Art Institute of Chicago's own public API, keyless: its artworks, the artist
 | Titles, dates, credits, facets, exhibition records | CC0, nothing owed |
 | `description` or `short_description` text | Credit the Art Institute of Chicago with the record's `web_url` (the response carries `description_attribution`) |
 | An image | Reusable only when `image.rights` is `public_domain`; only those records carry `url_large` (1686px) and `manifest_url`. The 843px `url` on an `in_copyright` work is for viewing, so don't offer it for download, print, or reuse |
+| `related_media` titles and links (sound recordings, text documents) | CC0, nothing owed. That covers the record, not the file at `url`: some linked texts are third-party work, such as poems, so check the file before reusing it |
+| `publication_sections`, or text read at their `web_url` | Noncommercial educational or personal use only, although `license_text` calls the rest of the record CC0. Keep the response's `publication_license_text` and `publication_citation` with it, and cite the section's `web_url` |
 | An audio-guide transcript or MP3 | Noncommercial educational or personal use only. Keep the response's `license_text` and `source_citation` with it |
 
 ## Workflows
 
 **Counts and breakdowns.** A search with `limit` 0 and facets returns exact totals, even far past 1,000, with no rows. Each facet lists its top 15 values, and `facets` takes all eleven names in one call: department, artwork_type, style, subject, classification, material, technique, theme, place_of_origin, gallery, and artist. Department, artwork type, and place of origin hold at most one value per work, so their counts never overlap; they add up to the total only when the facet lists every value (it shows the top 15) and every work carries one. Style, subject, classification, material, technique, theme, and artist hold several values per work, so their counts overlap. In the Moche set, `ceramics`, `earthenware`, and `art of the americas` each cover nearly every work, so don't sum them or read them as shares. Gallery holds at most one value, but only works on view carry one, so its counts cover on-view works alone. To ask which galleries hold a set, filter `on_view_only` and facet `gallery`. To count a value that is not among the top 15, list candidates with artic_lookup_vocabulary, whose counts span the whole collection (or public-domain works only), then run one `limit` 0 search per value with your other filters.
 
-**Listing more than 1,000 matches.** Paging stops at match 1,000, and a page holds up to 100 rows (the default is 10, so set `limit`; artic_get_artworks and artist `ids` also take 100 ids per call, with `deferred_ids` for the rest). Use a `limit` that divides 1,000 (10, 20, 25, 50, or 100): with any other, the last page ends short of match 1,000 (at `limit` 30, page 33 ends at match 990). Keep the same `limit` when following `next_page`. Split the set with filters until each slice holds under 1,000, and check each slice's total with `limit` 0 before listing it. Year windows, department, artwork type, or one facet value per slice all work. Year filters match by overlap: a work dated 1400–1599 falls into every window inside that span. Adjacent year slices therefore repeat broadly dated works, so dedupe by id and read `date_display` before calling a work "from" a window.
+**Listing more than 1,000 matches.** Paging stops at match 1,000, and a page holds up to 100 rows (the default is 10, so set `limit`; artic_get_artworks and artist `ids` also take 100 ids per call, with `deferred_ids` for the rest). Any `limit` reaches match 1,000: one that doesn't divide 1,000 ends on a shorter page, and the notice says so. Keep the same `limit` when following `next_page`. Split the set with filters until each slice holds under 1,000, and check each slice's total with `limit` 0 before listing it. Year windows, department, artwork type, or one facet value per slice all work. Year filters match by overlap: a work dated 1400–1599 falls into every window inside that span. Adjacent year slices therefore repeat broadly dated works, so dedupe by id and read `date_display` before calling a work "from" a window.
 
 **Highlights.** With no query text, results come in the museum's popularity order. The themes `Art Institute Icons` and `Essentials` are curated highlight sets, and adding `on_view_only` gives the ones in the galleries now.
 
-**Provenance research.** Query text searches provenance, so a dealer's or collector's name (`Durand-Ruel`) finds works whose ownership history names them. Narrow with `artist_id` or a year range, then read the `provenance` section (on by default) with artic_get_artworks, up to 100 ids per call. Request only the sections you will read: every section on 100 well-documented works comes to about 1.4 MB.
+**Provenance research.** Query text searches provenance, so a dealer's or collector's name (`Durand-Ruel`) finds works whose ownership history names them. Narrow with `artist_id` or a year range, then read the `provenance` section (on by default) with artic_get_artworks, up to 100 ids per call. Request only the sections you will read: every section on 100 well-documented works comes to about 1.5 MB.
 
-For a review keyed to when the museum acquired works (made before 1946 and acquired after 1932, say), `acquired_from` / `acquired_to` and `acquisition_fiscal_year` help but do not complete the set. Works with no recorded fiscal year never match the acquired filters and many works fall in that group, so also search them by year range alone and read their `provenance` text. Search rows carry `main_reference_number`, so a query for an accession number such as `1942.51` shows which row is the exact match.
+For a review keyed to when the museum acquired works (made before 1946 and acquired after 1932, say), `acquired_from` / `acquired_to` and `acquisition_fiscal_year` help but do not complete the set. Works with no recorded fiscal year never match the acquired filters and many works fall in that group, so also search by year range without the acquired filters. Set `provenance` to split either search: `recorded` lists works whose record carries provenance text to read, `unrecorded` those still to trace, and `limit` 0 counts each in one call. `recorded` means text is present, not that the chain of ownership is complete, so read it before calling a work cleared. Search rows carry `main_reference_number`, so a query for an accession number such as `1942.51` shows which row is the exact match.
+
+**Scholarship.** About 950 works carry `publication_sections` on artic_get_artworks: links to their entries in the museum's online scholarly catalogues. The tool returns the links alone, and the publications site can refuse automated fetches (403), so pass `web_url` on for the person to open. With `include_related_media` on and no notice naming a failed or capped load, a record without the field has no linked section the museum's API returns, which says nothing about print publications; those are in the `publication_history` section. A call loads at most 100 sections across its records, and the notice names the records left short.
 
 **Audio.** There are two separate sources:
-- artic_get_artworks `related_media` lists the media the museum links to that artwork id (lectures, podcasts, audio stops) as asset links, without transcripts.
+- artic_get_artworks `related_media` lists the media the museum links to that artwork id (lectures, podcasts, audio stops, then text documents) as asset links, without transcripts.
 - artic_search_audio_guide returns mobile-guide stops with full transcripts and MP3 links, but no artwork id.
 
 To find stops for a work, search the guide with the work's title or the artist's surname and confirm each match from the transcript. A query can return stops about other works that only mention yours, and stop titles are often file codes. One work can have several stops, such as a commentary and a verbal-description track. A page holds 2 stops by default, each with its whole transcript, and up to 100 with `limit`, so raise `limit` to read up to 100 matching stops in one call.

@@ -10,13 +10,13 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getAicService } from '@/services/aic/aic-service.js';
 import {
-  blankAsUnset,
+  numberInput,
   PAGE_MAX,
   pageInfo,
+  pageWindow,
   printableUrl,
   quoteBlock,
-  SEARCH_WINDOW,
-  WINDOW_NOTICE,
+  windowNotices,
 } from '@/services/aic/aic-text.js';
 import { titleText, yesNo } from '../artwork-output.js';
 
@@ -37,10 +37,10 @@ export const searchAudioGuide = tool('artic_search_audio_guide', {
       .describe(
         "Text matched against stop titles and transcripts; every word must match, except common English words such as the and of, which are ignored. An artwork's title or the artist's surname works well.",
       ),
-    page: blankAsUnset(z.number().int().min(1).max(1000).default(1)).describe(
-      'Page to return (1-based); page times the applied limit may not exceed 1,000.',
+    page: numberInput(z.number().int().min(1).max(1000).default(1)).describe(
+      'Page to return (1-based). A page must start within the first 1,000 matches; one that crosses match 1,000 holds only the rows up to it.',
     ),
-    limit: blankAsUnset(z.number().int().min(1).max(1000).default(2)).describe(
+    limit: numberInput(z.number().int().min(1).max(1000).default(2)).describe(
       `Requested stops per page (1-1,000); at most ${PAGE_MAX} are returned, each with its whole transcript.`,
     ),
   }),
@@ -81,7 +81,7 @@ export const searchAudioGuide = tool('artic_search_audio_guide', {
       .number()
       .optional()
       .describe(
-        'Page to request next; absent when nothing remains or the next page would pass the first 1,000 matches.',
+        'Page to request next; absent when nothing remains or the next page would start past match 1,000.',
       ),
     license_text: z
       .string()
@@ -99,18 +99,18 @@ export const searchAudioGuide = tool('artic_search_audio_guide', {
       .string()
       .optional()
       .describe(
-        'Guidance when nothing matched, more pages exist, or the reachable window is exhausted.',
+        'Guidance when nothing matched, more pages exist, the page was shortened at match 1,000, or the reachable window is exhausted.',
       ),
   },
   errors: [
     {
       reason: 'page_beyond_window',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'page times the applied limit exceeds 1,000, past the reachable search window.',
+      when: 'The page starts past match 1,000, the last reachable one: (page - 1) times the applied limit is 1,000 or more.',
       retryable: false,
       severity: 'notice',
       recovery:
-        "Only the first 1,000 matches are reachable. Add words to the artic_search_audio_guide query, such as the artwork title or the artist's surname.",
+        "Only the first 1,000 matches are reachable. Add words to the artic_search_audio_guide query, such as the artwork title or the artist's surname, and start again at page 1.",
     },
     {
       reason: 'rate_limited',
@@ -147,10 +147,11 @@ export const searchAudioGuide = tool('artic_search_audio_guide', {
     ctx.enrich.total(0);
     ctx.enrich({ truncated: false, shown: 0, cap: input.limit });
 
-    if (input.page * input.limit > SEARCH_WINDOW) {
+    const { firstMatch, position } = pageWindow(input.page, input.limit);
+    if (position === 'beyond') {
       throw ctx.fail(
         'page_beyond_window',
-        `Page ${input.page} with limit ${input.limit} reaches match ${input.page * input.limit}, past the first 1,000.`,
+        `Page ${input.page} with limit ${input.limit} starts at match ${firstMatch}, past the first 1,000.`,
       );
     }
 
@@ -171,8 +172,8 @@ export const searchAudioGuide = tool('artic_search_audio_guide', {
       notice = `Page ${input.page} is past the last match (${result.total} total); request a lower page.`;
     } else if (paging.next_page !== undefined) {
       notice = `More matches: call again with page ${paging.next_page}.`;
-    } else if (paging.windowExhausted) {
-      notice = WINDOW_NOTICE;
+    } else {
+      notice = windowNotices(result.total, input.page, input.limit).join(' ');
     }
     if (requestedLimit > input.limit)
       notice =

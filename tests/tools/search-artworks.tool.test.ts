@@ -18,6 +18,7 @@ import {
   behindFirewall,
   hangingResponder,
   jsonResponder,
+  numberedSearch,
   type Responder,
   scriptedFetch,
   searchBodyOf,
@@ -74,11 +75,13 @@ const FIELDS =
   'id,title,main_reference_number,fiscal_year,artist_display,artist_id,artist_title,date_display,date_start,date_end,medium_display,artwork_type_title,department_title,place_of_origin,is_public_domain,is_on_view,gallery_title,image_id,thumbnail';
 
 const PAGE_BOUND_RECOVERY =
-  'Only the first 1,000 matches of a search are reachable. Narrow artic_search_artworks with filters such as department, artwork_type, or year_from, using values from artic_lookup_vocabulary.';
+  'Only the first 1,000 matches of a search are reachable. Narrow artic_search_artworks with filters such as department, artwork_type, or year_from, using values from artic_lookup_vocabulary, and start again at page 1.';
 const YEAR_RANGE_RECOVERY =
   'Set year_from at or below year_to and acquired_from at or below acquired_to; use negative years for BCE, for example year_from -500.';
 const ACQUIRED_EXCLUSION =
   'Works with no recorded acquisition fiscal year are excluded; drop acquired_from/acquired_to to include them.';
+const SHORTENED_84_OF_12 =
+  'Page 84 starts at match 997 and holds only the rows that remain inside the first 1,000 matches, so it is shorter than the limit of 12.';
 
 /**
  * A stored style title, precomposed (NFC) as every stored vocabulary value is,
@@ -266,6 +269,84 @@ describe('artic_search_artworks request', () => {
     expect(result.isError).toBeUndefined();
     expect(bodyOf(blankFetch)).toEqual(bodyOf(fetchFake));
     expect(structuredOf<SearchRun>(result).sort_applied).toBe('popularity');
+  });
+
+  it('reads numbers and booleans sent as strings as the values they spell', async () => {
+    const page = searchEnvelope(rows(5, 6), 40);
+    const spelledFetch = serve(page);
+    const spelled = await search({
+      artist_id: '36062',
+      year_from: '-500',
+      year_to: ' 1945 ',
+      acquired_from: '1933',
+      acquired_to: '1950',
+      public_domain_only: 'true',
+      on_view_only: ' true ',
+      has_image: 'false',
+      page: '2',
+      limit: '5',
+    });
+    expect(bodyOf(spelledFetch)).toMatchObject({ page: 2, limit: 5 });
+    expect(filtersOf(spelledFetch)).toEqual([
+      { term: { artist_ids: 36062 } },
+      { range: { date_end: { gte: -500 } } },
+      { range: { date_start: { lte: 1945 } } },
+      { range: { date_start: { gte: -8000 } } },
+      { range: { date_end: { lte: 2100 } } },
+      { range: { fiscal_year: { gte: 1933, lte: 1950 } } },
+      { term: { is_public_domain: true } },
+      { term: { is_on_view: true } },
+    ]);
+    serve(page);
+    const typed = await search({
+      artist_id: 36062,
+      year_from: -500,
+      year_to: 1945,
+      acquired_from: 1933,
+      acquired_to: 1950,
+      public_domain_only: true,
+      on_view_only: true,
+      has_image: false,
+      page: 2,
+      limit: 5,
+    });
+    expect(structuredOf<SearchRun>(spelled)).toEqual(structuredOf<SearchRun>(typed));
+    expect(contentText(spelled)).toBe(contentText(typed));
+    expect(structuredOf<SearchRun>(spelled)).toMatchObject({ page: 2, cap: 5, shown: 5 });
+  });
+
+  it('keeps string inputs that look like numbers or booleans as text', async () => {
+    const fetchFake = emptyResults();
+    const result = await search({ query: '1942', artist: 'true', theme: '5', facets: 'style' });
+    expect(result.isError).toBeUndefined();
+    expect(bodyOf(fetchFake).query).toEqual({
+      bool: {
+        must: [{ simple_query_string: { query: '1942', default_operator: 'and' } }],
+        filter: [
+          { match: { artist_titles: { query: 'true', operator: 'and' } } },
+          { term: { 'theme_titles.keyword': { value: '5', case_insensitive: true } } },
+        ],
+      },
+    });
+  });
+
+  it.each([
+    ['limit', '1001', 'Too big: expected number to be <=1000'],
+    ['artist_id', '0', 'Too small: expected number to be >0'],
+    ['artist_id', '2.5', 'Invalid input: expected int, received number'],
+    ['year_from', '-8001', 'Too small: expected number to be >=-8000'],
+  ])('holds %s %j to the check its number fails', async (field, value, message) => {
+    const fetchFake = emptyResults();
+    const spelled = await search({ [field]: value });
+    const error = errorOf(spelled);
+    expect(error.data).toMatchObject({
+      reason: 'invalid_arguments',
+      issues: [{ path: [field], message }],
+      recovery: { hint: `${field}: ${message}` },
+    });
+    expect(error).toEqual(errorOf(await search({ [field]: Number(value) })));
+    expect(textOf(spelled)).toContain(`${field}: ${message}`);
+    expect(fetchFake).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -696,6 +777,42 @@ describe('artic_search_artworks request', () => {
   });
 });
 
+// --- Provenance -----------------------------------------------------------------------
+
+describe('artic_search_artworks provenance', () => {
+  it('filters on provenance_text and returns the rows on both surfaces', async () => {
+    const fetchFake = installAicService(scriptedFetch(jsonResponder(searchEnvelope(rows(2), 2))));
+    const result = await search({ provenance: 'recorded', department: 'Textiles' });
+    expect(filtersOf(fetchFake)).toEqual([
+      { term: { 'department_title.keyword': { value: 'Textiles', case_insensitive: true } } },
+      { exists: { field: 'provenance_text' } },
+    ]);
+    expect(structuredOf<SearchRun>(result).artworks.map((artwork) => artwork.id)).toEqual([1, 2]);
+    expect(contentText(result)).toContain('(id 2)');
+    await search({ provenance: 'unrecorded' });
+    expect(bodyOf(fetchFake, 1).query).toEqual({
+      bool: { must_not: [{ exists: { field: 'provenance_text' } }] },
+    });
+  });
+
+  it.each(['', '   '])('reads a blank %j as unset', async (provenance) => {
+    const fetchFake = emptyResults();
+    expect((await search({ provenance })).isError).toBeUndefined();
+    expect(bodyOf(fetchFake)).toEqual({ page: 1, limit: 10, fields: FIELDS });
+  });
+
+  it('says the filter reads presence, not completeness, and what acquired years still leave out', () => {
+    const schema = z.toJSONSchema(searchArtworks.input, { io: 'input' });
+    expect(schema.properties?.provenance).toStrictEqual({
+      type: 'string',
+      enum: ['recorded', 'unrecorded'],
+      description:
+        'recorded keeps only works whose record carries provenance text; unrecorded keeps only works whose record carries none. The filter reads whether text is present, which says nothing about whether the provenance is complete. With acquired_from or acquired_to, works with no recorded acquisition year are still left out.',
+    });
+    expect(schema.required ?? []).not.toContain('provenance');
+  });
+});
+
 // --- Validation -----------------------------------------------------------------------
 
 describe('artic_search_artworks validation', () => {
@@ -705,6 +822,8 @@ describe('artic_search_artworks validation', () => {
     ['page 0', { page: 0 }, 'page'],
     ['page 1001', { page: 1001 }, 'page'],
     ['an unknown sort', { sort: 'newest' }, 'sort'],
+    ['an unknown provenance', { provenance: 'complete' }, 'provenance'],
+    ['a boolean provenance', { provenance: true }, 'provenance'],
     ['an unknown facet', { facets: 'department,bogus' }, 'facets'],
     ['artist_id 0', { artist_id: 0 }, 'artist_id'],
     ['a fractional artist_id', { artist_id: 1.5 }, 'artist_id'],
@@ -713,7 +832,8 @@ describe('artic_search_artworks validation', () => {
     ['acquired_from before 1879', { acquired_from: 1878 }, 'acquired_from'],
     ['acquired_to past 2100', { acquired_to: 2101 }, 'acquired_to'],
     ['a fractional acquired_from', { acquired_from: 1933.5 }, 'acquired_from'],
-    ['a numeric-string acquired_to', { acquired_to: '1945' }, 'acquired_to'],
+    ['a zero-padded acquired_to string', { acquired_to: '01945' }, 'acquired_to'],
+    ['an upper-case has_image string', { has_image: 'TRUE' }, 'has_image'],
     ['a 201-character query', { query: 'x'.repeat(201) }, 'query'],
     ['a 121-character artist', { artist: 'x'.repeat(121) }, 'artist'],
     ['a 121-character department', { department: 'x'.repeat(121) }, 'department'],
@@ -812,7 +932,7 @@ describe('artic_search_artworks validation', () => {
 
 describe('artic_search_artworks window and range guards', () => {
   it.each([
-    [84, 12],
+    [85, 12],
     [11, 100],
     [50, 100],
     [1000, 2],
@@ -984,16 +1104,79 @@ describe('artic_search_artworks paging', () => {
     expect(out).toMatchObject({ has_more: true, next_page: 100 });
   });
 
-  it('withholds next_page and names the window when the next page would cross 1,000', async () => {
+  it('points the last whole page at the page that crosses 1,000', async () => {
     serve(searchEnvelope(rows(12, 985), 5000));
     const out = structuredOf<SearchRun>(await search({ page: 83, limit: 12 }));
     expect(out).toMatchObject({
       has_more: true,
+      next_page: 84,
       truncated: true,
       shown: 12,
-      notice: WINDOW_NOTICE,
+      notice: 'More matches: call again with page 84.',
     });
+  });
+
+  it('returns the matches left inside the window on the crossing page and says it was shortened', async () => {
+    const fetchFake = installAicService(scriptedFetch(numberedSearch(5000, artworkRecord)));
+    const result = await search({ page: 84, limit: 12, acquired_from: 1933 });
+    const out = structuredOf<SearchRun>(result);
+    expect(out).toMatchObject({
+      page: 84,
+      has_more: true,
+      truncated: true,
+      totalCount: 5000,
+      shown: 4,
+      cap: 12,
+      notice: `${SHORTENED_84_OF_12} ${WINDOW_NOTICE} ${ACQUIRED_EXCLUSION}`,
+    });
+    expect(out.artworks.map((artwork) => artwork.id)).toEqual([997, 998, 999, 1000]);
     expect(out).not.toHaveProperty('next_page');
+    expect(bodyOf(fetchFake)).toMatchObject({ from: 996, limit: 4 });
+    // The trailer reads shown 4, cap 12, then why.
+    expect(contentText(result)).toContain(
+      `**truncated:** true\n**shown:** 4\n**cap:** 12\n> ${SHORTENED_84_OF_12} ${WINDOW_NOTICE} ${ACQUIRED_EXCLUSION}`,
+    );
+    for (const id of [997, 998, 999, 1000]) expect(contentText(result)).toContain(`(id ${id})`);
+  });
+
+  it.each([
+    [1000, [997, 998, 999, 1000]],
+    [998, [997, 998]],
+  ])('ends all %i matches on the crossing page', async (total, ids) => {
+    installAicService(scriptedFetch(numberedSearch(total, artworkRecord)));
+    const result = await search({ page: 84, limit: 12 });
+    const out = structuredOf<SearchRun>(result);
+    expect(out).toMatchObject({
+      has_more: false,
+      truncated: false,
+      totalCount: total,
+      shown: ids.length,
+      cap: 12,
+    });
+    expect(out.artworks.map((artwork) => artwork.id)).toEqual(ids);
+    expect(out).not.toHaveProperty('next_page');
+    expect(out).not.toHaveProperty('notice');
+    expect(contentText(result)).toContain(
+      `**truncated:** false\n**shown:** ${ids.length}\n**cap:** 12`,
+    );
+    expect(contentText(result)).not.toContain('shorter than the limit');
+  });
+
+  it('explains a crossing page past the last match rather than calling it shortened', async () => {
+    installAicService(scriptedFetch(numberedSearch(995, artworkRecord)));
+    const result = await search({ page: 84, limit: 12 });
+    const out = structuredOf<SearchRun>(result);
+    const pastEnd = 'Page 84 is past the last match (995 total); request a lower page.';
+    expect(out).toMatchObject({ has_more: false, truncated: false, shown: 0, notice: pastEnd });
+    expect(out).not.toHaveProperty('next_page');
+    expect(contentText(result)).toContain(`> ${pastEnd}`);
+  });
+
+  it('gives zero-hit guidance on the crossing page of a search that matches nothing', async () => {
+    emptyResults();
+    const out = structuredOf<SearchRun>(await search({ page: 84, limit: 12, department: 'Nope' }));
+    expect(out.notice).toMatch(/^No artworks matched\. Check filter values/);
+    expect(out.notice).not.toContain('shorter than');
   });
 
   it('at limit 100 points page 9 to page 10, which ends the window at match 1,000', async () => {
@@ -1142,6 +1325,43 @@ describe('artic_search_artworks zero-hit guidance', () => {
       }),
     ).toBe(
       'No artworks matched. Check filter values with artic_lookup_vocabulary (vocabulary "department") — values match exactly, ignoring case. Resolve the name with artic_search_artists and pass artist_id instead. Confirm the id with artic_search_artists (ids mode); an agent with no artworks matches nothing. All words must match; try fewer words or quote an exact phrase. Drop public_domain_only to widen the set. Widen year_from/year_to; a work matches when its date span overlaps the range.',
+    );
+  });
+
+  it.each([
+    [
+      'recorded',
+      'Drop provenance "recorded" to include works whose record carries no provenance text.',
+    ],
+    [
+      'unrecorded',
+      'Drop provenance "unrecorded" to include works whose record carries provenance text.',
+    ],
+  ])('names provenance %s as a condition to drop, on both surfaces', async (provenance, hint) => {
+    emptyResults();
+    const result = await search({ provenance, limit: 0, year_to: 1945 });
+    const { notice } = structuredOf<SearchRun>(result);
+    expect(notice).toBe(
+      `No artworks matched. Widen year_from/year_to; a work matches when its date span overlaps the range. ${hint}`,
+    );
+    expect(contentText(result)).toContain(`> ${notice}`);
+    expect(await zeroHit({ provenance, acquired_from: 1933 })).toBe(
+      `No artworks matched. ${hint} ${ACQUIRED_EXCLUSION}`,
+    );
+  });
+
+  it('adds no notice for provenance when matches exist, beyond what other filters add', async () => {
+    serve(searchEnvelope(rows(2), 2));
+    const alone = await search({ provenance: 'unrecorded' });
+    expect(structuredOf<SearchRun>(alone)).not.toHaveProperty('notice');
+    expect(contentText(alone)).toContain('(id 2)');
+    serve(searchEnvelope([], 455));
+    expect(
+      structuredOf<SearchRun>(
+        await search({ provenance: 'unrecorded', limit: 0, acquired_from: 1933 }),
+      ).notice,
+    ).toBe(
+      `Counts only (limit 0); set limit between 1 and 100 to list the matching artworks. ${ACQUIRED_EXCLUSION}`,
     );
   });
 

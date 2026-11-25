@@ -10,14 +10,16 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getAicService } from '@/services/aic/aic-service.js';
 import {
   blankAsUnset,
+  booleanInput,
   idListInput,
   inlineSafe,
+  numberInput,
   numericIdItem,
   PAGE_MAX,
   pageInfo,
+  pageWindow,
   quoteBlock,
-  SEARCH_WINDOW,
-  WINDOW_NOTICE,
+  windowNotices,
   YEAR_MAX,
   YEAR_MIN,
 } from '@/services/aic/aic-text.js';
@@ -133,19 +135,19 @@ export const searchArtists = tool('artic_search_artists', {
     ).describe(
       `Agent ids as an array or comma-separated string, up to 1,000 supplied entries including blanks and duplicates. Comma strings also have a 100,000-character ceiling. Blanks and duplicates are dropped; fetches the first ${PAGE_MAX} and returns deferred_ids. Pass query or ids, not both; other filters and page apply to query only.`,
     ),
-    artists_only: blankAsUnset(z.boolean().default(true)).describe(
+    artists_only: booleanInput(z.boolean().default(true)).describe(
       'Query mode: only agents the museum records as artists. Set false to include donors, funds, and organizations.',
     ),
-    born_from: blankAsUnset(z.number().int().min(YEAR_MIN).max(YEAR_MAX).optional()).describe(
+    born_from: numberInput(z.number().int().min(YEAR_MIN).max(YEAR_MAX).optional()).describe(
       'Query mode: earliest birth year, negative for BCE.',
     ),
-    born_to: blankAsUnset(z.number().int().min(YEAR_MIN).max(YEAR_MAX).optional()).describe(
+    born_to: numberInput(z.number().int().min(YEAR_MIN).max(YEAR_MAX).optional()).describe(
       'Query mode: latest birth year, negative for BCE.',
     ),
-    page: blankAsUnset(z.number().int().min(1).max(1000).default(1)).describe(
-      'Query mode: page to return (1-based); page times the applied limit may not exceed 1,000.',
+    page: numberInput(z.number().int().min(1).max(1000).default(1)).describe(
+      'Query mode: page to return (1-based). A page must start within the first 1,000 matches; one that crosses match 1,000 holds only the rows up to it.',
     ),
-    limit: blankAsUnset(z.number().int().min(1).max(1000).default(10)).describe(
+    limit: numberInput(z.number().int().min(1).max(1000).default(10)).describe(
       `Query mode: requested agents per page (1-1,000); at most ${PAGE_MAX} are returned.`,
     ),
   }),
@@ -175,7 +177,7 @@ export const searchArtists = tool('artic_search_artists', {
       .number()
       .optional()
       .describe(
-        'Page to request next; absent when nothing remains or the next page would pass the first 1,000 matches.',
+        'Page to request next; absent when nothing remains or the next page would start past match 1,000.',
       ),
     artists_only_applied: z
       .boolean()
@@ -205,7 +207,7 @@ export const searchArtists = tool('artic_search_artists', {
       .string()
       .optional()
       .describe(
-        'Guidance when nothing matched, ids were missing, more pages exist, the reachable window is exhausted, or artwork counts could not be loaded.',
+        'Guidance when nothing matched, ids were missing, more pages exist, the page was shortened at match 1,000, the reachable window is exhausted, or artwork counts could not be loaded.',
       ),
   },
   errors: [
@@ -238,11 +240,11 @@ export const searchArtists = tool('artic_search_artists', {
     {
       reason: 'page_beyond_window',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'page times the applied limit exceeds 1,000, past the reachable search window.',
+      when: 'The page starts past match 1,000, the last reachable one: (page - 1) times the applied limit is 1,000 or more.',
       retryable: false,
       severity: 'notice',
       recovery:
-        'Only the first 1,000 matches are reachable. Add more of the name, or set born_from and born_to, and call artic_search_artists again.',
+        'Only the first 1,000 matches are reachable. Add more of the name, or set born_from and born_to, and call artic_search_artists again from page 1.',
     },
     {
       reason: 'rate_limited',
@@ -332,10 +334,11 @@ export const searchArtists = tool('artic_search_artists', {
     if (!query) {
       throw ctx.fail('query_or_ids_required', 'Neither query nor ids was given.');
     }
-    if (input.page * input.limit > SEARCH_WINDOW) {
+    const { firstMatch, position } = pageWindow(input.page, input.limit);
+    if (position === 'beyond') {
       throw ctx.fail(
         'page_beyond_window',
-        `Page ${input.page} with limit ${input.limit} reaches match ${input.page * input.limit}, past the first 1,000.`,
+        `Page ${input.page} with limit ${input.limit} starts at match ${firstMatch}, past the first 1,000.`,
       );
     }
     if (
@@ -388,8 +391,8 @@ export const searchArtists = tool('artic_search_artists', {
       );
     } else if (paging.next_page !== undefined) {
       fragments.push(`More matches: call again with page ${paging.next_page}.`);
-    } else if (paging.windowExhausted) {
-      fragments.push(WINDOW_NOTICE);
+    } else {
+      fragments.push(...windowNotices(result.total, input.page, input.limit));
     }
     if (degraded) fragments.push(STATS_DEGRADED);
     const notice = fragments.join(' ');

@@ -126,7 +126,7 @@ describe('artic_search_exhibitions request', () => {
   });
 
   it.each(['artwork_id', 'artist_id'])('rejects malformed %s before upstream', async (key) => {
-    for (const value of [0, -1, 1.5, '16568', 'bad', Number.MAX_SAFE_INTEGER + 1]) {
+    for (const value of [0, -1, 1.5, '016568', 'bad', Number.MAX_SAFE_INTEGER + 1]) {
       const fetchFake = emptyResults();
       const result = await search({ [key]: value });
       expect(errorOf(result).code).toBe(JsonRpcErrorCode.InvalidParams);
@@ -296,6 +296,37 @@ describe('artic_search_exhibitions request', () => {
     });
   });
 
+  it('reads numbers sent as strings as the values they spell', async () => {
+    const page = searchEnvelope(rows(5, 6), 40);
+    const spelledFetch = serve(page);
+    const spelled = await search({
+      query: '1942',
+      artwork_id: '16568',
+      artist_id: ' 35809 ',
+      page: '2',
+      limit: '5',
+    });
+    expect(bodyOf(spelledFetch)).toMatchObject({ page: 2, limit: 5 });
+    expect(mustOf(spelledFetch)).toEqual([
+      { simple_query_string: { query: '1942', default_operator: 'and' } },
+    ]);
+    expect(filtersOf(spelledFetch)).toEqual([
+      { term: { artwork_ids: 16568 } },
+      { term: { artist_ids: 35809 } },
+    ]);
+    serve(page);
+    const typed = await search({
+      query: '1942',
+      artwork_id: 16568,
+      artist_id: 35809,
+      page: 2,
+      limit: 5,
+    });
+    expect(structuredOf<ExhibitionsRun>(spelled)).toEqual(structuredOf<ExhibitionsRun>(typed));
+    expect(structuredOf<ExhibitionsRun>(spelled)).toMatchObject({ page: 2, cap: 5, shown: 5 });
+    expect(spelled.content).toEqual(typed.content);
+  });
+
   it('reads a blank query beside a sort as no query', async () => {
     const fetchFake = emptyResults();
     const out = structuredOf<ExhibitionsRun>(await search({ query: '  ', sort: 'start_asc' }));
@@ -440,7 +471,7 @@ describe('artic_search_exhibitions date-range guard', () => {
     expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
     expect(error.data.reason).toBe('page_beyond_window');
     expect(error.data.recovery?.hint).toBe(
-      'Only the first 1,000 matches are reachable. Narrow artic_search_exhibitions with artwork_id, artist_id, query text, when, or date_from and date_to.',
+      'Only the first 1,000 matches are reachable. Narrow artic_search_exhibitions with artwork_id, artist_id, query text, when, or date_from and date_to, and start again at page 1.',
     );
   });
 });

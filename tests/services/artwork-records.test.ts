@@ -1,8 +1,9 @@
 /**
  * @fileoverview Tests for `loadArtworkRecords`: request-order records, missing
- * ids, the 100-id cap and deferred ids, the 100-item related-media cap,
- * degradation when the `/sounds` search fails, cancellation, and the
- * description attribution.
+ * ids, the 100-id cap and deferred ids, the linked sound recordings,
+ * publication sections, and text documents (concurrent loads, the 100-id cap
+ * and degradation per kind, cancellation), and the description and publication
+ * attributions.
  * @module tests/services/artwork-records.test.ts
  */
 
@@ -15,9 +16,13 @@ import {
   DEFAULT_SECTIONS,
   DESCRIPTION_ATTRIBUTION,
   loadArtworkRecords,
+  PUBLICATION_CITATION,
 } from '@/services/aic/artwork-records.js';
 import {
+  barrier,
   behindFirewall,
+  hangingResponder,
+  idSearchesOf,
   jsonResponder,
   networkErrorResponder,
   queryParam,
@@ -25,10 +30,12 @@ import {
   rejection,
   rejectionOf,
   routedFetch,
+  SECTIONS,
   SOUNDS,
   searchCallOf,
   soundSearchesOf,
   TEST_VERSION,
+  TEXTS,
   textResponder,
 } from '../fixtures/aic-service-kit.js';
 import {
@@ -37,9 +44,15 @@ import {
   ES_BAD_REQUEST_TEXT,
   envelope,
   inCopyrightArtworkRecord,
+  SECTION_LICENSE,
+  searchEnvelope,
+  sectionRecord,
   soundRecord,
   soundUuid,
   sparseArtworkRecord,
+  TEXT_LICENSE,
+  textRecord,
+  textUuid,
 } from '../fixtures/aic-upstream.js';
 
 const ARTWORKS = '/api/v1/artworks';
@@ -48,7 +61,7 @@ const UNATTEMPTED_NOTICE =
   'The first 100 ids were attempted; call artic_get_artworks again with deferred_ids for the rest.';
 
 const degradedNotice =
-  'Related media could not be loaded; the artwork records are complete. Call artic_get_artworks again to retry related media.';
+  'The linked sound recordings could not be loaded; the artwork records themselves are complete. Call artic_get_artworks again to retry.';
 
 function setup(routes: Record<string, Responder>) {
   const fetch = routedFetch(routes);
@@ -81,6 +94,58 @@ const artworkIdsRequested = (fetch: ReturnType<typeof routedFetch>): number[][] 
 /** `/sounds` searches recorded, as the uuid lists of their `id` terms filter. */
 const soundIdsRequested = (fetch: ReturnType<typeof routedFetch>): string[][] =>
   soundSearchesOf(fetch).map(({ ids }) => ids);
+
+/** `/sections` searches recorded, as the id lists of their `id` terms filter. */
+const sectionIdsRequested = (fetch: ReturnType<typeof routedFetch>): number[][] =>
+  idSearchesOf<number>(fetch, SECTIONS).map(({ ids }) => ids);
+
+/** `/texts` searches recorded, as the uuid lists of their `id` terms filter. */
+const textIdsRequested = (fetch: ReturnType<typeof routedFetch>): string[][] =>
+  idSearchesOf(fetch, TEXTS).map(({ ids }) => ids);
+
+/** Paths requested, in call order. */
+const pathsRequested = (fetch: ReturnType<typeof routedFetch>): string[] =>
+  fetch.mock.calls.map(([url]) => new URL(url).pathname);
+
+const warningsOf = (ctx: ReturnType<typeof createMockContext>): string[] =>
+  (ctx.log as MockContextLogger).calls.filter((c) => c.level === 'warning').map((c) => c.msg);
+
+/** An artwork linking one item of each kind, all numbered `id`. */
+const linkedArtwork = (id: number) =>
+  artworkRecord(id, { sound_ids: [soundUuid(id)], section_ids: [id], text_ids: [textUuid(id)] });
+
+const soundsResponder = (ns: number[]) =>
+  jsonResponder(searchEnvelope(ns.map((n) => soundRecord(soundUuid(n)))));
+const sectionsResponder = (ns: number[], license: string | null = SECTION_LICENSE) =>
+  jsonResponder(
+    searchEnvelope(
+      ns.map((n) => sectionRecord(n)),
+      ns.length,
+      { license },
+    ),
+  );
+const textsResponder = (ns: number[]) =>
+  jsonResponder(
+    searchEnvelope(
+      ns.map((n) => textRecord(textUuid(n))),
+      ns.length,
+      { license: TEXT_LICENSE },
+    ),
+  );
+
+/** Routes `artworks` plus each kind's search; a kind left out fails if it is requested. */
+const setupLinked = (
+  artworks: unknown[],
+  kinds: { sections?: Responder; sounds?: Responder; texts?: Responder },
+) =>
+  setup({
+    [ARTWORKS]: jsonResponder(envelope(artworks)),
+    ...(kinds.sounds ? { [SOUNDS]: kinds.sounds } : {}),
+    ...(kinds.sections ? { [SECTIONS]: kinds.sections } : {}),
+    ...(kinds.texts ? { [TEXTS]: kinds.texts } : {}),
+  });
+
+const range = (count: number, from = 1) => Array.from({ length: count }, (_, i) => from + i);
 
 afterEach(() => {
   disposeAicService();
@@ -169,7 +234,9 @@ describe('loadArtworkRecords', () => {
         createMockContext(),
       );
       expect(result.description_attribution).toBe(DESCRIPTION_ATTRIBUTION);
-      expect(DESCRIPTION_ATTRIBUTION).toContain('CC BY 4.0');
+      expect(DESCRIPTION_ATTRIBUTION).toBe(
+        "Description text © Art Institute of Chicago, CC BY 4.0 — cite the record's web_url.",
+      );
     });
 
     it('is present when only a short description exists', async () => {
@@ -242,7 +309,6 @@ describe('loadArtworkRecords', () => {
   describe('the 100-id cap', () => {
     const bulky = (id: number, chars: number) =>
       artworkRecord(id, { provenance_text: 'p'.repeat(chars) });
-    const range = (count: number, from = 1) => Array.from({ length: count }, (_, i) => from + i);
 
     it('attempts exactly 100 ids in one call, deferring none', async () => {
       const fetch = setup({
@@ -493,7 +559,7 @@ describe('loadArtworkRecords', () => {
         expect(result.artworks[1]?.related_media).toHaveLength(40);
         expect(result.artworks[2]).not.toHaveProperty('related_media');
         expect(result.notices).toEqual([
-          'Related media is capped at 100 items per call; artwork 2, 3 is missing some or all of its related media. Call artic_get_artworks with fewer ids to load it.',
+          'Linked sound recordings are capped at 100 per call; artwork 2, 3 is missing some or all of them. Call artic_get_artworks with fewer ids to load them.',
         ]);
       });
 
@@ -583,7 +649,7 @@ describe('loadArtworkRecords', () => {
       await loadArtworkRecords(request([1, 2]), ctx);
       const warnings = (ctx.log as MockContextLogger).calls.filter((c) => c.level === 'warning');
       expect(warnings).toHaveLength(1);
-      expect(warnings[0]?.msg).toContain('Related media could not be loaded');
+      expect(warnings[0]?.msg).toContain('sound recordings could not be loaded');
     });
 
     it('keeps the cap and degradation notices in order after a missing-id notice', async () => {
@@ -631,6 +697,537 @@ describe('loadArtworkRecords', () => {
       const ctx = createMockContext({ signal: controller.signal });
       const error = await rejectionOf(loadArtworkRecords(request([1]), ctx));
       expect((error as DOMException).message).toBe('cancelled by caller');
+    });
+  });
+
+  describe('publication sections and text documents', () => {
+    it('attaches each record its sections and its texts after its sounds, in the order its ids list them', async () => {
+      const fetch = setupLinked(
+        [
+          artworkRecord(1, {
+            sound_ids: [soundUuid(2), soundUuid(1)],
+            section_ids: [520264, 421375],
+            text_ids: [textUuid(9), textUuid(8)],
+          }),
+          artworkRecord(2, { section_ids: [36741370056, 421375] }),
+          artworkRecord(3, { text_ids: [textUuid(8)] }),
+          artworkRecord(4),
+        ],
+        {
+          sounds: soundsResponder([1, 2]),
+          sections: sectionsResponder([36741370056, 421375, 520264]),
+          texts: textsResponder([8, 9]),
+        },
+      );
+      const result = await loadArtworkRecords(request([1, 2, 3, 4]), createMockContext());
+      expect(result.artworks[0]?.related_media).toEqual([
+        {
+          id: soundUuid(2),
+          title: 'Synthetic stop 0002',
+          url: `https://www.artic.edu/assets/${soundUuid(2)}`,
+          type: 'sound',
+        },
+        {
+          id: soundUuid(1),
+          title: 'Synthetic stop 0001',
+          url: `https://www.artic.edu/assets/${soundUuid(1)}`,
+          type: 'sound',
+        },
+        {
+          id: textUuid(9),
+          title: 'Synthetic text 0009',
+          url: `https://www.artic.edu/assets/${textUuid(9)}`,
+          type: 'text',
+        },
+        {
+          id: textUuid(8),
+          title: 'Synthetic text 0008',
+          url: `https://www.artic.edu/assets/${textUuid(8)}`,
+          type: 'text',
+        },
+      ]);
+      const link = (id: number) => ({
+        id,
+        title: `Cat. ${id} Synthetic Entry, 1877`,
+        publication_title: 'Synthetic Paintings at the Art Institute of Chicago',
+        web_url: `https://publications.artic.edu/synthetic/reader/works/section/${id}`,
+      });
+      expect(result.artworks.map((a) => a.publication_sections)).toEqual([
+        [link(520264), link(421375)],
+        [link(36741370056), link(421375)],
+        undefined,
+        undefined,
+      ]);
+      expect(result.artworks[1]).not.toHaveProperty('related_media');
+      expect(result.artworks[2]?.related_media?.map((m) => m.id)).toEqual([textUuid(8)]);
+      expect(result.artworks[2]).not.toHaveProperty('publication_sections');
+      expect(result.artworks[3]).not.toHaveProperty('related_media');
+      expect(result.artworks[3]).not.toHaveProperty('publication_sections');
+      expect(sectionIdsRequested(fetch)).toEqual([[520264, 421375, 36741370056]]);
+      expect(textIdsRequested(fetch)).toEqual([[textUuid(9), textUuid(8)]]);
+      expect(result.notices).toEqual([]);
+    });
+
+    it.each([
+      ['sounds', { sound_ids: [soundUuid(1)] }, SOUNDS],
+      ['sections', { section_ids: [1] }, SECTIONS],
+      ['texts', { text_ids: [textUuid(1)] }, TEXTS],
+    ])('sends only the %s search when nothing else is linked', async (_kind, links, path) => {
+      const fetch = setup({
+        [ARTWORKS]: jsonResponder(envelope([artworkRecord(1, links), sparseArtworkRecord(2)])),
+        [path]: jsonResponder(envelope([])),
+      });
+      const result = await loadArtworkRecords(request([1, 2]), createMockContext());
+      expect(pathsRequested(fetch)).toEqual([ARTWORKS, path]);
+      expect(result.notices).toEqual([]);
+    });
+
+    it('loads every kind for the attempted ids when later ids were deferred', async () => {
+      const fetch = setupLinked([linkedArtwork(1)], {
+        sounds: soundsResponder([1]),
+        sections: sectionsResponder([1]),
+        texts: textsResponder([1]),
+      });
+      const result = await loadArtworkRecords(request(range(101)), createMockContext());
+      expect(result.deferred_ids).toEqual([101]);
+      expect(pathsRequested(fetch)).toEqual([ARTWORKS, SOUNDS, SECTIONS, TEXTS]);
+      expect(result.artworks).toHaveLength(1);
+      expect(result.artworks[0]?.related_media?.map((m) => m.type)).toEqual(['sound', 'text']);
+      expect(result.artworks[0]?.publication_sections).toHaveLength(1);
+      expect(result.publication_citation).toBe(
+        "Publication sections © Art Institute of Chicago and third parties, https://www.artic.edu/terms — cite the section's web_url.",
+      );
+    });
+
+    it('sends no linked-item search and attaches nothing when related media is declined', async () => {
+      const fetch = setupLinked([linkedArtwork(1)], {});
+      const result = await loadArtworkRecords(
+        request([1], { include_related_media: false }),
+        createMockContext(),
+      );
+      expect(pathsRequested(fetch)).toEqual([ARTWORKS]);
+      expect(result.artworks[0]).not.toHaveProperty('related_media');
+      expect(result.artworks[0]).not.toHaveProperty('publication_sections');
+      expect(result).not.toHaveProperty('publication_license_text');
+      expect(result).not.toHaveProperty('publication_citation');
+    });
+
+    it.each([
+      ['the API has none of the ids', sectionsResponder([]), textsResponder([])],
+      [
+        'no item has a usable URL',
+        jsonResponder(
+          searchEnvelope([
+            sectionRecord(1, { web_url: null }),
+            sectionRecord(2, { web_url: 'javascript:alert(1)' }),
+          ]),
+        ),
+        jsonResponder(searchEnvelope([textRecord(textUuid(1), { content: 'Prose.' })])),
+      ],
+    ])('carries neither, and no publication terms, when %s', async (_name, sections, texts) => {
+      setupLinked([artworkRecord(1, { section_ids: [1, 2], text_ids: [textUuid(1)] })], {
+        sections,
+        texts,
+      });
+      const result = await loadArtworkRecords(request([1]), createMockContext());
+      expect(result.artworks[0]).not.toHaveProperty('publication_sections');
+      expect(result.artworks[0]).not.toHaveProperty('related_media');
+      expect(result).not.toHaveProperty('publication_license_text');
+      expect(result).not.toHaveProperty('publication_citation');
+      expect(result.notices).toEqual([]);
+    });
+
+    it('keeps the sounds of a record whose texts loaded nothing, and the reverse', async () => {
+      setupLinked([linkedArtwork(1), linkedArtwork(2)], {
+        sounds: soundsResponder([1]),
+        sections: sectionsResponder([]),
+        texts: textsResponder([2]),
+      });
+      const result = await loadArtworkRecords(request([1, 2]), createMockContext());
+      expect(result.artworks.map((a) => a.related_media?.map((m) => m.type))).toEqual([
+        ['sound'],
+        ['text'],
+      ]);
+    });
+
+    describe('publication terms', () => {
+      it('carries the sections license verbatim and the citation when any record has a section', async () => {
+        setupLinked([artworkRecord(1), artworkRecord(2, { section_ids: [2] })], {
+          sections: sectionsResponder([2]),
+        });
+        const result = await loadArtworkRecords(request([1, 2]), createMockContext());
+        expect(result.license_text).toBe(ARTWORK_LICENSE);
+        expect(result.publication_license_text).toBe(SECTION_LICENSE);
+        expect(result.publication_citation).toBe(PUBLICATION_CITATION);
+        expect(PUBLICATION_CITATION).toBe(
+          "Publication sections © Art Institute of Chicago and third parties, https://www.artic.edu/terms — cite the section's web_url.",
+        );
+      });
+
+      it('carries neither for records with sounds and texts alone', async () => {
+        setupLinked([artworkRecord(1, { sound_ids: [soundUuid(1)], text_ids: [textUuid(1)] })], {
+          sounds: soundsResponder([1]),
+          texts: textsResponder([1]),
+        });
+        const result = await loadArtworkRecords(request([1]), createMockContext());
+        expect(result.artworks[0]?.related_media).toHaveLength(2);
+        expect(result).not.toHaveProperty('publication_license_text');
+        expect(result).not.toHaveProperty('publication_citation');
+      });
+
+      it('carries neither when the sections load failed', async () => {
+        setupLinked([linkedArtwork(1)], {
+          sounds: soundsResponder([1]),
+          sections: jsonResponder({}, 500),
+          texts: textsResponder([1]),
+        });
+        const result = await loadArtworkRecords(request([1]), createMockContext());
+        expect(result).not.toHaveProperty('publication_license_text');
+        expect(result).not.toHaveProperty('publication_citation');
+      });
+
+      it('carries both, the license empty, when the sections envelope states none', async () => {
+        setupLinked([artworkRecord(1, { section_ids: [1] })], {
+          sections: sectionsResponder([1], null),
+        });
+        const result = await loadArtworkRecords(request([1]), createMockContext());
+        expect(result.publication_license_text).toBe('');
+        expect(result.publication_citation).toBe(PUBLICATION_CITATION);
+      });
+    });
+
+    it('sends the three searches concurrently: none answers until all three are in flight', async () => {
+      const held = barrier(3);
+      const fetch = setupLinked([linkedArtwork(1)], {
+        sounds: held(soundsResponder([1])),
+        sections: held(sectionsResponder([1])),
+        texts: held(textsResponder([1])),
+      });
+      const result = await loadArtworkRecords(request([1]), createMockContext());
+      expect(pathsRequested(fetch)).toEqual([ARTWORKS, SOUNDS, SECTIONS, TEXTS]);
+      expect(result.artworks[0]?.related_media?.map((m) => m.type)).toEqual(['sound', 'text']);
+      expect(result.artworks[0]?.publication_sections).toHaveLength(1);
+      expect(result.notices).toEqual([]);
+    });
+
+    it('lists sounds before texts when the texts answer first', async () => {
+      const soundsMayAnswer = Promise.withResolvers<void>();
+      setupLinked([artworkRecord(1, { sound_ids: [soundUuid(1)], text_ids: [textUuid(1)] })], {
+        sounds: async (url, init) => {
+          await soundsMayAnswer.promise;
+          return await soundsResponder([1])(url, init);
+        },
+        texts: (url, init) => {
+          soundsMayAnswer.resolve();
+          return textsResponder([1])(url, init);
+        },
+      });
+      const result = await loadArtworkRecords(request([1]), createMockContext());
+      expect(result.artworks[0]?.related_media?.map((m) => m.type)).toEqual(['sound', 'text']);
+    });
+
+    describe('the 100-id cap of each kind', () => {
+      it('loads the first 100 section ids in record order and names the records left short', async () => {
+        const fetch = setupLinked(
+          [
+            artworkRecord(1, { section_ids: range(60) }),
+            artworkRecord(2, { section_ids: range(50, 61) }),
+            artworkRecord(3, { section_ids: range(3, 111) }),
+            artworkRecord(4, { section_ids: range(2) }),
+          ],
+          { sections: sectionsResponder(range(113)) },
+        );
+        const result = await loadArtworkRecords(request([1, 2, 3, 4]), createMockContext());
+        expect(sectionIdsRequested(fetch)).toEqual([range(100)]);
+        expect(result.artworks.map((a) => a.publication_sections?.length)).toEqual([
+          60,
+          40,
+          undefined,
+          2,
+        ]);
+        expect(result.artworks[2]).not.toHaveProperty('publication_sections');
+        expect(result.notices).toEqual([
+          'Linked publication sections are capped at 100 per call; artwork 2, 3 is missing some or all of them. Call artic_get_artworks with fewer ids to load them.',
+        ]);
+      });
+
+      it('loads the first 100 text ids in one posted search and names the records left short', async () => {
+        const uuids = range(102).map(textUuid);
+        const fetch = setupLinked(
+          [
+            artworkRecord(1, { text_ids: uuids.slice(0, 99) }),
+            artworkRecord(2, { text_ids: uuids.slice(99) }),
+          ],
+          { texts: behindFirewall(textsResponder(range(102))) },
+        );
+        const result = await loadArtworkRecords(request([1, 2]), createMockContext());
+        expect(textIdsRequested(fetch)).toEqual([uuids.slice(0, 100)]);
+        expect(searchCallOf(fetch, 1)).toMatchObject({ method: 'POST', body: { limit: 100 } });
+        expect(result.artworks.map((a) => a.related_media?.length)).toEqual([99, 1]);
+        expect(result.notices).toEqual([
+          'Linked text documents are capped at 100 per call; artwork 2 is missing some or all of them. Call artic_get_artworks with fewer ids to load them.',
+        ]);
+      });
+
+      it('does not cap or notify at exactly 100 ids of every kind', async () => {
+        const fetch = setupLinked(
+          [
+            artworkRecord(1, {
+              sound_ids: range(100).map(soundUuid),
+              section_ids: range(100),
+              text_ids: range(100).map(textUuid),
+            }),
+          ],
+          {
+            sounds: soundsResponder(range(100)),
+            sections: sectionsResponder(range(100)),
+            texts: textsResponder(range(100)),
+          },
+        );
+        const result = await loadArtworkRecords(request([1]), createMockContext());
+        expect(sectionIdsRequested(fetch)[0]).toHaveLength(100);
+        expect(textIdsRequested(fetch)[0]).toHaveLength(100);
+        expect(result.artworks[0]?.publication_sections).toHaveLength(100);
+        expect(result.artworks[0]?.related_media).toHaveLength(200);
+        expect(result.notices).toEqual([]);
+      });
+
+      it('counts a section two records share once, and attaches it to both', async () => {
+        const fetch = setupLinked(
+          [
+            artworkRecord(1, { section_ids: range(100) }),
+            artworkRecord(2, { section_ids: [100, 1] }),
+          ],
+          { sections: sectionsResponder(range(100)) },
+        );
+        const result = await loadArtworkRecords(request([1, 2]), createMockContext());
+        expect(sectionIdsRequested(fetch)).toEqual([range(100)]);
+        expect(result.artworks[1]?.publication_sections?.map((s) => s.id)).toEqual([100, 1]);
+        expect(result.notices).toEqual([]);
+      });
+
+      it('gives each capped kind its own notice, after a degradation, naming its own records', async () => {
+        setupLinked(
+          [
+            artworkRecord(1, { sound_ids: [soundUuid(1)], section_ids: range(100) }),
+            artworkRecord(2, { section_ids: [101], text_ids: range(100).map(textUuid) }),
+            artworkRecord(3, { text_ids: [textUuid(101)] }),
+          ],
+          {
+            sounds: jsonResponder({}, 500),
+            sections: sectionsResponder(range(100)),
+            texts: textsResponder(range(100)),
+          },
+        );
+        const result = await loadArtworkRecords(request([1, 2, 3, 9]), createMockContext());
+        expect(result.notices.join(' ')).toBe(
+          'No artwork exists for id 9; find ids with artic_search_artworks. The linked sound recordings could not be loaded; the artwork records themselves are complete. Call artic_get_artworks again to retry. Linked publication sections are capped at 100 per call; artwork 2 is missing some or all of them. Call artic_get_artworks with fewer ids to load them. Linked text documents are capped at 100 per call; artwork 3 is missing some or all of them. Call artic_get_artworks with fewer ids to load them.',
+        );
+      });
+    });
+
+    describe('a failed load', () => {
+      const failing = jsonResponder({ status: 403, error: 'Forbidden' }, 403);
+
+      it.each([
+        ['sound recordings', { sounds: failing }, ['text'], 1],
+        ['publication sections', { sections: failing }, ['sound', 'text'], undefined],
+        ['text documents', { texts: failing }, ['sound'], 1],
+        [
+          'sound recordings and publication sections',
+          { sounds: failing, sections: failing },
+          ['text'],
+          undefined,
+        ],
+        ['sound recordings and text documents', { sounds: failing, texts: failing }, undefined, 1],
+        [
+          'publication sections and text documents',
+          { sections: failing, texts: failing },
+          ['sound'],
+          undefined,
+        ],
+        [
+          'sound recordings, publication sections, and text documents',
+          { sounds: failing, sections: failing, texts: failing },
+          undefined,
+          undefined,
+        ],
+      ])('of the %s names it and attaches the rest', async (kinds, broken, media, sections) => {
+        setupLinked([linkedArtwork(1)], {
+          sounds: soundsResponder([1]),
+          sections: sectionsResponder([1]),
+          texts: textsResponder([1]),
+          ...broken,
+        });
+        const ctx = createMockContext();
+        const result = await loadArtworkRecords(request([1]), ctx);
+        expect(result.artworks.map((a) => a.id)).toEqual([1]);
+        expect(result.artworks[0]?.related_media?.map((m) => m.type)).toEqual(media);
+        expect(result.artworks[0]?.publication_sections?.length).toBe(sections);
+        expect(result.notices).toEqual([
+          `The linked ${kinds} could not be loaded; the artwork records themselves are complete. Call artic_get_artworks again to retry.`,
+        ]);
+        expect(warningsOf(ctx)).toHaveLength(Object.keys(broken).length);
+      });
+
+      it.each([
+        ['a 5xx', jsonResponder({}, 500)],
+        ['a rate limit', jsonResponder({}, 429)],
+        ['a firewall 403', textResponder('<html>blocked</html>', 403)],
+        ['a 400 rejection', textResponder(ES_BAD_REQUEST_TEXT, 400)],
+        ['a network failure', networkErrorResponder()],
+        ['an unreadable body', textResponder('not json')],
+      ])('of the sections on %s degrades the same way', async (_name, sections) => {
+        setupLinked([linkedArtwork(1)], {
+          sounds: soundsResponder([1]),
+          sections,
+          texts: textsResponder([1]),
+        });
+        const result = await loadArtworkRecords(request([1]), createMockContext());
+        expect(result.artworks[0]).not.toHaveProperty('publication_sections');
+        expect(result.artworks[0]?.related_media).toHaveLength(2);
+        expect(result.notices).toEqual([
+          'The linked publication sections could not be loaded; the artwork records themselves are complete. Call artic_get_artworks again to retry.',
+        ]);
+      });
+
+      it('of a kind with more ids than the cap is reported as failed alone, not also as capped', async () => {
+        setupLinked([artworkRecord(1, { section_ids: range(101) })], { sections: failing });
+        const result = await loadArtworkRecords(request([1]), createMockContext());
+        expect(result.notices).toEqual([
+          'The linked publication sections could not be loaded; the artwork records themselves are complete. Call artic_get_artworks again to retry.',
+        ]);
+      });
+
+      it('retries only the failed kind on the next call', async () => {
+        let sectionCalls = 0;
+        const fetch = setupLinked([linkedArtwork(1)], {
+          sounds: soundsResponder([1]),
+          sections: (url, init) => {
+            sectionCalls += 1;
+            return (sectionCalls === 1 ? failing : sectionsResponder([1]))(url, init);
+          },
+          texts: textsResponder([1]),
+        });
+        const first = await loadArtworkRecords(request([1]), createMockContext());
+        expect(first.notices).toHaveLength(1);
+        fetch.mockClear();
+        const second = await loadArtworkRecords(request([1]), createMockContext());
+        expect(pathsRequested(fetch)).toEqual([SECTIONS]);
+        expect(second.artworks[0]?.publication_sections).toHaveLength(1);
+        expect(second.artworks[0]?.related_media).toHaveLength(2);
+        expect(second.notices).toEqual([]);
+      });
+    });
+
+    describe('cancellation', () => {
+      const cancelled = () => new DOMException('cancelled by caller', 'AbortError');
+      const KINDS = ['sounds', 'sections', 'texts'] as const;
+
+      /** Runs `work` and returns the unhandled rejections that surfaced during it. */
+      async function unhandledDuring(work: () => Promise<void>): Promise<unknown[]> {
+        const seen: unknown[] = [];
+        const record = (reason: unknown) => seen.push(reason);
+        process.on('unhandledRejection', record);
+        try {
+          await work();
+          // Node reports an unhandled rejection after the microtask queue drains.
+          await new Promise((resolve) => setImmediate(resolve));
+        } finally {
+          process.off('unhandledRejection', record);
+        }
+        return seen;
+      }
+
+      it.each(KINDS)('rethrows it from the %s load, the others in flight', async (kind) => {
+        const controller = new AbortController();
+        const held = barrier(3);
+        const aborting: Responder = () => {
+          controller.abort(cancelled());
+          throw controller.signal.reason;
+        };
+        const responders = {
+          sounds: hangingResponder,
+          sections: hangingResponder,
+          texts: hangingResponder,
+          [kind]: aborting,
+        };
+        const fetch = setupLinked([linkedArtwork(1)], {
+          sounds: held(responders.sounds),
+          sections: held(responders.sections),
+          texts: held(responders.texts),
+        });
+        const ctx = createMockContext({ signal: controller.signal });
+        const unhandled = await unhandledDuring(async () => {
+          const error = await rejectionOf(loadArtworkRecords(request([1]), ctx));
+          expect(error).toBe(controller.signal.reason);
+          expect((error as DOMException).message).toBe('cancelled by caller');
+        });
+        expect(unhandled).toEqual([]);
+        expect(pathsRequested(fetch)).toHaveLength(4);
+        expect(warningsOf(ctx)).toEqual([]);
+      });
+
+      it.each(KINDS)('rethrows it after the %s load has already degraded', async (kind) => {
+        const controller = new AbortController();
+        const ctx = createMockContext({ signal: controller.signal });
+        const warn = ctx.log.warning.bind(ctx.log);
+        ctx.log.warning = (...args) => {
+          warn(...args);
+          controller.abort(cancelled());
+        };
+        setupLinked([linkedArtwork(1)], {
+          sounds: hangingResponder,
+          sections: hangingResponder,
+          texts: hangingResponder,
+          [kind]: jsonResponder({ status: 403, error: 'Forbidden' }, 403),
+        });
+        const unhandled = await unhandledDuring(async () => {
+          const error = await rejectionOf(loadArtworkRecords(request([1]), ctx));
+          expect(error).toBe(controller.signal.reason);
+        });
+        expect(unhandled).toEqual([]);
+        expect(warningsOf(ctx)).toHaveLength(1);
+      });
+
+      // The SDK aborts with the reason text of the client's cancelled notification, which is no Error.
+      it('rethrows a plain string reason unchanged', async () => {
+        const controller = new AbortController();
+        const held = barrier(3);
+        const fetch = setupLinked([linkedArtwork(1)], {
+          sounds: held(hangingResponder),
+          sections: held(hangingResponder),
+          texts: held(() => {
+            controller.abort('user cancelled');
+            throw controller.signal.reason;
+          }),
+        });
+        const ctx = createMockContext({ signal: controller.signal });
+        const unhandled = await unhandledDuring(async () => {
+          const error = await rejectionOf(loadArtworkRecords(request([1]), ctx));
+          expect(error).toBe('user cancelled');
+        });
+        expect(unhandled).toEqual([]);
+        expect(pathsRequested(fetch)).toEqual([ARTWORKS, SOUNDS, SECTIONS, TEXTS]);
+        expect(warningsOf(ctx)).toEqual([]);
+      });
+
+      it('rethrows it when the other kinds answer normally', async () => {
+        const controller = new AbortController();
+        const held = barrier(3);
+        setupLinked([linkedArtwork(1)], {
+          sounds: held(soundsResponder([1])),
+          sections: held(sectionsResponder([1])),
+          texts: held(async () => {
+            controller.abort(cancelled());
+            throw controller.signal.reason;
+          }),
+        });
+        const ctx = createMockContext({ signal: controller.signal });
+        const error = await rejectionOf(loadArtworkRecords(request([1]), ctx));
+        expect(error).toBe(controller.signal.reason);
+        expect(warningsOf(ctx)).toEqual([]);
+      });
     });
   });
 
