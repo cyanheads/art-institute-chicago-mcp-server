@@ -1,5 +1,5 @@
 /**
- * @fileoverview Vitest config for the consumer server. Uses Vitest 4 `projects`
+ * @fileoverview Vitest config for the consumer server. Uses Vitest `projects`
  * so you can split suites (unit/smoke/integration/fuzz) and run each with
  * `--project <name>` as the surface grows. Extends the framework's base config
  * for shared `resolve`, `ssr`, and coverage settings.
@@ -12,11 +12,19 @@ import { defineConfig, mergeConfig } from 'vitest/config';
 
 const alias = { '@/': new URL('./src/', import.meta.url).pathname };
 
+/**
+ * Vitest 5.1.1's forks pool calls `child.channel.unref()`, which Bun's child
+ * processes lack, so no fork starts under `bun --bun`. Node keeps the base
+ * config's forks and their isolation.
+ */
+const bunPool = process.versions.bun ? ({ pool: 'threads' } as const) : {};
+
 export default mergeConfig(
   coreConfig,
   defineConfig({
     resolve: { alias },
     test: {
+      ...bunPool,
       projects: [
         {
           extends: true,
