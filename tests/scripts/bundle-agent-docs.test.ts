@@ -7,16 +7,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { AGENT_DOC_ENTRY, filterAgentDocEntries } from '../../scripts/clean-mcpb.js';
-
-/**
- * Loaded by URL: the shipped script's repo-only fallback import does not
- * resolve in this project, so a static import breaks the typecheck
- * (cyanheads/mcp-ts-core#797).
- */
-const lintPackaging: {
-  AGENT_DOC_ENTRY: RegExp;
-  checkBundleEntries: (entries: string[], bundleLabel: string) => string[];
-} = await import(new URL('../../scripts/lint-packaging.ts', import.meta.url).href);
+import * as lintPackaging from '../../scripts/lint-packaging.js';
 
 const RUNTIME_ENTRIES = [
   'node_modules/@modelcontextprotocol/server/dist/ext/skills/index.mjs',
@@ -24,7 +15,6 @@ const RUNTIME_ENTRIES = [
   'node_modules/parent/node_modules/@modelcontextprotocol/server/dist/ext/skills/index.mjs',
   'node_modules/some-pkg/lib/skills/loader.js',
   'node_modules/some-pkg/dist/framework-skills/index.js',
-  'node_modules/some-pkg/dist/skills/guide/SKILL.md',
   'node_modules/@scope/skills/index.js',
   'node_modules/@scope/.claude/index.js',
   'skills/artic-guide/SKILL.md',
@@ -41,6 +31,7 @@ const AGENT_DOC_ENTRIES = [
   'node_modules/some-pkg/.agents/skills/guide/SKILL.md',
   'node_modules/some-pkg/SKILL.md',
   'node_modules/@scope/some-pkg/SKILL.md',
+  'node_modules/some-pkg/dist/skills/guide/SKILL.md',
 ];
 
 describe('bundle agent-doc selector', () => {
